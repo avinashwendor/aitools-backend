@@ -14,7 +14,8 @@
     "test": "LOG_LEVEL=error node --experimental-test-module-mocks --test \"tests/**/*.test.mjs\"",
     "eval:retrieval": "node scripts/eval-retrieval.mjs",
     "eval:workflow": "node scripts/eval-workflow.mjs",
-    "check:providers": "node scripts/check-providers.mjs"
+    "check:providers": "node scripts/check-providers.mjs",
+    "railway:sync-env": "node scripts/sync-railway-env.mjs"
   },
   "keywords": [
     "ai",
