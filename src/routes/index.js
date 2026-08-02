@@ -1,0 +1,84 @@
+import { Router } from 'express';
+import mongoose from 'mongoose';
+import config from '../config/index.js';
+import { getCatalog } from '../ai/catalog.js';
+import { isLLMAvailable, getProviderStatus } from '../ai/llm.js';
+import { getStats } from '../ai/telemetry.js';
+import { getCacheStats } from '../ai/cache.js';
+import { authenticate, requireAdmin } from '../middleware/auth.js';
+import authRoutes from './authRoutes.js';
+import toolRoutes from './toolRoutes.js';
+import commentRoutes from './commentRoutes.js';
+import adminRoutes from './adminRoutes.js';
+import chatRoutes from './chatRoutes.js';
+import categoryRoutes from './categoryRoutes.js';
+import workflowRoutes from './workflowRoutes.js';
+
+const router = Router();
+
+// Liveness — is the process up.
+router.get('/health', (req, res) => {
+  res.json({
+    success: true,
+    message: 'API is running',
+    version: '2.0.0',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Readiness — can we actually serve traffic (DB reachable, catalog indexed,
+// AI configured). Returns 503 so orchestrators can hold traffic back.
+router.get('/health/ready', async (req, res) => {
+  const dbState = mongoose.connection.readyState; // 1 = connected
+  let catalogSize = 0;
+  let catalogOk = false;
+
+  try {
+    const catalog = await getCatalog();
+    catalogSize = catalog.tools.length;
+    catalogOk = catalogSize > 0;
+  } catch {
+    catalogOk = false;
+  }
+
+  const ready = dbState === 1 && catalogOk;
+
+  res.status(ready ? 200 : 503).json({
+    success: ready,
+    checks: {
+      database: dbState === 1 ? 'up' : 'down',
+      catalog: catalogOk ? `${catalogSize} tools indexed` : 'empty',
+      ai: isLLMAvailable() ? 'configured' : 'not configured',
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// AI observability — latency percentiles, token spend, cache efficiency and
+// error rate per pipeline stage. Admin-only: it reveals cost and model routing.
+router.get('/health/ai', authenticate, requireAdmin, async (req, res) => {
+  const [cacheStats, llmStats] = await Promise.all([getCacheStats(), getStats()]);
+  res.json({
+    success: true,
+    data: {
+      configured: isLLMAvailable(),
+      // Ordered failover chain, with any provider currently benched for an
+      // exhausted quota or a rejected key flagged as unavailable.
+      providers: getProviderStatus(),
+      cache: cacheStats,
+      ...llmStats,
+    },
+  });
+});
+
+// Mount routes
+router.use('/auth', authRoutes);
+router.use('/tools', toolRoutes);
+router.use('/comments', commentRoutes);
+router.use('/admin', adminRoutes);
+router.use('/chat', chatRoutes);
+router.use('/categories', categoryRoutes);
+router.use('/workflows', workflowRoutes);
+
+export default router;
+
