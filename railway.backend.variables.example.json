@@ -1,0 +1,21 @@
+{
+  "NODE_ENV": "production",
+  "MONGODB_URI": "${{MongoDB.MONGO_URL}}",
+  "REDIS_URL": "${{Redis.REDIS_URL}}",
+  "JWT_SECRET": "REPLACE_WITH_openssl_rand_base64_48",
+  "JWT_EXPIRES_IN": "7d",
+  "CORS_ORIGINS": "https://aitools-frontned-production.up.railway.app,http://localhost:5173",
+  "QDRANT_URL": "http://${{qdrant-production-c51b.RAILWAY_PRIVATE_DOMAIN}}:6333",
+  "QDRANT_API_KEY": "${{qdrant-production-c51b.QDRANT__SERVICE__API_KEY}}",
+  "EMBEDDING_MODEL": "Xenova/all-MiniLM-L6-v2",
+  "EMBEDDING_DIMENSIONS": "384",
+  "AI_PROVIDERS": "[{\"name\":\"openrouter\",\"baseUrl\":\"https://openrouter.ai/api/v1\",\"apiKey\":\"YOUR_OPENROUTER_KEY\",\"planner\":\"openai/gpt-4.1-mini\",\"fast\":\"google/gemini-2.5-flash\",\"fallbacks\":[\"deepseek/deepseek-chat\",\"meta-llama/llama-3.3-70b-instruct\"]}]",
+  "AI_TEMPERATURE": "0.35",
+  "AI_MAX_TOKENS": "4096",
+  "AI_TIMEOUT_MS": "45000",
+  "AI_RATE_LIMIT_WINDOW_MS": "60000",
+  "AI_RATE_LIMIT_MAX": "20",
+  "TAVILY_API_KEY": "YOUR_TAVILY_KEY",
+  "TAVILY_MONTHLY_CREDIT_CAP": "900",
+  "LOG_LEVEL": "info"
+}
