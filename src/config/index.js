@@ -20,6 +20,18 @@ const list = (v, fallback = []) =>
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const isProd = nodeEnv === 'production';
+const isRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+
+/** Railway MongoDB injects MONGO_URL; Atlas and local dev use MONGODB_URI. */
+function resolveMongoUri() {
+  return (
+    process.env.MONGODB_URI ||
+    process.env.MONGO_URL ||
+    process.env.MONGO_URI ||
+    process.env.DATABASE_URL ||
+    ''
+  );
+}
 
 /**
  * Builds the ordered AI provider chain.
@@ -86,7 +98,7 @@ const config = {
   isProd,
   port: num(process.env.PORT, 5002),
 
-  mongoUri: process.env.MONGODB_URI,
+  mongoUri: resolveMongoUri(),
   jwtSecret: process.env.JWT_SECRET,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '7d',
 
@@ -168,14 +180,23 @@ const config = {
 
 // ─── Startup validation ──────────────────────────────────────
 const missing = [];
-if (!config.mongoUri) missing.push('MONGODB_URI');
+if (!config.mongoUri) missing.push('MONGODB_URI (or MONGO_URL)');
 if (!config.jwtSecret) missing.push('JWT_SECRET');
 
 if (missing.length) {
-  console.error(
-    `\n✖ Missing required environment variables: ${missing.join(', ')}\n` +
-    `  Copy backend/.env.example to backend/.env and fill them in.\n`
-  );
+  console.error(`\n✖ Missing required environment variables: ${missing.join(', ')}\n`);
+
+  if (isRailway) {
+    console.error(
+      '  Railway → backend service → Variables:\n' +
+      '    MONGODB_URI=${{MongoDB.MONGO_URL}}   (or your Atlas connection string)\n' +
+      '    JWT_SECRET=<openssl rand -base64 48>\n' +
+      '    NODE_ENV=production\n'
+    );
+  } else {
+    console.error('  Copy backend/.env.example to backend/.env and fill them in.\n');
+  }
+
   process.exit(1);
 }
 
