@@ -1,6 +1,7 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "npm ci"
+# Nixpacks already runs `npm ci` in its install phase — do not repeat it here
+# or npm hits EBUSY on node_modules/.cache.
 
 [deploy]
 startCommand = "npm start"

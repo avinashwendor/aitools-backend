@@ -1,0 +1,10 @@
+# Ignore local installs and caches — Nixpacks runs npm ci in the container.
+node_modules
+.npm
+*.log
+.env
+.env.*
+!.env.example
+.git
+coverage
+.DS_Store
