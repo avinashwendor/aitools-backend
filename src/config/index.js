@@ -40,8 +40,8 @@ function resolveMongoUri() {
  *
  *  1. AI_PROVIDERS — a JSON array, for multi-provider failover:
  *       [{"name":"openrouter","baseUrl":"https://openrouter.ai/api/v1",
- *         "apiKey":"sk-or-…","planner":"openai/gpt-4.1-mini",
- *         "fast":"google/gemini-2.5-flash","fallbacks":["deepseek/deepseek-chat"]}]
+ *         "apiKey":"sk-or-…","planner":"openai/gpt-5.6-luna",
+ *         "fast":"openai/gpt-5-mini","fallbacks":["openai/gpt-5-mini"]}]
  *
  *  2. The flat AI_BASE_URL / AI_API_KEY / AI_MODEL_* variables (single provider).
  *     GROQ_API_KEY is still honoured so older deployments keep working.

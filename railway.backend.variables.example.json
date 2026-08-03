@@ -9,7 +9,7 @@
   "QDRANT_API_KEY": "${{qdrant-production-c51b.QDRANT__SERVICE__API_KEY}}",
   "EMBEDDING_MODEL": "Xenova/all-MiniLM-L6-v2",
   "EMBEDDING_DIMENSIONS": "384",
-  "AI_PROVIDERS": "[{\"name\":\"openrouter\",\"baseUrl\":\"https://openrouter.ai/api/v1\",\"apiKey\":\"YOUR_OPENROUTER_KEY\",\"planner\":\"openai/gpt-4.1-mini\",\"fast\":\"google/gemini-2.5-flash\",\"fallbacks\":[\"deepseek/deepseek-chat\",\"meta-llama/llama-3.3-70b-instruct\"]}]",
+  "AI_PROVIDERS": "[{\"name\":\"openrouter\",\"baseUrl\":\"https://openrouter.ai/api/v1\",\"apiKey\":\"YOUR_OPENROUTER_KEY\",\"planner\":\"openai/gpt-5.6-luna\",\"fast\":\"openai/gpt-5-mini\",\"fallbacks\":[\"openai/gpt-5-mini\",\"openai/gpt-5.6-luna\"]}]",
   "AI_TEMPERATURE": "0.35",
   "AI_MAX_TOKENS": "4096",
   "AI_TIMEOUT_MS": "45000",
