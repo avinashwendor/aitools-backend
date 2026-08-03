@@ -13,6 +13,7 @@ import {
   clearHistory,
   getStatus,
 } from '../controllers/chatController.js';
+import { submitFeedback, getPreferences } from '../controllers/feedbackController.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { rateLimit } from '../middleware/rateLimit.js';
@@ -53,7 +54,19 @@ router.post(
 
 router.get('/history', getHistory);
 router.get('/sessions', getSessions);
+router.get('/preferences', getPreferences);
 router.delete('/history', clearHistory);
+
+router.post(
+  '/feedback',
+  [
+    body('rating').isIn(['like', 'dislike']).withMessage('rating must be like or dislike'),
+    body('reason').optional().isString().isLength({ max: 500 }),
+    body('sessionId').optional().isString().isLength({ max: 120 }),
+  ],
+  validate,
+  submitFeedback
+);
 
 router.get('/status', requireAdmin, getStatus);
 

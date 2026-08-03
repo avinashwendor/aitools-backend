@@ -22,6 +22,7 @@ import {
   clearConversation,
   listConversations,
   updateProfileFacts,
+  loadProfile,
 } from '../ai/memory.js';
 import { GuardrailError } from '../ai/guardrails.js';
 import { LLMError, isLLMAvailable } from '../ai/llm.js';
@@ -31,6 +32,12 @@ import { getCacheStats } from '../ai/cache.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('chat');
+
+async function resolveAllowExternalTools(userId, bodyValue) {
+  if (typeof bodyValue === 'boolean') return bodyValue;
+  const profile = await loadProfile(userId).catch(() => null);
+  return Boolean(profile?.allowExternalTools);
+}
 
 /** Maps engine/guardrail errors onto a client-safe HTTP response. */
 function sendError(res, err, { streaming = false } = {}) {
@@ -89,11 +96,12 @@ export const sendMessage = async (req, res) => {
 
   try {
     const conversation = await loadConversation(userId, sessionId);
+    const resolvedExternal = await resolveAllowExternalTools(userId, allowExternalTools);
     if (typeof allowExternalTools === 'boolean') {
       updateProfileFacts(userId, { allowExternalTools }).catch(() => {});
     }
 
-    const result = await handleMessage({ message, conversation, userId, allowExternalTools: Boolean(allowExternalTools) });
+    const result = await handleMessage({ message, conversation, userId, allowExternalTools: resolvedExternal });
 
     await persistTurn(userId, sessionId, {
       userMessage: message,
@@ -112,6 +120,8 @@ export const sendMessage = async (req, res) => {
         workflow: result.workflow,
         intent: result.intent,
         clarifyingQuestions: result.clarifyingQuestions || null,
+        readyToApprove: result.readyToApprove || false,
+        workflowDiff: result.workflowDiff || null,
         sessionId,
       },
     });
@@ -151,6 +161,7 @@ export const streamMessage = async (req, res) => {
 
   try {
     const conversation = await loadConversation(userId, sessionId);
+    const resolvedExternal = await resolveAllowExternalTools(userId, allowExternalTools);
     if (typeof allowExternalTools === 'boolean') {
       updateProfileFacts(userId, { allowExternalTools }).catch(() => {});
     }
@@ -159,7 +170,7 @@ export const streamMessage = async (req, res) => {
       message,
       conversation,
       userId,
-      allowExternalTools: Boolean(allowExternalTools),
+      allowExternalTools: resolvedExternal,
       onProgress: event => send('progress', event),
     });
 
@@ -170,6 +181,8 @@ export const streamMessage = async (req, res) => {
       workflow: result.workflow,
       intent: result.intent,
       clarifyingQuestions: result.clarifyingQuestions || null,
+      readyToApprove: result.readyToApprove || false,
+      workflowDiff: result.workflowDiff || null,
       sessionId,
     });
     send('done', { ok: true });

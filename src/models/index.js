@@ -6,5 +6,6 @@ import Conversation from './Conversation.js';
 import UserProfile from './UserProfile.js';
 import WorkflowRun from './WorkflowRun.js';
 import SuggestedTool from './SuggestedTool.js';
+import MessageFeedback from './MessageFeedback.js';
 
-export { User, Tool, Comment, Category, Conversation, UserProfile, WorkflowRun, SuggestedTool };
+export { User, Tool, Comment, Category, Conversation, UserProfile, WorkflowRun, SuggestedTool, MessageFeedback };

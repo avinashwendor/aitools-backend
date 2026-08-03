@@ -19,8 +19,25 @@ function profileBlock(profile) {
   if (profile.pricingPreference) lines.push(`Default budget preference: ${profile.pricingPreference}`);
   if (profile.industry) lines.push(`Industry/niche: ${profile.industry}`);
   if (profile.toolsAlreadyUsing?.length) lines.push(`Already uses: ${profile.toolsAlreadyUsing.join(', ')}`);
+  if (profile.preferredTools?.length) lines.push(`Has liked workflows using: ${profile.preferredTools.join(', ')}`);
+  if (profile.rejectedTools?.length) lines.push(`Has rejected or disliked: ${profile.rejectedTools.join(', ')}`);
+  if (profile.notes?.length) lines.push(`Past feedback/preferences: ${profile.notes.slice(-3).join(' | ')}`);
   if (!lines.length) return '';
   return `\n\nWHAT YOU ALREADY KNOW ABOUT THIS USER (from long-term memory — do not ask for these again,\nuse them as defaults unless the current message overrides them):\n- ${lines.join('\n- ')}\n`;
+}
+
+/** Planner-facing profile — think like an architect who knows this user. */
+function plannerProfileBlock(profile) {
+  if (!profile) return '';
+  const lines = [];
+  if (profile.skillLevel) lines.push(`Skill: ${profile.skillLevel}`);
+  if (profile.pricingPreference) lines.push(`Budget bias: ${profile.pricingPreference}`);
+  if (profile.toolsAlreadyUsing?.length) lines.push(`Already comfortable with: ${profile.toolsAlreadyUsing.join(', ')}`);
+  if (profile.preferredTools?.length) lines.push(`Prefer these tools when they fit: ${profile.preferredTools.join(', ')}`);
+  if (profile.rejectedTools?.length) lines.push(`Never suggest unless no alternative: ${profile.rejectedTools.join(', ')}`);
+  if (profile.notes?.length) lines.push(`Standing preferences: ${profile.notes.slice(-4).join('; ')}`);
+  if (!lines.length) return '';
+  return `\n\nUSER PROFILE (architect for THIS person — honour their history):\n- ${lines.join('\n- ')}\n`;
 }
 
 export function routerSystem(categories, profile = null) {
@@ -53,14 +70,14 @@ FIELDS
                  preference if you have one, otherwise "any".
 - skill:         "beginner" | "intermediate" | "advanced" — infer from wording; if unstated,
                  use the user's known skill level if you have one, otherwise "beginner".
-- clarifyingQuestions: [] normally. Only populate this — for "workflow" intent — when the goal
-                 is genuinely too vague to plan (e.g. just "help me make something") AND the
-                 answer isn't already known about this user. Max 4 questions, prefer short
-                 multiple-choice over free text. Each item:
-                 {"id":"skill","question":"...","type":"choice","options":["Beginner","Intermediate","Advanced"]}
-                 or {"id":"...","question":"...","type":"text"}. Never ask something you already
-                 know from the block below, and never ask more than is needed to produce a
-                 sensible first plan — you can always refine later.${profileBlock(profile)}
+- clarifyingQuestions: [] normally. For a NEW "workflow" intent (no prior workflow in this chat),
+                 you MUST ask 5-6 short intake questions before any plan is generated — unless the
+                 user's message already answers most of them OR the profile block below covers them.
+                 Cover: output format, AI vs manual approach, free vs paid budget, tools they already
+                 use, platform/channel, and skill level. Prefer multiple-choice. Each item:
+                 {"id":"budget","question":"...","type":"choice","options":["Free only","Freemium OK","Paid is fine"]}
+                 or {"id":"...","question":"...","type":"text"}. Max 6 questions. Never ask something
+                 you already know from the block below.${profileBlock(profile)}
 
 Respond with exactly:
 {"intent":"...","goal":"...","title":"...","domains":[],"searchQueries":[],"pricing":"any","skill":"beginner","clarifyingQuestions":[]}`;
@@ -69,8 +86,9 @@ Respond with exactly:
 // ─────────────────────────────────────────────────────────────
 // 2. Planner — choose the stages and the tool for each
 // ─────────────────────────────────────────────────────────────
-export function plannerSystem({ minStages, maxStages, pricing, skill }) {
+export function plannerSystem({ minStages, maxStages, pricing, skill, profile = null }) {
   return `You are ${BRAND}. You design real, executable workflows out of a fixed catalog of AI tools.
+Think like a project architect planning one scoped build for this specific user.${plannerProfileBlock(profile)}
 
 You will receive CANDIDATE_TOOLS (JSON). It is the ONLY inventory you may use.
 Every "toolSlug" and "alternativeSlugs" value MUST be copied verbatim from a candidate's

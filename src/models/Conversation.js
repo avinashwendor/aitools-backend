@@ -40,6 +40,18 @@ const conversationSchema = new mongoose.Schema(
     /** Last workflow returned for this session, so "make it cheaper" has context. */
     lastWorkflow: { type: mongoose.Schema.Types.Mixed, default: null },
 
+    /**
+     * Intake state machine — ask clarifying questions before spending planner tokens,
+     * then wait for explicit approval before generating the workflow.
+     */
+    clarificationState: {
+      phase: { type: String, enum: ['asking', 'awaiting_approval', null], default: null },
+      questions: { type: [mongoose.Schema.Types.Mixed], default: [] },
+      answersText: { type: String, default: '' },
+      enrichedGoal: { type: String, default: '' },
+      baseGoal: { type: String, default: '' },
+    },
+
     turnCount: { type: Number, default: 0 },
 
     lastActivity: { type: Date, default: Date.now },

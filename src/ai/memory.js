@@ -33,6 +33,7 @@ export async function loadConversation(userId, sessionId) {
       summary: '',
       goal: '',
       lastWorkflow: null,
+      clarificationState: null,
       turnCount: 0,
     };
   }
@@ -232,6 +233,21 @@ export async function incrementClarifyingQuestionsAsked(userId) {
   );
 }
 
+export async function saveClarificationState(userId, sessionId, state) {
+  await Conversation.updateOne(
+    { user: userId, sessionId: sessionId || 'default' },
+    { $set: { clarificationState: state, lastActivity: new Date() } },
+    { upsert: true }
+  );
+}
+
+export async function clearClarificationState(userId, sessionId) {
+  await Conversation.updateOne(
+    { user: userId, sessionId: sessionId || 'default' },
+    { $set: { clarificationState: { phase: null, questions: [], answersText: '', enrichedGoal: '', baseGoal: '' } } }
+  );
+}
+
 // ─────────────────────────────────────────────────────────────
 // Long-term memory: semantic recall across sessions (Qdrant)
 // ─────────────────────────────────────────────────────────────
@@ -261,5 +277,7 @@ export default {
   loadProfile,
   updateProfileFacts,
   incrementClarifyingQuestionsAsked,
+  saveClarificationState,
+  clearClarificationState,
   recallRelatedSessions,
 };

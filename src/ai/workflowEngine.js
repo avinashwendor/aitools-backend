@@ -20,9 +20,12 @@ import {
   updateProfileFacts,
   incrementClarifyingQuestionsAsked,
   recallRelatedSessions,
+  saveClarificationState,
+  clearClarificationState,
 } from './memory.js';
 import cache from './cache.js';
 import * as prompts from './prompts.js';
+import { patchWorkflow } from './workflowDiff.js';
 import { webSearch, isWebSearchConfigured, wantsFreshInfo } from './tools/webSearch.js';
 import { discoverAndQueueTools } from './tools/toolDiscovery.js';
 import { createLogger } from '../utils/logger.js';
@@ -64,10 +67,12 @@ const VALID_INTENTS = ['workflow', 'refine', 'discover', 'question', 'smalltalk'
 /** Caps how many times we'll ever interrupt a returning user with clarifying questions. */
 const MAX_CLARIFYING_ASKS = 3;
 
+const APPROVAL_RE = /\b(yes|create the workflow|generate the workflow|build it|go ahead|approve|looks good|let'?s do it|start planning|make the workflow|design the workflow)\b/i;
+
 function sanitizeClarifyingQuestions(raw) {
   return (Array.isArray(raw) ? raw : [])
     .filter(q => q && q.question)
-    .slice(0, 4)
+    .slice(0, 6)
     .map((q, i) => ({
       id: String(q.id || `q${i}`).slice(0, 40),
       question: String(q.question).slice(0, 160),
@@ -161,7 +166,7 @@ function heuristicRoute(message, hasPriorWorkflow, profile) {
 // Phase 2 — planning
 // ─────────────────────────────────────────────────────────────
 
-async function plan({ goal, cards, pricing, skill, priorWorkflow, adjustment }) {
+async function plan({ goal, cards, pricing, skill, priorWorkflow, adjustment, profile }) {
   const validSlugs = new Set(cards.map(c => c.slug));
   const { minStages, maxStages } = config.ai;
 
@@ -173,7 +178,7 @@ async function plan({ goal, cards, pricing, skill, priorWorkflow, adjustment }) 
     // plus the closing tips array — a truncated plan loses whole stages.
     maxTokens: 3600,
     messages: [
-      { role: 'system', content: prompts.plannerSystem({ minStages, maxStages, pricing, skill }) },
+      { role: 'system', content: prompts.plannerSystem({ minStages, maxStages, pricing, skill, profile }) },
       { role: 'user', content: prompts.plannerUser({ goal, candidates: cards, priorWorkflow, adjustment }) },
     ],
     validate: v => {
@@ -658,24 +663,73 @@ export async function handleMessage({ message, conversation, userId = null, allo
       ])
     : [null, []];
 
+  const resolvedExternalTools = typeof allowExternalTools === 'boolean'
+    ? allowExternalTools
+    : Boolean(profile?.allowExternalTools);
+
   const contextMessages = buildContextMessages(conversation, { recalled });
   const priorWorkflow = conversation.lastWorkflow || null;
+  const clarifyState = conversation.clarificationState;
+  const sessionId = conversation.sessionId || 'default';
+
+  // ── Clarification intake (no planner tokens until user approves) ──
+  if (clarifyState?.phase === 'asking' && !priorWorkflow) {
+    const enrichedGoal = `${clarifyState.baseGoal || sanitized}\n\nUser preferences:\n${sanitized}`;
+    if (userId) {
+      await saveClarificationState(userId, sessionId, {
+        phase: 'awaiting_approval',
+        questions: clarifyState.questions || [],
+        answersText: sanitized,
+        enrichedGoal,
+        baseGoal: clarifyState.baseGoal || sanitized,
+      });
+    }
+    return {
+      message:
+        `Thanks — here's what I'll plan for:\n\n**${clarifyState.baseGoal || 'Your project'}**\n\n` +
+        `${sanitized}\n\n` +
+        `When you're ready, hit **Generate workflow** and I'll design the full build plan.`,
+      workflow: null,
+      intent: 'clarify',
+      readyToApprove: true,
+      clarifyingQuestions: null,
+    };
+  }
+
+  let forcedGoal = null;
+  if (clarifyState?.phase === 'awaiting_approval' && APPROVAL_RE.test(sanitized)) {
+    forcedGoal = clarifyState.enrichedGoal || clarifyState.baseGoal || sanitized;
+    if (userId) await clearClarificationState(userId, sessionId);
+  }
 
   // ── Phase 1: route ───────────────────────────────────────
   onProgress({ phase: 'understanding', message: 'Understanding your goal' });
 
   let routed;
-  try {
-    routed = await route({
-      message: sanitized,
-      contextMessages,
-      categories: catalog.categories,
-      hasPriorWorkflow: Boolean(priorWorkflow),
-      profile,
-    });
-  } catch (err) {
-    log.warn('Router failed — falling back to heuristics', { error: err.message });
-    routed = heuristicRoute(sanitized, Boolean(priorWorkflow), profile);
+  if (forcedGoal) {
+    routed = {
+      intent: 'workflow',
+      goal: forcedGoal.slice(0, 500),
+      title: clarifyState?.baseGoal?.slice(0, 80) || '',
+      domains: [],
+      searchQueries: [forcedGoal.slice(0, 80)],
+      pricing: profile?.pricingPreference || 'any',
+      skill: profile?.skillLevel || 'beginner',
+      clarifyingQuestions: [],
+    };
+  } else {
+    try {
+      routed = await route({
+        message: sanitized,
+        contextMessages,
+        categories: catalog.categories,
+        hasPriorWorkflow: Boolean(priorWorkflow),
+        profile,
+      });
+    } catch (err) {
+      log.warn('Router failed — falling back to heuristics', { error: err.message });
+      routed = heuristicRoute(sanitized, Boolean(priorWorkflow), profile);
+    }
   }
 
   if (flags.includes('possible_injection')) {
@@ -694,10 +748,19 @@ export async function handleMessage({ message, conversation, userId = null, allo
     return { message: prompts.smalltalkReply(), workflow: null, intent: 'smalltalk' };
   }
 
-  if (routed.clarifyingQuestions.length && routed.intent === 'workflow') {
-    if (userId) incrementClarifyingQuestionsAsked(userId).catch(() => {});
+  if (routed.clarifyingQuestions.length && routed.intent === 'workflow' && !priorWorkflow) {
+    if (userId) {
+      incrementClarifyingQuestionsAsked(userId).catch(() => {});
+      saveClarificationState(userId, sessionId, {
+        phase: 'asking',
+        questions: routed.clarifyingQuestions,
+        answersText: '',
+        enrichedGoal: '',
+        baseGoal: routed.goal,
+      }).catch(() => {});
+    }
     return {
-      message: 'A couple of quick questions before I design this:',
+      message: 'Before I design your workflow, a few quick questions:',
       workflow: null,
       intent: 'clarify',
       clarifyingQuestions: routed.clarifyingQuestions,
@@ -706,7 +769,7 @@ export async function handleMessage({ message, conversation, userId = null, allo
 
   if (routed.intent === 'discover' || routed.intent === 'question') {
     onProgress({ phase: 'searching', message: `Searching ${catalog.tools.length} tools` });
-    return answerGrounded({ message: sanitized, routed, contextMessages, allowExternalTools, userId });
+    return answerGrounded({ message: sanitized, routed, contextMessages, allowExternalTools: resolvedExternalTools, userId });
   }
 
   // ── Workflow / refine ────────────────────────────────────
@@ -765,6 +828,7 @@ export async function handleMessage({ message, conversation, userId = null, allo
     skill: routed.skill,
     priorWorkflow: isRefine ? priorWorkflow : null,
     adjustment: isRefine ? sanitized : null,
+    profile,
   });
 
   const bySlug = new Map(cards.map(c => [c.slug, catalog.bySlug.get(c.slug)]).filter(([, t]) => t));
@@ -772,7 +836,7 @@ export async function handleMessage({ message, conversation, userId = null, allo
 
   if (normalized.stages.length < 2) {
     log.warn('Plan collapsed after validation', { stages: normalized.stages.length });
-    return answerGrounded({ message: sanitized, routed, contextMessages, allowExternalTools, userId });
+    return answerGrounded({ message: sanitized, routed, contextMessages, allowExternalTools: resolvedExternalTools, userId });
   }
 
   const reusedCount = isRefine ? reusePlaybooksFromPrior(normalized.stages, priorWorkflow) : 0;
@@ -786,7 +850,7 @@ export async function handleMessage({ message, conversation, userId = null, allo
 
   await writeAllPlaybooks(routed.goal, normalized.stages, onProgress);
 
-  const workflow = assemble(normalized, {
+  let workflow = assemble(normalized, {
     model,
     corpusSize,
     candidatesConsidered: cards.length,
@@ -796,6 +860,14 @@ export async function handleMessage({ message, conversation, userId = null, allo
     cached: false,
     reusedStages: reusedCount,
   });
+
+  let workflowDiff = null;
+  if (isRefine && priorWorkflow) {
+    const patched = patchWorkflow(priorWorkflow, workflow, { adjustment: sanitized });
+    workflow = patched.workflow;
+    workflowDiff = patched.diff;
+    workflow.reply = composeReply(workflow);
+  }
 
   if (!isRefine) await cache.set(cacheKey, workflow);
 
@@ -811,6 +883,7 @@ export async function handleMessage({ message, conversation, userId = null, allo
   return {
     message: workflow.reply,
     workflow,
+    workflowDiff,
     intent: routed.intent,
     title: workflow.title,
     goal: routed.goal,

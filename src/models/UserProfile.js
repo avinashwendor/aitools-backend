@@ -26,6 +26,12 @@ const userProfileSchema = new mongoose.Schema(
     /** Preference for whether web-search-discovered tools outside our catalog may be suggested. */
     allowExternalTools: { type: Boolean, default: false },
 
+    /** Tools the user has positively rated in workflows — bias the planner toward these. */
+    preferredTools: [{ type: String, maxlength: 60 }],
+
+    /** Tools the user rejected or disliked — steer the planner away from these. */
+    rejectedTools: [{ type: String, maxlength: 60 }],
+
     /** Freeform durable facts that don't fit a typed field, capped so this can't grow unbounded. */
     notes: [{ type: String, maxlength: 240 }],
 
@@ -55,6 +61,16 @@ userProfileSchema.methods.applyFacts = function applyFacts(facts = {}) {
   }
 
   if (typeof facts.allowExternalTools === 'boolean') this.allowExternalTools = facts.allowExternalTools;
+
+  if (Array.isArray(facts.preferredTools)) {
+    const merged = new Set([...this.preferredTools, ...facts.preferredTools.map(String)]);
+    this.preferredTools = [...merged].slice(-MAX_TOOLS);
+  }
+
+  if (Array.isArray(facts.rejectedTools)) {
+    const merged = new Set([...this.rejectedTools, ...facts.rejectedTools.map(String)]);
+    this.rejectedTools = [...merged].slice(-MAX_TOOLS);
+  }
 
   if (facts.note) {
     this.notes = [...this.notes, String(facts.note).slice(0, 240)].slice(-MAX_NOTES);
