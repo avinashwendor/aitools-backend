@@ -28,7 +28,7 @@ export async function loadConversation(userId, sessionId) {
   if (!convo) {
     convo = {
       ...key,
-      title: 'New workflow',
+      title: 'New chat',
       messages: [],
       summary: '',
       goal: '',

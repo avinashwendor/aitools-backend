@@ -83,6 +83,60 @@ function sanitizeClarifyingQuestions(raw) {
     }));
 }
 
+/** Fallback intake when the router skips questions on a detailed first message. */
+function buildDefaultIntakeQuestions(profile) {
+  const questions = [];
+
+  if (!profile?.pricingPreference) {
+    questions.push({
+      id: 'budget',
+      question: 'What is your budget for tools?',
+      type: 'choice',
+      options: ['Free only', 'Freemium is OK', 'Paid tools are fine'],
+    });
+  }
+
+  if (!profile?.skillLevel) {
+    questions.push({
+      id: 'skill',
+      question: 'What is your experience level?',
+      type: 'choice',
+      options: ['Beginner', 'Intermediate', 'Advanced'],
+    });
+  }
+
+  questions.push({
+    id: 'timeline',
+    question: 'How quickly do you need this done?',
+    type: 'choice',
+    options: ['Today', 'This week', 'No rush'],
+  });
+
+  questions.push({
+    id: 'approach',
+    question: 'How hands-on do you want to be?',
+    type: 'choice',
+    options: ['Mostly AI-automated', 'Mix of AI and manual', 'I want full control'],
+  });
+
+  questions.push({
+    id: 'priority',
+    question: 'What matters most for this build?',
+    type: 'choice',
+    options: ['Speed', 'Quality', 'Lowest cost', 'Learning as I go'],
+  });
+
+  if (questions.length < 4) {
+    questions.push({
+      id: 'constraints',
+      question: 'Any other constraints or preferences?',
+      type: 'text',
+    });
+  }
+
+  return questions.slice(0, 5);
+}
+
 async function route({ message, contextMessages, categories, hasPriorWorkflow, profile }) {
   const { data } = await completeJson({
     task: 'route',
@@ -748,23 +802,33 @@ export async function handleMessage({ message, conversation, userId = null, allo
     return { message: prompts.smalltalkReply(), workflow: null, intent: 'smalltalk' };
   }
 
-  if (routed.clarifyingQuestions.length && routed.intent === 'workflow' && !priorWorkflow) {
-    if (userId) {
-      incrementClarifyingQuestionsAsked(userId).catch(() => {});
-      saveClarificationState(userId, sessionId, {
-        phase: 'asking',
-        questions: routed.clarifyingQuestions,
-        answersText: '',
-        enrichedGoal: '',
-        baseGoal: routed.goal,
-      }).catch(() => {});
+  // Mandatory intake before the first workflow. Workflow Studio (wf-* sessions)
+  // always gets a short Q&A — even when the quick-start prompt is detailed.
+  // Other sessions only ask when the router returns clarifying questions.
+  const isWorkflowStudio = String(sessionId || '').startsWith('wf-');
+  if (routed.intent === 'workflow' && !priorWorkflow && !forcedGoal) {
+    const questions = routed.clarifyingQuestions?.length
+      ? routed.clarifyingQuestions
+      : (isWorkflowStudio ? buildDefaultIntakeQuestions(profile) : []);
+
+    if (questions.length && clarifyState?.phase !== 'awaiting_approval') {
+      if (userId) {
+        incrementClarifyingQuestionsAsked(userId).catch(() => {});
+        saveClarificationState(userId, sessionId, {
+          phase: 'asking',
+          questions,
+          answersText: '',
+          enrichedGoal: '',
+          baseGoal: routed.goal,
+        }).catch(() => {});
+      }
+      return {
+        message: 'Before I design your workflow, a few quick questions:',
+        workflow: null,
+        intent: 'clarify',
+        clarifyingQuestions: questions,
+      };
     }
-    return {
-      message: 'Before I design your workflow, a few quick questions:',
-      workflow: null,
-      intent: 'clarify',
-      clarifyingQuestions: routed.clarifyingQuestions,
-    };
   }
 
   if (routed.intent === 'discover' || routed.intent === 'question') {

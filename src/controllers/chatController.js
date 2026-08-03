@@ -66,9 +66,13 @@ function sendError(res, err, { streaming = false } = {}) {
 }
 
 /** Persist the turn without ever failing the user's request over it. */
-async function persistTurn(userId, sessionId, payload) {
+async function persistTurn(userId, sessionId, payload, { isFirstTurn = false } = {}) {
+  const title =
+    payload.title ||
+    (isFirstTurn ? payload.userMessage?.trim().slice(0, 80) : undefined);
+
   try {
-    await appendTurn(userId, sessionId, payload);
+    await appendTurn(userId, sessionId, { ...payload, title });
   } catch (err) {
     log.warn('Failed to persist conversation turn', { error: err.message });
   }
@@ -103,6 +107,8 @@ export const sendMessage = async (req, res) => {
 
     const result = await handleMessage({ message, conversation, userId, allowExternalTools: resolvedExternal });
 
+    const isFirstTurn = !(conversation.messages?.length);
+
     await persistTurn(userId, sessionId, {
       userMessage: message,
       assistantMessage: result.message,
@@ -111,7 +117,7 @@ export const sendMessage = async (req, res) => {
       workflow: result.workflow ?? undefined,
       title: result.title,
       intent: result.intent,
-    });
+    }, { isFirstTurn });
 
     res.json({
       success: true,
@@ -189,6 +195,8 @@ export const streamMessage = async (req, res) => {
     clearInterval(heartbeat);
     res.end();
 
+    const isFirstTurn = !(conversation.messages?.length);
+
     await persistTurn(userId, sessionId, {
       userMessage: message,
       assistantMessage: result.message,
@@ -197,7 +205,7 @@ export const streamMessage = async (req, res) => {
       workflow: result.workflow ?? undefined,
       title: result.title,
       intent: result.intent,
-    });
+    }, { isFirstTurn });
   } catch (err) {
     clearInterval(heartbeat);
     if (!aborted) sendError(res, err, { streaming: true });
@@ -237,6 +245,8 @@ export const getHistory = async (req, res) => {
   try {
     const conversation = await loadConversation(req.user._id, req.query.sessionId || 'default');
 
+    const clarify = conversation.clarificationState;
+
     res.json({
       success: true,
       data: {
@@ -248,6 +258,9 @@ export const getHistory = async (req, res) => {
         workflow: conversation.lastWorkflow || null,
         goal: conversation.goal || '',
         title: conversation.title || '',
+        clarifyingQuestions:
+          clarify?.phase === 'asking' ? clarify.questions || [] : null,
+        readyToApprove: clarify?.phase === 'awaiting_approval',
       },
     });
   } catch (err) {

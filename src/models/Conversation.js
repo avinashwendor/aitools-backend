@@ -24,7 +24,7 @@ const conversationSchema = new mongoose.Schema(
     user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     sessionId: { type: String, required: true },
 
-    title: { type: String, default: 'New workflow' },
+    title: { type: String, default: 'New chat' },
 
     messages: { type: [messageSchema], default: [] },
 
