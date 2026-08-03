@@ -30,6 +30,13 @@ function nextWorkingDay(date) {
   return d;
 }
 
+/** The working day `n` working-days after `date` (`date` itself is day 0). */
+function advanceWorkingDays(date, n) {
+  let d = startOfDay(date);
+  for (let i = 0; i < n; i++) d = nextWorkingDay(new Date(d.getTime() + DAY_MS));
+  return d;
+}
+
 /** Working days in [from, to], inclusive — used to solve for required capacity. */
 export function countWorkingDays(from, to) {
   let count = 0;
@@ -48,7 +55,10 @@ export function countWorkingDays(from, to) {
  *
  * Tasks are never split across days: a stage is one sitting, and telling
  * someone to do "40% of the voiceover today" is not a plan they can act on.
- * A task larger than the daily budget simply takes its own day.
+ * A task larger than the daily budget still gets one due date, but the next
+ * task waits out however many working days that sitting actually represents
+ * at the user's pace — otherwise a chain of oversized stages would report the
+ * same finish date no matter how large they got.
  *
  * @param {Array<{order:number, estimateMinutes:number, status:string}>} tasks
  * @param {object} opts
@@ -96,7 +106,7 @@ export function scheduleTasks(tasks, { targetDate, weeklyHours, from = new Date(
     const minutes = minutesFor(task);
 
     // Move to the next working day when today can't fit this task — unless the
-    // day is already empty, in which case an oversized task takes the day.
+    // day is already empty, in which case an oversized task takes over from here.
     if (minutes > remainingToday && remainingToday < dailyBudgetMinutes) {
       cursor = nextWorkingDay(new Date(cursor.getTime() + DAY_MS));
       remainingToday = dailyBudgetMinutes;
@@ -104,6 +114,21 @@ export function scheduleTasks(tasks, { targetDate, weeklyHours, from = new Date(
 
     dueDates.set(task.order, new Date(cursor));
     finishDate = new Date(cursor);
+
+    if (minutes > dailyBudgetMinutes) {
+      // Still one sitting — its own due date isn't split across days — but
+      // the NEXT stage has to wait out however many working days this one
+      // actually represents at the user's pace. Previously the cursor only
+      // ever advanced by a single day here regardless of size, so a chain of
+      // oversized stages (e.g. after an estimateBias recalibration doubled
+      // every estimate) reported a finishDate that didn't move even though
+      // totalMinutes did — the weekly-hours pace stopped affecting the plan
+      // the moment every stage exceeded it.
+      cursor = advanceWorkingDays(cursor, Math.ceil(minutes / dailyBudgetMinutes));
+      remainingToday = dailyBudgetMinutes;
+      continue;
+    }
+
     remainingToday -= minutes;
 
     if (remainingToday <= 0) {

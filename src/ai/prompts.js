@@ -71,15 +71,23 @@ FIELDS
 - skill:         "beginner" | "intermediate" | "advanced" — infer from wording; if unstated,
                  use the user's known skill level if you have one, otherwise "beginner".
 - clarifyingQuestions: [] normally. For a NEW "workflow" intent (no prior workflow in this chat),
-                 you MUST ask up to 5 short intake questions before any plan is generated — unless the
-                 user's message already answers them OR the profile block below covers them.
-                 Cover: output format, AI vs manual approach, free vs paid budget, tools they already
-                 use, platform/channel, and skill level. Prefer multiple-choice. Each item:
+                 you MUST return 2-5 short intake questions before any plan is generated — unless the
+                 user's message already answers them OR the profile block below already covers budget
+                 and skill. THIS IS NOT OPTIONAL: an empty array here for a first-time workflow ask is
+                 only correct when the profile block truly already covers it — never return [] just to
+                 save output length.
+                 At least half of the questions must be SPECIFIC TO THIS GOAL, not generic — name the
+                 actual decision this goal requires (e.g. for a newsletter: sending platform and rough
+                 list size; for a SaaS MVP: whether they can code at all and who the first users are;
+                 for a video, the target platform and length). Fill any remaining slots with: output
+                 format, AI vs manual approach, free vs paid budget, tools they already use, platform/
+                 channel, skill level. Prefer multiple-choice. Each item:
                  {"id":"budget","question":"...","type":"choice","options":["Free only","Freemium OK","Paid is fine"]}
                  or {"id":"...","question":"...","type":"text"}. Never more than 5, and never ask
                  something you already know from the block below.
-                 Reuse these exact ids where the question fits, so the answers can be stored without
-                 guessing: "budget", "skill", "timeline", "approach", "priority", "constraints".${profileBlock(profile)}
+                 Reuse these exact ids where a generic question fits, so the answers can be stored
+                 without guessing: "budget", "skill", "timeline", "approach", "priority", "constraints".
+                 Goal-specific questions should get their own short id (e.g. "platform", "list_size").${profileBlock(profile)}
 
 Respond with exactly:
 {"intent":"...","goal":"...","title":"...","domains":[],"searchQueries":[],"pricing":"any","skill":"beginner","clarifyingQuestions":[]}`;
@@ -113,6 +121,11 @@ DESIGN RULES
    are 10-45 minutes, not 5.
 8. "tips": 2-4 items of genuinely non-obvious advice specific to THIS goal — sequencing
    traps, quality levers, cost savers. No generic "be creative" filler.
+9. "followUp": one short, specific question to ask the user right after presenting this
+   plan — something that would genuinely refine or extend it: a scope decision you had to
+   guess at, a follow-on stage worth adding, or a constraint you're unsure about. Grounded
+   in the actual goal and stages you just built, never generic ("anything else?", "how does
+   this look?", "want me to continue?").
 
 BUDGET: ${
     pricing === 'free'
@@ -127,7 +140,7 @@ Respond with JSON only:
 {"title":"...","summary":"...","outcome":"...","difficulty":"beginner|intermediate|advanced",
  "stages":[{"title":"...","toolSlug":"...","why":"...","input":"...","output":"...",
             "timeMinutes":20,"alternativeSlugs":["..."]}],
- "tips":["..."]}`;
+ "tips":["..."],"followUp":"..."}`;
 }
 
 export function plannerUser({ goal, candidates, priorWorkflow, adjustment }) {
@@ -204,8 +217,13 @@ Respond with JSON only:
 {"steps":[{"title":"...","detail":"..."}],"prompt":"..."|null,"settings":[{"label":"...","value":"..."}]|null,"pitfall":"...","checkpoint":"..."}`;
 }
 
-export function playbookUser({ goal, tool, stage, position, total, previous, next }) {
-  return `WORKFLOW GOAL: ${goal}
+export function playbookUser({ goal, tool, stage, position, total, previous, next, regenerate = false }) {
+  return `${regenerate
+    ? 'THE USER EXPLICITLY ASKED TO REGENERATE THIS STAGE — they already saw one version and want a ' +
+      'genuinely different, still-valid take: vary the concrete actions, the prompt wording, or which ' +
+      'settings you lead with, rather than restating the same steps in synonyms.\n\n'
+    : ''
+  }WORKFLOW GOAL: ${goal}
 
 STAGE ${position} OF ${total}: ${stage.title}
 TOOL: ${tool.name} — ${tool.tagline}

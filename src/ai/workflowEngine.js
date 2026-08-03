@@ -147,12 +147,17 @@ function buildDefaultIntakeQuestions(profile) {
   return questions.slice(0, MAX_INTAKE_QUESTIONS);
 }
 
-async function route({ message, contextMessages, categories, hasPriorWorkflow, profile }) {
+async function route({ message, contextMessages, categories, hasPriorWorkflow, profile, requireQuestions = false }) {
   const { data } = await completeJson({
     task: 'route',
     role: 'fast',
     temperature: 0.1,
-    maxTokens: 700,
+    // A full route response — goal, title, domains, search queries, plus up to
+    // 5 clarifying questions each carrying options — comfortably exceeds the
+    // 700-token budget this used to run on, which meant the JSON silently
+    // truncated right where clarifyingQuestions lives (the last field) and
+    // every first-time ask fell back to the same five generic questions.
+    maxTokens: 1400,
     messages: [
       { role: 'system', content: prompts.routerSystem(categories, profile) },
       ...contextMessages.slice(-4),
@@ -172,6 +177,28 @@ async function route({ message, contextMessages, categories, hasPriorWorkflow, p
       }
       if (['workflow', 'refine'].includes(v.intent) && !v.goal) {
         return '"goal" is required for workflow and refine intents.';
+      }
+      // A brand-new workflow ask needs real intake. Accepting an empty array
+      // here unconditionally is exactly what let every first-time ask fall
+      // through to the same generic questions regardless of the goal — force
+      // one self-repair pass unless the profile genuinely already covers it.
+      // Also lenient once intake is exhausted in some domain: at that point an
+      // empty array from the router is the *correct* answer for a returning
+      // user, not a compliance failure, and forcing a repair round-trip over
+      // it would only add latency for no benefit (the questions get thrown
+      // away by the exhaustion check downstream regardless).
+      const profileIsRich =
+        Boolean(profile?.skillLevel && profile?.pricingPreference) ||
+        (profile?.intakeAsks || []).some(a => hasExhaustedIntake(profile, a.domain, MAX_CLARIFYING_ASKS));
+      if (
+        requireQuestions &&
+        v.intent === 'workflow' &&
+        !hasPriorWorkflow &&
+        !profileIsRich &&
+        !(Array.isArray(v.clarifyingQuestions) && v.clarifyingQuestions.length)
+      ) {
+        return '"clarifyingQuestions" must contain 2-5 questions specific to this goal — it can only ' +
+          'be empty when the profile block already covers budget and skill.';
       }
       return null;
     },
@@ -344,6 +371,7 @@ function normalizePlan(raw, { bySlug, goal, title }) {
       .map(t => String(t).slice(0, 240))
       .filter(Boolean)
       .slice(0, 4),
+    followUp: String(raw.followUp || '').slice(0, 220),
   };
 }
 
@@ -371,16 +399,25 @@ function fallbackPlaybook(stage) {
   };
 }
 
-async function writePlaybook({ goal, stage, position, total, previous, next }) {
+async function writePlaybook({ goal, stage, position, total, previous, next, forceRefresh = false }) {
   const key = cache.makeKey('playbook', [goal, stage.toolSlug, stage.title, stage.output]);
-  const cached = await cache.get(key);
-  if (cached) return cached;
+
+  // A deep-dive regeneration is the user explicitly asking for something
+  // different from what they already saw — serving the cached entry back
+  // made the "Regenerate" button a no-op. Skip the read but still write the
+  // fresh result below, so reuse-on-refine and other callers stay current.
+  if (!forceRefresh) {
+    const cached = await cache.get(key);
+    if (cached) return cached;
+  }
 
   try {
     const { data } = await completeJson({
       task: 'playbook',
       role: 'planner',
-      temperature: 0.35,
+      // A touch more variation on a regeneration — the deterministic best
+      // guess is exactly what the user just asked to move away from.
+      temperature: forceRefresh ? 0.55 : 0.35,
       // A 4-step playbook with details plus a paste-ready prompt runs well past
       // 900 tokens; too tight a cap truncates the JSON mid-object and the
       // repair pass then salvages a partial, field-missing playbook.
@@ -389,7 +426,9 @@ async function writePlaybook({ goal, stage, position, total, previous, next }) {
         { role: 'system', content: prompts.playbookSystem() },
         {
           role: 'user',
-          content: prompts.playbookUser({ goal, tool: stage.tool, stage, position, total, previous, next }),
+          content: prompts.playbookUser({
+            goal, tool: stage.tool, stage, position, total, previous, next, regenerate: forceRefresh,
+          }),
         },
       ],
       // Strict enough that a truncated completion is rejected and retried
@@ -609,6 +648,8 @@ function composeReply(workflow) {
 
   lines.push('', 'Click any stage on the canvas for the step-by-step playbook and a ready-to-paste prompt.');
 
+  if (workflow.followUp) lines.push('', workflow.followUp);
+
   return lines.join('\n');
 }
 
@@ -626,6 +667,7 @@ function assemble(plan, meta) {
     costSummary: summariseCost(plan.stages),
     stages: plan.stages,
     tips: plan.tips,
+    followUp: plan.followUp || '',
     createdAt: new Date().toISOString(),
     meta,
   };
@@ -818,6 +860,10 @@ export async function handleMessage({
       clarifyingQuestions: [],
     };
   } else {
+    // Second, distinct label — the router call that follows can take anywhere
+    // from ~10s to the full timeout, and a single frozen "Understanding your
+    // goal" for that whole span reads as a hang on the SSE stream.
+    onProgress({ phase: 'understanding', message: 'Working out what to ask before planning' });
     try {
       routed = await route({
         message: sanitized,
@@ -825,6 +871,11 @@ export async function handleMessage({
         categories: catalog.categories,
         hasPriorWorkflow: Boolean(priorWorkflow),
         profile,
+        // clarifyingQuestions are only ever read downstream when there's a
+        // userId to store the intake state against — gate the requirement on
+        // the same condition so an anonymous/system caller never forces a
+        // repair round-trip over a field it will discard anyway.
+        requireQuestions: Boolean(userId),
       });
     } catch (err) {
       log.warn('Router failed — falling back to heuristics', { error: err.message });
@@ -1070,6 +1121,7 @@ export async function deepDive({ goal, workflow, stageId }) {
     total: stages.length,
     previous,
     next,
+    forceRefresh: true,
   });
 }
 

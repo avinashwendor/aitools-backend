@@ -53,6 +53,40 @@ const MAX_FORCED_PREFERRED = 4;
 
 const EMPTY_SIGNALS = { preferred: [], rejected: [], owned: [] };
 
+/**
+ * Resolve profile signal values to real catalog slugs.
+ *
+ * `preferredTools`/`rejectedTools` are written from `stage.toolSlug`, so
+ * they're already slugs. `toolsAlreadyUsing` is written from free-text LLM
+ * extraction ("Notion", "ChatGPT") with no catalog awareness, so a value that
+ * actually names a catalog tool by its display name — case, spacing and all —
+ * would otherwise never match `tool.slug` and the owned-tool boost below
+ * would silently never fire. A value that names a tool genuinely outside the
+ * catalog just resolves to nothing here, which is correct: there's no slug to
+ * boost.
+ */
+function resolveToSlugs(values, catalog) {
+  if (!values?.length) return [];
+
+  const bySlug = new Set(catalog.tools.map(t => t.slug));
+  const byName = new Map(catalog.tools.map(t => [t.name.toLowerCase(), t.slug]));
+
+  const out = [];
+  for (const raw of values) {
+    const value = String(raw || '').trim();
+    if (!value) continue;
+
+    if (bySlug.has(value)) { out.push(value); continue; }
+
+    const slugLike = value.toLowerCase().replace(/[\s_]+/g, '-');
+    if (bySlug.has(slugLike)) { out.push(slugLike); continue; }
+
+    const byNameMatch = byName.get(value.toLowerCase());
+    if (byNameMatch) out.push(byNameMatch);
+  }
+  return out;
+}
+
 function rank(scoreMap) {
   return [...scoreMap.entries()]
     .sort((a, b) => b[1] - a[1])
@@ -114,9 +148,9 @@ export async function retrieve({
 
   const wantedCategories = new Set(categories.filter(Boolean));
 
-  const preferredSet = new Set(signals?.preferred || []);
-  const rejectedSet = new Set(signals?.rejected || []);
-  const ownedSet = new Set(signals?.owned || []);
+  const preferredSet = new Set(resolveToSlugs(signals?.preferred, catalog));
+  const rejectedSet = new Set(resolveToSlugs(signals?.rejected, catalog));
+  const ownedSet = new Set(resolveToSlugs(signals?.owned, catalog));
 
   // ── 4. Structured boosts ───────────────────────────────────
   const scored = [];
