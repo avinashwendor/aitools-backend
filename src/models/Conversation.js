@@ -50,6 +50,15 @@ const conversationSchema = new mongoose.Schema(
       answersText: { type: String, default: '' },
       enrichedGoal: { type: String, default: '' },
       baseGoal: { type: String, default: '' },
+      /**
+       * Routing overrides derived deterministically from the user's typed
+       * intake answers (see ai/personalization.js). Carried across the
+       * approval turn so the generated plan honours what they picked even if
+       * the profile write failed.
+       */
+      intakeOverrides: { type: mongoose.Schema.Types.Mixed, default: {} },
+      /** Raw `{questionId: answer}` map, so a reload can still show it back. */
+      answers: { type: mongoose.Schema.Types.Mixed, default: {} },
     },
 
     turnCount: { type: Number, default: 0 },

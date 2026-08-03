@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import config from './config/index.js';
-import { User, Tool, Comment, Category, Conversation, UserProfile, WorkflowRun, SuggestedTool } from './models/index.js';
+import { User, Tool, Comment, Category, Conversation, UserProfile, TaskBoard, SuggestedTool } from './models/index.js';
 import {
   categories,
   seedUsers,
@@ -22,7 +22,7 @@ async function seed() {
       Category.deleteMany({}),
       Conversation.deleteMany({}),
       UserProfile.deleteMany({}),
-      WorkflowRun.deleteMany({}),
+      TaskBoard.deleteMany({}),
       SuggestedTool.deleteMany({}),
     ]);
 

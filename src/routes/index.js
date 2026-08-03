@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import config from '../config/index.js';
-import { getCatalog } from '../ai/catalog.js';
+import { getCatalog, getVectorStoreHealth } from '../ai/catalog.js';
 import { isLLMAvailable, getProviderStatus } from '../ai/llm.js';
 import { getStats } from '../ai/telemetry.js';
 import { getCacheStats } from '../ai/cache.js';
@@ -12,7 +12,7 @@ import commentRoutes from './commentRoutes.js';
 import adminRoutes from './adminRoutes.js';
 import chatRoutes from './chatRoutes.js';
 import categoryRoutes from './categoryRoutes.js';
-import workflowRoutes from './workflowRoutes.js';
+import taskRoutes from './taskRoutes.js';
 
 const router = Router();
 
@@ -54,6 +54,17 @@ router.get('/health/ready', async (req, res) => {
   });
 });
 
+// Vector store diagnostic — Qdrant reachability, collection point counts, embedding model.
+router.get('/health/vector', async (req, res) => {
+  const health = await getVectorStoreHealth();
+  const ok = health.configured === false || health.ok === true;
+  res.status(ok ? 200 : 503).json({
+    success: ok,
+    data: health,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // AI observability — latency percentiles, token spend, cache efficiency and
 // error rate per pipeline stage. Admin-only: it reveals cost and model routing.
 router.get('/health/ai', authenticate, requireAdmin, async (req, res) => {
@@ -78,7 +89,7 @@ router.use('/comments', commentRoutes);
 router.use('/admin', adminRoutes);
 router.use('/chat', chatRoutes);
 router.use('/categories', categoryRoutes);
-router.use('/workflows', workflowRoutes);
+router.use('/tasks', taskRoutes);
 
 export default router;
 

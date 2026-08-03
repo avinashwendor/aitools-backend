@@ -14,8 +14,10 @@
  *       literal "audio"/"voice" match in a tool's indexed fields). A no-op,
  *       pure-BM25 fallback when Qdrant isn't configured/reachable.
  *   3. Reciprocal Rank Fusion to merge every ranked list (lexical + dense)
- *   4. structured boosts (category intent, pricing constraint, quality prior)
+ *   4. structured boosts (category intent, pricing constraint, quality prior,
+ *      and the user's own history — see `signals`)
  *   5. per-category diversification so one crowded category can't fill the slate
+ *   6. guaranteed inclusion of tools the user explicitly prefers
  */
 
 import { getCatalog, bm25, tokenize, toCandidateCard } from './catalog.js';
@@ -30,6 +32,27 @@ const RRF_K = 60;
 /** Max tools from any one category in the final candidate slate. */
 const MAX_PER_CATEGORY = 6;
 
+/**
+ * Personalization multipliers, applied alongside the pricing and category
+ * boosts. Same philosophy as pricing: demote, never filter. A tool the user
+ * rejected may still be the only candidate that can do a given stage, and a
+ * workflow with a hole in it is worse than one containing a tool they'll swap.
+ */
+const SIGNAL_BOOSTS = {
+  preferred: 1.5,
+  owned: 1.2,
+  rejected: 0.15,
+};
+
+/**
+ * Cap on how many preferred tools may be force-included past the ranking.
+ * Without a cap, a user with 30 preferred tools would crowd out retrieval
+ * entirely and every workflow would collapse onto their existing stack.
+ */
+const MAX_FORCED_PREFERRED = 4;
+
+const EMPTY_SIGNALS = { preferred: [], rejected: [], owned: [] };
+
 function rank(scoreMap) {
   return [...scoreMap.entries()]
     .sort((a, b) => b[1] - a[1])
@@ -42,6 +65,8 @@ function rank(scoreMap) {
  * @param {string[]} [opts.categories]   category slugs the router inferred
  * @param {'free'|'freemium'|'paid'|'any'} [opts.pricing]
  * @param {number} [opts.limit]
+ * @param {{preferred?:string[],rejected?:string[],owned?:string[]}} [opts.signals]
+ *   the user's own history, from `personalization.retrievalSignals`
  * @returns {Promise<{candidates: object[], cards: object[], corpusSize: number}>}
  */
 export async function retrieve({
@@ -49,6 +74,7 @@ export async function retrieve({
   categories = [],
   pricing = 'any',
   limit = 32,
+  signals = EMPTY_SIGNALS,
 } = {}) {
   const catalog = await getCatalog();
   if (!catalog.tools.length) return { candidates: [], cards: [], corpusSize: 0 };
@@ -88,6 +114,10 @@ export async function retrieve({
 
   const wantedCategories = new Set(categories.filter(Boolean));
 
+  const preferredSet = new Set(signals?.preferred || []);
+  const rejectedSet = new Set(signals?.rejected || []);
+  const ownedSet = new Set(signals?.owned || []);
+
   // ── 4. Structured boosts ───────────────────────────────────
   const scored = [];
   for (const [docIndex, rrfScore] of fused) {
@@ -109,6 +139,12 @@ export async function retrieve({
     } else if (pricing === 'paid') {
       if (tool.pricing === 'paid') score *= 1.35;
     }
+
+    // The user's own history. Applied after the pricing constraint so an
+    // explicit rejection still suppresses a tool that pricing just boosted.
+    if (rejectedSet.has(tool.slug)) score *= SIGNAL_BOOSTS.rejected;
+    else if (preferredSet.has(tool.slug)) score *= SIGNAL_BOOSTS.preferred;
+    else if (ownedSet.has(tool.slug)) score *= SIGNAL_BOOSTS.owned;
 
     // Quality prior — ratings and adoption, log-damped so a mega-popular tool
     // can't dominate purely on volume.
@@ -144,10 +180,37 @@ export async function retrieve({
 
   const selected = [...primary, ...overflow].slice(0, limit);
 
+  // ── 6. Guaranteed inclusion of preferred tools ─────────────
+  // A ×1.5 boost is useless if the tool still lands at rank 40 of a 32-slot
+  // slate: the planner can only pick what it is shown, so "prefer these tools"
+  // in the prompt is unactionable unless they are actually in the list. Swap
+  // the weakest non-preferred entries out rather than growing the slate, so
+  // the prompt budget stays fixed.
+  const forced = [];
+  if (preferredSet.size) {
+    const selectedSlugs = new Set(selected.map(s => s.tool.slug));
+    for (const entry of scored) {
+      if (forced.length >= MAX_FORCED_PREFERRED) break;
+      if (!preferredSet.has(entry.tool.slug)) continue;
+      if (selectedSlugs.has(entry.tool.slug)) continue;
+      forced.push(entry);
+    }
+
+    for (const entry of forced) {
+      // Drop from the tail, which is the lowest-scoring non-preferred entry.
+      const dropIndex = selected.findLastIndex(s => !preferredSet.has(s.tool.slug));
+      if (dropIndex === -1) break;
+      selected.splice(dropIndex, 1);
+      selected.push(entry);
+    }
+  }
+
   log.debug('Retrieved candidates', {
     queries: cleanQueries.length,
     corpus: catalog.tools.length,
     returned: selected.length,
+    forcedPreferred: forced.length,
+    demotedRejected: rejectedSet.size,
     categories: [...new Set(selected.map(s => s.tool.category))].join(','),
   });
 

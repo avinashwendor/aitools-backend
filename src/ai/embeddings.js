@@ -21,17 +21,59 @@ import { createLogger } from '../utils/logger.js';
 const log = createLogger('ai:embeddings');
 
 let extractorPromise = null;
+let modelReady = false;
+
+/** Host-safe label for logs — never prints tokens or paths. */
+export function embeddingModelLabel() {
+  return config.vector.embeddingModel;
+}
 
 function loadExtractor() {
   if (!extractorPromise) {
+    const started = Date.now();
+    log.info('Loading embedding model (first run downloads ONNX weights — can take 1-2 min on Railway)', {
+      model: config.vector.embeddingModel,
+      dimensions: config.vector.dimensions,
+    });
+
     extractorPromise = import('@huggingface/transformers')
       .then(({ pipeline }) => pipeline('feature-extraction', config.vector.embeddingModel))
+      .then(extractor => {
+        modelReady = true;
+        log.info('Embedding model ready', {
+          model: config.vector.embeddingModel,
+          ms: Date.now() - started,
+        });
+        return extractor;
+      })
       .catch(err => {
-        extractorPromise = null; // allow a retry on the next call
+        extractorPromise = null;
+        modelReady = false;
+        log.error('Embedding model failed to load — vector sync and semantic search disabled', {
+          model: config.vector.embeddingModel,
+          error: err.message,
+          ms: Date.now() - started,
+        });
         throw err;
       });
   }
   return extractorPromise;
+}
+
+/** Pre-load the model so the first catalog upsert doesn't fail in parallel. */
+export async function warmupEmbeddings() {
+  if (!isEmbeddingConfigured()) return { ok: false, reason: 'QDRANT_URL not set' };
+  try {
+    await loadExtractor();
+    await embed('warmup ping');
+    return { ok: true, model: config.vector.embeddingModel };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+export function isEmbeddingModelReady() {
+  return modelReady;
 }
 
 export const isEmbeddingConfigured = () => Boolean(config.vector.url);
@@ -62,4 +104,11 @@ export async function embedBatch(texts) {
   return results;
 }
 
-export default { embed, embedBatch, isEmbeddingConfigured };
+export default {
+  embed,
+  embedBatch,
+  isEmbeddingConfigured,
+  isEmbeddingModelReady,
+  warmupEmbeddings,
+  embeddingModelLabel,
+};

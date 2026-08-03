@@ -178,6 +178,20 @@ async function compact(key, convo) {
   log.debug('Conversation compacted', { kept: WINDOW, folded: overflow.length });
 }
 
+/**
+ * Replace the stored workflow without recording a conversational turn.
+ *
+ * Regenerating one stage's playbook changes the workflow but isn't a turn —
+ * routing it through `appendTurn` would inflate `turnCount` and bring the
+ * compaction window forward for something the user never said.
+ */
+export async function updateLastWorkflow(userId, sessionId, workflow) {
+  await Conversation.updateOne(
+    { user: userId, sessionId: sessionId || 'default' },
+    { $set: { lastWorkflow: workflow, lastActivity: new Date() } }
+  );
+}
+
 export async function clearConversation(userId, sessionId) {
   await Conversation.deleteOne({ user: userId, sessionId: sessionId || 'default' });
 }
@@ -213,24 +227,33 @@ export async function loadProfile(userId) {
 /**
  * Merge newly-learned facts into a user's long-term profile. Safe to call
  * with an empty/no-op `facts` object — upserts so the first call creates it.
+ *
+ * @param {'inferred'|'user'} [source] see `UserProfile.applyFacts` — an
+ *   inferred fact never overwrites a field the user pinned in Settings.
  */
-export async function updateProfileFacts(userId, facts) {
+export async function updateProfileFacts(userId, facts, source = 'inferred') {
   if (!facts || !Object.keys(facts).length) return;
 
   let profile = await UserProfile.findOne({ user: userId });
   if (!profile) profile = new UserProfile({ user: userId });
 
-  profile.applyFacts(facts);
+  profile.applyFacts(facts, source);
   await profile.save();
   return profile;
 }
 
-export async function incrementClarifyingQuestionsAsked(userId) {
-  await UserProfile.updateOne(
-    { user: userId },
-    { $inc: { clarifyingQuestionsAsked: 1 }, $setOnInsert: { user: userId } },
-    { upsert: true }
-  );
+/**
+ * Record that we asked intake questions about a domain. Scoped per domain so
+ * a user who has been asked about "video" three times still gets a proper
+ * intake the first time they ask about "web development".
+ */
+export async function recordIntakeAsk(userId, domain) {
+  let profile = await UserProfile.findOne({ user: userId });
+  if (!profile) profile = new UserProfile({ user: userId });
+
+  profile.recordIntakeAsk(domain);
+  await profile.save();
+  return profile;
 }
 
 export async function saveClarificationState(userId, sessionId, state) {
@@ -244,7 +267,13 @@ export async function saveClarificationState(userId, sessionId, state) {
 export async function clearClarificationState(userId, sessionId) {
   await Conversation.updateOne(
     { user: userId, sessionId: sessionId || 'default' },
-    { $set: { clarificationState: { phase: null, questions: [], answersText: '', enrichedGoal: '', baseGoal: '' } } }
+    {
+      $set: {
+        clarificationState: {
+          phase: null, questions: [], answersText: '', enrichedGoal: '', baseGoal: '', intakeOverrides: {},
+        },
+      },
+    }
   );
 }
 
@@ -272,11 +301,12 @@ export default {
   loadConversation,
   buildContextMessages,
   appendTurn,
+  updateLastWorkflow,
   clearConversation,
   listConversations,
   loadProfile,
   updateProfileFacts,
-  incrementClarifyingQuestionsAsked,
+  recordIntakeAsk,
   saveClarificationState,
   clearClarificationState,
   recallRelatedSessions,

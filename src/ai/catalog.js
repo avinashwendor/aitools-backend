@@ -8,7 +8,12 @@
 
 import Tool from '../models/Tool.js';
 import { bus, EVENTS } from '../utils/events.js';
-import { upsertTool, deleteTool, isVectorStoreConfigured } from './vectorStore.js';
+import {
+  deleteTool,
+  isVectorStoreConfigured,
+  syncToolsToVectorStore,
+  getVectorStoreHealth,
+} from './vectorStore.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ai:catalog');
@@ -99,28 +104,70 @@ const state = {
  */
 let needsVectorSync = true;
 
-/** Fire-and-forget: keeps the Qdrant `tools` collection in step with Mongo. */
+let vectorSyncInFlight = null;
+
+/** Keeps the Qdrant `tools` collection in step with Mongo (batched upserts + logs). */
 async function syncVectorStore(oldTools, newTools) {
-  if (!isVectorStoreConfigured()) return;
+  if (!isVectorStoreConfigured()) return { configured: false };
 
-  const oldSlugs = new Set(oldTools.map(t => t.slug));
-  const newSlugs = new Set(newTools.map(t => t.slug));
-  const removed = [...oldSlugs].filter(slug => !newSlugs.has(slug));
+  if (vectorSyncInFlight) return vectorSyncInFlight;
 
-  const results = await Promise.all(newTools.map(t => upsertTool(t)));
-  await Promise.all(removed.map(slug => deleteTool(slug)));
+  vectorSyncInFlight = (async () => {
+    const oldSlugs = new Set(oldTools.map(t => t.slug));
+    const newSlugs = new Set(newTools.map(t => t.slug));
+    const removed = [...oldSlugs].filter(slug => !newSlugs.has(slug));
 
-  const succeeded = results.filter(Boolean).length;
-  if (succeeded < newTools.length) {
-    log.warn('Vector store sync partially failed — some tools have no embedding', {
-      attempted: newTools.length,
-      succeeded,
-      removed: removed.length,
-    });
-  } else {
-    log.info('Vector store synced', { upserted: succeeded, removed: removed.length });
+    const stats = await syncToolsToVectorStore(newTools);
+
+    for (const slug of removed) {
+      await deleteTool(slug);
+    }
+
+    if (removed.length) {
+      log.info('Removed stale tool embeddings', { count: removed.length });
+    }
+
+    return { ...stats, removed: removed.length };
+  })().finally(() => {
+    vectorSyncInFlight = null;
+  });
+
+  return vectorSyncInFlight;
+}
+
+/**
+ * Awaited on server boot — populates Qdrant after catalog load with a timeout.
+ * @param {{ timeoutMs?: number }} [opts]
+ */
+export async function warmVectorIndex({ timeoutMs = 180_000 } = {}) {
+  if (!isVectorStoreConfigured()) {
+    log.info('Vector store disabled — set QDRANT_URL on the backend to enable semantic search');
+    return { configured: false, reason: 'QDRANT_URL not set' };
+  }
+
+  const catalog = await getCatalog();
+  needsVectorSync = true;
+
+  const syncPromise = (async () => {
+    needsVectorSync = false;
+    return syncVectorStore([], catalog.tools);
+  })();
+
+  const timeout = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`Vector sync timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([syncPromise, timeout]);
+  } catch (err) {
+    needsVectorSync = true;
+    log.error('Vector store warmup failed', { error: err.message });
+    const health = await getVectorStoreHealth();
+    return { configured: true, ok: false, error: err.message, health };
   }
 }
+
+export { getVectorStoreHealth };
 
 function buildIndex(tools) {
   const index = new Map();

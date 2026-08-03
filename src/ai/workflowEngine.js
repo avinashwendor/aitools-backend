@@ -18,12 +18,19 @@ import {
   buildContextMessages,
   loadProfile,
   updateProfileFacts,
-  incrementClarifyingQuestionsAsked,
+  recordIntakeAsk,
   recallRelatedSessions,
   saveClarificationState,
   clearClarificationState,
 } from './memory.js';
 import cache from './cache.js';
+import {
+  profileFingerprint,
+  retrievalSignals,
+  hasExhaustedIntake,
+  factsFromIntakeAnswers,
+  GENERAL_DOMAIN,
+} from './personalization.js';
 import * as prompts from './prompts.js';
 import { patchWorkflow } from './workflowDiff.js';
 import { webSearch, isWebSearchConfigured, wantsFreshInfo } from './tools/webSearch.js';
@@ -64,15 +71,18 @@ function truncate(text, max) {
 
 const VALID_INTENTS = ['workflow', 'refine', 'discover', 'question', 'smalltalk'];
 
-/** Caps how many times we'll ever interrupt a returning user with clarifying questions. */
+/** How many times we'll interrupt a returning user with intake, per domain. */
 const MAX_CLARIFYING_ASKS = 3;
+
+/** Intake length, enforced identically by the router prompt and both builders. */
+const MAX_INTAKE_QUESTIONS = 5;
 
 const APPROVAL_RE = /\b(yes|create the workflow|generate the workflow|build it|go ahead|approve|looks good|let'?s do it|start planning|make the workflow|design the workflow)\b/i;
 
 function sanitizeClarifyingQuestions(raw) {
   return (Array.isArray(raw) ? raw : [])
     .filter(q => q && q.question)
-    .slice(0, 6)
+    .slice(0, MAX_INTAKE_QUESTIONS)
     .map((q, i) => ({
       id: String(q.id || `q${i}`).slice(0, 40),
       question: String(q.question).slice(0, 160),
@@ -134,7 +144,7 @@ function buildDefaultIntakeQuestions(profile) {
     });
   }
 
-  return questions.slice(0, 5);
+  return questions.slice(0, MAX_INTAKE_QUESTIONS);
 }
 
 async function route({ message, contextMessages, categories, hasPriorWorkflow, profile }) {
@@ -168,7 +178,6 @@ async function route({ message, contextMessages, categories, hasPriorWorkflow, p
   });
 
   const validCategories = new Set(categories);
-  const askedTooOften = (profile?.clarifyingQuestionsAsked || 0) >= MAX_CLARIFYING_ASKS;
 
   return {
     intent: data.intent,
@@ -185,9 +194,9 @@ async function route({ message, contextMessages, categories, hasPriorWorkflow, p
     skill: ['beginner', 'intermediate', 'advanced'].includes(data.skill)
       ? data.skill
       : (profile?.skillLevel || 'beginner'),
-    // A returning user who's already been asked enough gets our best guess
-    // instead of another round of questions.
-    clarifyingQuestions: askedTooOften ? [] : sanitizeClarifyingQuestions(data.clarifyingQuestions),
+    // Whether to actually ask these is decided by the caller, which knows the
+    // routed domain and so can throttle per-domain rather than globally.
+    clarifyingQuestions: sanitizeClarifyingQuestions(data.clarifyingQuestions),
   };
 }
 
@@ -526,6 +535,10 @@ async function writeAllPlaybooks(goal, stages, onProgress) {
         message: `Writing steps for ${stage.tool.name}`,
         done,
         total: stages.length,
+        // Carried so the canvas can fill this node in as it lands, rather than
+        // waiting for every other stage to finish first.
+        stageId: stage.id,
+        stage: { ...stage, ...results[i] },
       });
     }
   }
@@ -625,12 +638,13 @@ function assemble(plan, meta) {
 // Non-workflow intents
 // ─────────────────────────────────────────────────────────────
 
-async function answerGrounded({ message, routed, contextMessages, allowExternalTools, userId }) {
+async function answerGrounded({ message, routed, contextMessages, allowExternalTools, userId, signals }) {
   const { cards } = await retrieve({
     queries: routed.searchQueries.length ? routed.searchQueries : [message],
     categories: routed.domains,
     pricing: routed.pricing,
     limit: 14,
+    signals,
   });
 
   // Bounded, single web search: only when the user has opted in, the tool is
@@ -685,10 +699,19 @@ async function answerGrounded({ message, routed, contextMessages, allowExternalT
  * @param {object} input.conversation   from memory.loadConversation
  * @param {string} [input.userId]       used to load/update long-term memory (profile + semantic recall)
  * @param {boolean} [input.allowExternalTools] user opt-in for web-search-discovered tools beyond the catalog
+ * @param {Record<string,string>} [input.intakeAnswers] structured answers to the clarifying questions,
+ *   keyed by question id — read directly instead of re-inferred from the prose the user sees
  * @param {(event:object)=>void} [input.onProgress]
  * @returns {Promise<{message:string, workflow:object|null, intent:string, title?:string, goal?:string}>}
  */
-export async function handleMessage({ message, conversation, userId = null, allowExternalTools = false, onProgress = noop }) {
+export async function handleMessage({
+  message,
+  conversation,
+  userId = null,
+  allowExternalTools = false,
+  intakeAnswers = null,
+  onProgress = noop,
+}) {
   const startedAt = Date.now();
 
   if (!isLLMAvailable()) {
@@ -729,6 +752,18 @@ export async function handleMessage({ message, conversation, userId = null, allo
   // ── Clarification intake (no planner tokens until user approves) ──
   if (clarifyState?.phase === 'asking' && !priorWorkflow) {
     const enrichedGoal = `${clarifyState.baseGoal || sanitized}\n\nUser preferences:\n${sanitized}`;
+
+    // The answers arrived as structured choices, so read them rather than
+    // sending the prose back through an LLM to re-derive what the user
+    // already picked from a dropdown. Awaited, not fire-and-forget: the
+    // approval turn immediately below reloads this profile.
+    const { facts, overrides } = factsFromIntakeAnswers(intakeAnswers);
+    if (userId && Object.keys(facts).length) {
+      await updateProfileFacts(userId, facts).catch(err =>
+        log.warn('Failed to persist intake facts', { error: err.message })
+      );
+    }
+
     if (userId) {
       await saveClarificationState(userId, sessionId, {
         phase: 'awaiting_approval',
@@ -736,6 +771,12 @@ export async function handleMessage({ message, conversation, userId = null, allo
         answersText: sanitized,
         enrichedGoal,
         baseGoal: clarifyState.baseGoal || sanitized,
+        // Carried forward so the approval turn honours the answers even if the
+        // profile write above failed.
+        intakeOverrides: overrides,
+        // Kept so a page reload can still show what was captured, rather than
+        // only the turn that submitted it.
+        answers: intakeAnswers || {},
       });
     }
     return {
@@ -747,12 +788,15 @@ export async function handleMessage({ message, conversation, userId = null, allo
       intent: 'clarify',
       readyToApprove: true,
       clarifyingQuestions: null,
+      capturedPreferences: intakeAnswers || null,
     };
   }
 
   let forcedGoal = null;
+  let forcedOverrides = {};
   if (clarifyState?.phase === 'awaiting_approval' && APPROVAL_RE.test(sanitized)) {
     forcedGoal = clarifyState.enrichedGoal || clarifyState.baseGoal || sanitized;
+    forcedOverrides = clarifyState.intakeOverrides || {};
     if (userId) await clearClarificationState(userId, sessionId);
   }
 
@@ -767,8 +811,10 @@ export async function handleMessage({ message, conversation, userId = null, allo
       title: clarifyState?.baseGoal?.slice(0, 80) || '',
       domains: [],
       searchQueries: [forcedGoal.slice(0, 80)],
-      pricing: profile?.pricingPreference || 'any',
-      skill: profile?.skillLevel || 'beginner',
+      // The intake answers win over the stored profile: they are what the user
+      // said about *this* build, minutes ago.
+      pricing: forcedOverrides.pricing || profile?.pricingPreference || 'any',
+      skill: forcedOverrides.skill || profile?.skillLevel || 'beginner',
       clarifyingQuestions: [],
     };
   } else {
@@ -802,24 +848,37 @@ export async function handleMessage({ message, conversation, userId = null, allo
     return { message: prompts.smalltalkReply(), workflow: null, intent: 'smalltalk' };
   }
 
-  // Mandatory intake before the first workflow. Workflow Studio (wf-* sessions)
-  // always gets a short Q&A — even when the quick-start prompt is detailed.
-  // Other sessions only ask when the router returns clarifying questions.
-  const isWorkflowStudio = String(sessionId || '').startsWith('wf-');
-  if (routed.intent === 'workflow' && !priorWorkflow && !forcedGoal) {
-    const questions = routed.clarifyingQuestions?.length
-      ? routed.clarifyingQuestions
-      : (isWorkflowStudio ? buildDefaultIntakeQuestions(profile) : []);
+  // Mandatory intake before the first workflow — on every surface, not just
+  // Workflow Studio. `/chat` generates real workflows too, and used to plan
+  // them from a one-line goal with no questions asked at all.
+  //
+  // Repetition is throttled per routed domain (and decays), so a user who has
+  // been asked about video three times still gets a proper intake the first
+  // time they ask for a web app.
+  //
+  // Requires a userId: the answers are processed by matching them against a
+  // persisted `clarificationState`, so asking without somewhere to store that
+  // state would loop the same questions forever with no way to move past them.
+  if (userId && routed.intent === 'workflow' && !priorWorkflow && !forcedGoal) {
+    const intakeDomain = routed.domains[0] || GENERAL_DOMAIN;
+    const exhausted = hasExhaustedIntake(profile, intakeDomain, MAX_CLARIFYING_ASKS);
+
+    const questions = exhausted
+      ? []
+      : (routed.clarifyingQuestions?.length
+          ? routed.clarifyingQuestions
+          : buildDefaultIntakeQuestions(profile));
 
     if (questions.length && clarifyState?.phase !== 'awaiting_approval') {
       if (userId) {
-        incrementClarifyingQuestionsAsked(userId).catch(() => {});
+        recordIntakeAsk(userId, intakeDomain).catch(() => {});
         saveClarificationState(userId, sessionId, {
           phase: 'asking',
           questions,
           answersText: '',
           enrichedGoal: '',
           baseGoal: routed.goal,
+          intakeOverrides: {},
         }).catch(() => {});
       }
       return {
@@ -831,19 +890,28 @@ export async function handleMessage({ message, conversation, userId = null, allo
     }
   }
 
+  const signals = retrievalSignals(profile);
+
   if (routed.intent === 'discover' || routed.intent === 'question') {
     onProgress({ phase: 'searching', message: `Searching ${catalog.tools.length} tools` });
-    return answerGrounded({ message: sanitized, routed, contextMessages, allowExternalTools: resolvedExternalTools, userId });
+    return answerGrounded({
+      message: sanitized, routed, contextMessages,
+      allowExternalTools: resolvedExternalTools, userId, signals,
+    });
   }
 
   // ── Workflow / refine ────────────────────────────────────
   const isRefine = routed.intent === 'refine' && priorWorkflow;
 
+  // The fingerprint is what stops one user's cached plan being served to
+  // another whose profile would have produced a different one. Without it the
+  // whole personalization layer is silently discarded on every cache hit.
   const cacheKey = cache.makeKey('workflow', [
     routed.goal,
     routed.pricing,
     routed.skill,
     catalog.tools.length,
+    profileFingerprint(profile),
     isRefine ? priorWorkflow.id : 'fresh',
   ]);
 
@@ -871,6 +939,7 @@ export async function handleMessage({ message, conversation, userId = null, allo
     categories: routed.domains,
     pricing: routed.pricing,
     limit: config.ai.retrievalCandidates,
+    signals,
   });
 
   if (!cards.length) {
@@ -900,10 +969,32 @@ export async function handleMessage({ message, conversation, userId = null, allo
 
   if (normalized.stages.length < 2) {
     log.warn('Plan collapsed after validation', { stages: normalized.stages.length });
-    return answerGrounded({ message: sanitized, routed, contextMessages, allowExternalTools: resolvedExternalTools, userId });
+    return answerGrounded({
+      message: sanitized, routed, contextMessages,
+      allowExternalTools: resolvedExternalTools, userId, signals,
+    });
   }
 
   const reusedCount = isRefine ? reusePlaybooksFromPrior(normalized.stages, priorWorkflow) : 0;
+
+  // The stage list — tools, titles, handovers, timings — is fully decided at
+  // this point, but the playbooks below take most of the wall-clock time.
+  // Emitting the skeleton now lets the canvas draw the real graph immediately
+  // instead of showing a spinner for the whole pipeline.
+  onProgress({
+    phase: 'plan',
+    message: 'Workflow mapped — writing the steps',
+    workflow: assemble(normalized, {
+      model,
+      corpusSize,
+      candidatesConsidered: cards.length,
+      pricing: routed.pricing,
+      skill: routed.skill,
+      ms: Date.now() - startedAt,
+      cached: false,
+      partial: true,
+    }),
+  });
 
   onProgress({
     phase: 'playbook',

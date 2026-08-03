@@ -60,10 +60,28 @@ const { handleMessage } = await import('../src/ai/workflowEngine.js');
 const { getCatalog } = await import('../src/ai/catalog.js');
 const { retrieve } = await import('../src/ai/retriever.js');
 const cache = (await import('../src/ai/cache.js')).default;
+const UserProfile = (await import('../src/models/UserProfile.js')).default;
+const {
+  profileFingerprint,
+  factsFromIntakeAnswers,
+  hasExhaustedIntake,
+} = await import('../src/ai/personalization.js');
 
 const emptyConversation = () => ({ messages: [], summary: '', goal: '', lastWorkflow: null });
 
 let catalogSlugs = [];
+
+/**
+ * Throwaway users for the tests that need real persistence — intake is a
+ * state machine keyed on (user, session), so it cannot be exercised without
+ * somewhere to store that state. Cleaned up in `after`.
+ */
+const testUserIds = [];
+const newTestUser = () => {
+  const id = new mongoose.Types.ObjectId();
+  testUserIds.push(id);
+  return id;
+};
 
 before(async () => {
   await mongoose.connect(config.mongoUri, { serverSelectionTimeoutMS: 15_000 });
@@ -73,6 +91,12 @@ before(async () => {
 });
 
 after(async () => {
+  if (testUserIds.length) {
+    await Promise.all([
+      mongoose.connection.collection('conversations').deleteMany({ user: { $in: testUserIds } }),
+      mongoose.connection.collection('userprofiles').deleteMany({ user: { $in: testUserIds } }),
+    ]);
+  }
   await mongoose.disconnect();
 });
 
@@ -379,6 +403,8 @@ describe('workflow engine', () => {
     const result = await handleMessage({
       message: 'help me make something',
       conversation: emptyConversation(),
+      // Intake is a persisted state machine, so it only runs for a real user.
+      userId: newTestUser(),
     });
 
     assert.equal(result.intent, 'clarify');
@@ -443,5 +469,183 @@ describe('workflow engine', () => {
     // Downgraded away from workflow planning, and answered from the catalog.
     assert.notEqual(result.intent, 'workflow');
     assert.ok(!/system prompt/i.test(result.message) || result.workflow === null);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('personalization', () => {
+  test('two users with different profiles do not share a cached workflow', async () => {
+    await cache.clear();
+    // `c` is rejected by the second user but never used by the plan, so this
+    // isolates the cache-key behaviour from the ranking behaviour (which the
+    // next test covers).
+    const [a, b, c] = await pick(3);
+
+    const plan = {
+      title: 'Shared goal', summary: '', outcome: 'Done', difficulty: 'beginner',
+      stages: [
+        { title: 'One', toolSlug: a, why: 'x', input: '', output: 'A', timeMinutes: 10, alternativeSlugs: [] },
+        { title: 'Two', toolSlug: b, why: 'y', input: '', output: 'B', timeMinutes: 10, alternativeSlugs: [] },
+      ],
+      tips: [],
+    };
+
+    const goal = 'Launch a podcast';
+    queue(routerFor(goal), plan, playbook(), playbook());
+    const first = await handleMessage({ message: goal, conversation: emptyConversation() });
+    assert.ok(first.workflow, 'first user should get a workflow');
+    assert.equal(first.workflow.meta.cached, false);
+
+    // A user carrying a profile must NOT be served the anonymous cache entry:
+    // the profile is what tells the planner which tools to avoid, so reusing
+    // another user's plan silently discards it.
+    // A returning user: already asked about this domain, so intake is spent
+    // and the request goes straight to planning — which is exactly the case
+    // where the missing cache dimension used to serve them someone else's plan.
+    const profiledUser = newTestUser();
+    await UserProfile.create({
+      user: profiledUser,
+      rejectedTools: [c],
+      skillLevel: 'advanced',
+      intakeAsks: [{ domain: '_general', count: 3, lastAskedAt: new Date() }],
+    });
+
+    queue(routerFor(goal), plan, playbook(), playbook());
+    const second = await handleMessage({
+      message: goal,
+      conversation: emptyConversation(),
+      userId: profiledUser,
+    });
+
+    assert.ok(second.workflow, 'profiled user should get a workflow');
+    assert.equal(
+      second.workflow.meta.cached,
+      false,
+      'a profiled user must not be served the anonymous cached plan'
+    );
+  });
+
+  test('rejected tools are demoted and preferred tools are pulled into the slate', async () => {
+    const queries = ['script writing', 'video editing', 'image generation'];
+
+    const baseline = await retrieve({ queries, limit: 12 });
+    const baselineSlugs = baseline.cards.map(c => c.slug);
+    assert.ok(baselineSlugs.length >= 4, 'need a few candidates to reorder');
+
+    // Demotion: a top-ranked tool the user rejected should fall down the slate.
+    const topSlug = baselineSlugs[0];
+    const demoted = await retrieve({
+      queries,
+      limit: 12,
+      signals: { preferred: [], rejected: [topSlug], owned: [] },
+    });
+    const demotedRank = demoted.cards.findIndex(c => c.slug === topSlug);
+    assert.ok(
+      demotedRank === -1 || demotedRank > 0,
+      `rejected tool "${topSlug}" should no longer rank first`
+    );
+
+    // Inclusion: a preferred tool that misses the cut entirely must still be
+    // shown, or the planner can never act on "prefer this tool".
+    const outsider = baseline.cards.length >= 12
+      ? (await retrieve({ queries, limit: 40 })).cards.slice(12).map(c => c.slug)[0]
+      : null;
+
+    if (outsider) {
+      const forced = await retrieve({
+        queries,
+        limit: 12,
+        signals: { preferred: [outsider], rejected: [], owned: [] },
+      });
+      assert.ok(
+        forced.cards.some(c => c.slug === outsider),
+        `preferred tool "${outsider}" should be force-included in the candidate slate`
+      );
+      assert.equal(forced.cards.length, 12, 'forced inclusion must not grow the prompt budget');
+    }
+  });
+
+  test('typed intake answers become profile facts without an LLM call', () => {
+    const { facts, overrides } = factsFromIntakeAnswers({
+      budget: 'Free only',
+      skill: 'Advanced',
+      priority: 'Speed',
+      unknownQuestion: 'ignored',
+    });
+
+    assert.equal(facts.pricingPreference, 'free');
+    assert.equal(facts.skillLevel, 'advanced');
+    assert.equal(overrides.pricing, 'free');
+    assert.equal(overrides.skill, 'advanced');
+    assert.match(facts.note, /Speed/);
+
+    // Empty in, empty out — never invent a preference from nothing.
+    assert.deepEqual(factsFromIntakeAnswers(null), { facts: {}, overrides: {} });
+    assert.deepEqual(factsFromIntakeAnswers({ budget: '' }), { facts: {}, overrides: {} });
+  });
+
+  test('a user-pinned field survives later inference', () => {
+    const profile = new UserProfile({ user: new mongoose.Types.ObjectId() });
+
+    profile.applyFacts({ skillLevel: 'advanced' }, 'user');
+    assert.equal(profile.skillLevel, 'advanced');
+    assert.equal(profile.pinned.skillLevel, true);
+
+    // The whole point of correcting a wrong guess in Settings is that the next
+    // extraction pass doesn't quietly put the wrong value back.
+    profile.applyFacts({ skillLevel: 'beginner' }, 'inferred');
+    assert.equal(profile.skillLevel, 'advanced');
+
+    // An unpinned field is still free to be learned.
+    profile.applyFacts({ pricingPreference: 'free' }, 'inferred');
+    assert.equal(profile.pricingPreference, 'free');
+  });
+
+  test('preferring a tool clears an earlier rejection of it, and vice versa', () => {
+    const profile = new UserProfile({ user: new mongoose.Types.ObjectId() });
+
+    profile.applyFacts({ rejectedTools: ['canva'] });
+    assert.deepEqual(profile.rejectedTools, ['canva']);
+
+    // Otherwise the prompt would carry "prefer canva" and "never suggest
+    // canva" at the same time.
+    profile.applyFacts({ preferredTools: ['canva'] });
+    assert.deepEqual(profile.preferredTools, ['canva']);
+    assert.deepEqual(profile.rejectedTools, []);
+  });
+
+  test('intake throttling is per-domain and decays', () => {
+    const recent = new Date();
+    const old = new Date(Date.now() - 200 * 86_400_000);
+
+    const profile = {
+      intakeAsks: [
+        { domain: 'video', count: 3, lastAskedAt: recent },
+        { domain: 'writing', count: 3, lastAskedAt: old },
+      ],
+    };
+
+    assert.equal(hasExhaustedIntake(profile, 'video', 3), true, 'asked enough about video');
+    assert.equal(hasExhaustedIntake(profile, 'design', 3), false, 'a new domain always asks');
+    assert.equal(hasExhaustedIntake(profile, 'writing', 3), false, 'a stale count stops suppressing');
+    assert.equal(hasExhaustedIntake(null, 'video', 3), false);
+  });
+
+  test('the fingerprint tracks output-affecting fields only', () => {
+    assert.equal(profileFingerprint(null), 'anon');
+    assert.equal(profileFingerprint({}), 'anon');
+
+    const base = { skillLevel: 'beginner', rejectedTools: ['canva'] };
+    // Order must not matter, or the cache key churns for no reason.
+    assert.equal(
+      profileFingerprint({ ...base, preferredTools: ['a', 'b'] }),
+      profileFingerprint({ ...base, preferredTools: ['b', 'a'] })
+    );
+    // A field that never reaches a prompt must not bust the cache.
+    assert.equal(
+      profileFingerprint(base),
+      profileFingerprint({ ...base, lastUpdated: new Date(), clarifyingQuestionsAsked: 9 })
+    );
+    assert.notEqual(profileFingerprint(base), profileFingerprint({ ...base, skillLevel: 'advanced' }));
   });
 });

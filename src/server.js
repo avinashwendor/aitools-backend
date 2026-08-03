@@ -9,7 +9,7 @@ import config from './config/index.js';
 import routes from './routes/index.js';
 import { notFound, errorHandler } from './middleware/errorHandler.js';
 import { rateLimit } from './middleware/rateLimit.js';
-import { getCatalog } from './ai/catalog.js';
+import { getCatalog, warmVectorIndex } from './ai/catalog.js';
 import { createLogger } from './utils/logger.js';
 
 const log = createLogger('server');
@@ -128,6 +128,19 @@ async function start() {
       tools: catalog.tools.length,
       categories: catalog.categories.length,
     });
+
+    const vector = await warmVectorIndex();
+    if (vector.configured === false) {
+      log.info('Vector search unavailable', { reason: vector.reason });
+    } else if (vector.ok === false) {
+      log.error('Vector store not populated — semantic search will use BM25 only', vector);
+    } else {
+      log.info('Vector store ready', {
+        succeeded: vector.succeeded,
+        attempted: vector.attempted,
+        ms: vector.ms,
+      });
+    }
   } catch (err) {
     log.warn('Could not warm retrieval index', { error: err.message });
   }

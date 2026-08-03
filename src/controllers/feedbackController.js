@@ -1,5 +1,4 @@
 import { recordFeedback } from '../ai/feedbackLearning.js';
-import { loadProfile } from '../ai/memory.js';
 import { loadConversation } from '../ai/memory.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -11,7 +10,9 @@ const log = createLogger('chat:feedback');
  */
 export const submitFeedback = async (req, res) => {
   try {
-    const { sessionId = 'default', rating, reason = '', messageExcerpt = '' } = req.body;
+    const {
+      sessionId = 'default', rating, reason = '', messageExcerpt = '', rejectedToolSlugs = [],
+    } = req.body;
     const userId = req.user._id;
 
     if (!['like', 'dislike'].includes(rating)) {
@@ -35,6 +36,7 @@ export const submitFeedback = async (req, res) => {
       intent: conversation.lastWorkflow ? 'workflow' : 'chat',
       workflow: conversation.lastWorkflow,
       messageExcerpt,
+      rejectedToolSlugs,
     });
 
     res.json({ success: true, message: "Thanks — we'll use this to personalise your next workflow." });
@@ -44,27 +46,4 @@ export const submitFeedback = async (req, res) => {
   }
 };
 
-/**
- * GET /api/chat/preferences
- * Returns the user's learned profile for the UI (external tools toggle, etc.)
- */
-export const getPreferences = async (req, res) => {
-  try {
-    const profile = await loadProfile(req.user._id);
-    res.json({
-      success: true,
-      data: {
-        allowExternalTools: profile?.allowExternalTools ?? false,
-        skillLevel: profile?.skillLevel || null,
-        pricingPreference: profile?.pricingPreference || null,
-        toolsAlreadyUsing: profile?.toolsAlreadyUsing || [],
-        preferredTools: profile?.preferredTools || [],
-        rejectedTools: profile?.rejectedTools || [],
-      },
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Could not load preferences.' });
-  }
-};
-
-export default { submitFeedback, getPreferences };
+export default { submitFeedback };

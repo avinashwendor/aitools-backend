@@ -71,13 +71,15 @@ FIELDS
 - skill:         "beginner" | "intermediate" | "advanced" — infer from wording; if unstated,
                  use the user's known skill level if you have one, otherwise "beginner".
 - clarifyingQuestions: [] normally. For a NEW "workflow" intent (no prior workflow in this chat),
-                 you MUST ask 5-6 short intake questions before any plan is generated — unless the
-                 user's message already answers most of them OR the profile block below covers them.
+                 you MUST ask up to 5 short intake questions before any plan is generated — unless the
+                 user's message already answers them OR the profile block below covers them.
                  Cover: output format, AI vs manual approach, free vs paid budget, tools they already
                  use, platform/channel, and skill level. Prefer multiple-choice. Each item:
                  {"id":"budget","question":"...","type":"choice","options":["Free only","Freemium OK","Paid is fine"]}
-                 or {"id":"...","question":"...","type":"text"}. Max 6 questions. Never ask something
-                 you already know from the block below.${profileBlock(profile)}
+                 or {"id":"...","question":"...","type":"text"}. Never more than 5, and never ask
+                 something you already know from the block below.
+                 Reuse these exact ids where the question fits, so the answers can be stored without
+                 guessing: "budget", "skill", "timeline", "approach", "priority", "constraints".${profileBlock(profile)}
 
 Respond with exactly:
 {"intent":"...","goal":"...","title":"...","domains":[],"searchQueries":[],"pricing":"any","skill":"beginner","clarifyingQuestions":[]}`;

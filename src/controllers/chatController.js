@@ -15,10 +15,11 @@
  */
 
 import { handleMessage, deepDive, updateProfileFromTurn } from '../ai/workflowEngine.js';
-import { upsertWorkflowRun } from './workflowController.js';
+import { syncStagePlaybook } from './taskController.js';
 import {
   loadConversation,
   appendTurn,
+  updateLastWorkflow,
   clearConversation,
   listConversations,
   updateProfileFacts,
@@ -85,17 +86,16 @@ async function persistTurn(userId, sessionId, payload, { isFirstTurn = false } =
     intent: payload.intent,
   }).catch(() => {});
 
-  // Fire-and-forget: keeps server-persisted task tracking in step with the latest workflow.
-  if (payload.workflow) {
-    upsertWorkflowRun({ userId, sessionId, workflow: payload.workflow }).catch(() => {});
-  }
+  // Note: generating a workflow deliberately does NOT create a task board.
+  // Tracking every generated plan filled the dashboard with ideas nobody
+  // committed to; a board is created only by an explicit "Add to tasks".
 }
 
 // ─────────────────────────────────────────────────────────────
 // POST /api/chat
 // ─────────────────────────────────────────────────────────────
 export const sendMessage = async (req, res) => {
-  const { message, sessionId = 'default', allowExternalTools } = req.body;
+  const { message, sessionId = 'default', allowExternalTools, intakeAnswers } = req.body;
   const userId = req.user._id;
 
   try {
@@ -105,7 +105,9 @@ export const sendMessage = async (req, res) => {
       updateProfileFacts(userId, { allowExternalTools }).catch(() => {});
     }
 
-    const result = await handleMessage({ message, conversation, userId, allowExternalTools: resolvedExternal });
+    const result = await handleMessage({
+      message, conversation, userId, allowExternalTools: resolvedExternal, intakeAnswers,
+    });
 
     const isFirstTurn = !(conversation.messages?.length);
 
@@ -127,6 +129,7 @@ export const sendMessage = async (req, res) => {
         intent: result.intent,
         clarifyingQuestions: result.clarifyingQuestions || null,
         readyToApprove: result.readyToApprove || false,
+        capturedPreferences: result.capturedPreferences || null,
         workflowDiff: result.workflowDiff || null,
         sessionId,
       },
@@ -140,7 +143,7 @@ export const sendMessage = async (req, res) => {
 // POST /api/chat/stream — Server-Sent Events
 // ─────────────────────────────────────────────────────────────
 export const streamMessage = async (req, res) => {
-  const { message, sessionId = 'default', allowExternalTools } = req.body;
+  const { message, sessionId = 'default', allowExternalTools, intakeAnswers } = req.body;
   const userId = req.user._id;
 
   res.writeHead(200, {
@@ -177,7 +180,14 @@ export const streamMessage = async (req, res) => {
       conversation,
       userId,
       allowExternalTools: resolvedExternal,
-      onProgress: event => send('progress', event),
+      intakeAnswers,
+      // Progress events carrying real workflow data go out as `partial` so a
+      // status-label consumer can never mistake a payload for a message.
+      onProgress: event => {
+        const { workflow, stage, ...status } = event;
+        send('progress', status);
+        if (workflow || stage) send('partial', { workflow, stage, stageId: event.stageId });
+      },
     });
 
     if (aborted) return;
@@ -188,6 +198,7 @@ export const streamMessage = async (req, res) => {
       intent: result.intent,
       clarifyingQuestions: result.clarifyingQuestions || null,
       readyToApprove: result.readyToApprove || false,
+      capturedPreferences: result.capturedPreferences || null,
       workflowDiff: result.workflowDiff || null,
       sessionId,
     });
@@ -232,7 +243,29 @@ export const regenerateStage = async (req, res) => {
 
     const playbook = await deepDive({ goal: conversation.goal, workflow, stageId });
 
-    res.json({ success: true, data: { stageId, ...playbook } });
+    // `deepDive` accepts either a stage id or a tool slug; resolve to the real
+    // id before writing, so both the workflow and the board update the same row.
+    const target = workflow.stages.find(s => s.id === stageId || s.toolSlug === stageId);
+    const resolvedStageId = target?.id || stageId;
+
+    // Persist the rewritten steps. Without this the server keeps serving the
+    // old playbook, so a page reload silently undid the rewrite the user just
+    // asked for.
+    const updatedStages = workflow.stages.map(s =>
+      s.id === resolvedStageId ? { ...s, ...playbook } : s
+    );
+    await updateLastWorkflow(req.user._id, sessionId, { ...workflow, stages: updatedStages })
+      .catch(err => log.warn('Failed to persist regenerated stage', { error: err.message }));
+
+    // Fire-and-forget: keeps any task board built from this workflow in step.
+    syncStagePlaybook({
+      userId: req.user._id,
+      sessionId,
+      stageId: resolvedStageId,
+      steps: playbook.steps,
+    }).catch(() => {});
+
+    res.json({ success: true, data: { stageId: resolvedStageId, ...playbook } });
   } catch (err) {
     sendError(res, err);
   }
@@ -261,6 +294,8 @@ export const getHistory = async (req, res) => {
         clarifyingQuestions:
           clarify?.phase === 'asking' ? clarify.questions || [] : null,
         readyToApprove: clarify?.phase === 'awaiting_approval',
+        capturedPreferences:
+          clarify?.phase === 'awaiting_approval' ? clarify.answers || null : null,
       },
     });
   } catch (err) {
