@@ -17,6 +17,7 @@ import {
   requestUpgrade,
   cancelUpgradeRequest,
   getEntitlements,
+  updateOnDemand,
 } from '../controllers/billingController.js';
 import { authenticate } from '../middleware/auth.js';
 import { withCurrentPeriod } from '../middleware/entitlements.js';
@@ -36,6 +37,19 @@ router.get('/me', getMyBilling);
 router.get('/entitlements', getEntitlements);
 router.get('/activity', getActivity);
 router.get('/history', getHistory);
+
+router.put(
+  '/on-demand',
+  [
+    body('enabled').isBoolean().withMessage('Say whether on-demand is on or off.'),
+    // Capped at a number rather than left open: the field exists to *limit*
+    // exposure, and a typo that turns 2,000 into 200,000 should be rejected by
+    // the form, not discovered on a statement.
+    body('capCredits').optional().isInt({ min: 0, max: 1_000_000 }),
+  ],
+  validate,
+  updateOnDemand
+);
 
 router.post(
   '/upgrade',

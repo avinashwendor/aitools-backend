@@ -54,9 +54,13 @@ function createMemoryStore() {
     },
 
     async incr(key) {
+      return store.incrby(key, 1);
+    },
+
+    async incrby(key, by = 1) {
       const e = kv.get(key);
       const current = e && !isExpired(e) ? Number(e.value) : 0;
-      const next = current + 1;
+      const next = current + Number(by);
       kv.set(key, { value: String(next), expiresAt: e && !isExpired(e) ? e.expiresAt : null });
       return next;
     },

@@ -1,19 +1,25 @@
 /**
  * Agentic workflow API.
  *
- *   GET    /api/agents/registry          node manifest (drives the whole editor)
- *   GET    /api/agents                   list
- *   POST   /api/agents                   create
- *   GET    /api/agents/:id               load into the editor
- *   PATCH  /api/agents/:id               save graph / rename / schedule
- *   DELETE /api/agents/:id               archive
- *   POST   /api/agents/:id/compose       build or edit by chat
- *   POST   /api/agents/:id/run           queue a run
- *   GET    /api/agents/:id/runs          run history
- *   GET    /api/agents/runs/:runId       one run
- *   GET    /api/agents/runs/:runId/stream  live SSE
+ *   GET    /api/agents/registry              node manifest (drives the whole editor)
+ *   GET    /api/agents                       list
+ *   POST   /api/agents                       create (optionally starts a build)
+ *   GET    /api/agents/:id                   load into the editor
+ *   PATCH  /api/agents/:id                   save graph / rename / schedule
+ *   DELETE /api/agents/:id                   archive
+ *   POST   /api/agents/:id/build             ask the architect to build or edit
+ *   GET    /api/agents/:id/builds            build history
+ *   POST   /api/agents/:id/repair            ask the architect to fix a failed run
+ *   PUT    /api/agents/:id/requirements/:key attach a credential to a requirement
+ *   POST   /api/agents/:id/run               queue a run
+ *   GET    /api/agents/:id/runs              run history
+ *   GET    /api/agents/builds/:buildId       one build
+ *   GET    /api/agents/builds/:buildId/stream  live SSE
+ *   POST   /api/agents/builds/:buildId/cancel
+ *   GET    /api/agents/runs/:runId           one run
+ *   GET    /api/agents/runs/:runId/stream    live SSE
  *   POST   /api/agents/runs/:runId/cancel
- *   ALL    /api/agents/:id/webhook/:token inbound trigger (unauthenticated)
+ *   ALL    /api/agents/:id/webhook/:token    inbound trigger (unauthenticated)
  *   …plus credential CRUD.
  *
  * Entitlement lives in the routes, not here — see `agentRoutes.js`. The one
@@ -24,19 +30,16 @@
 
 import mongoose from 'mongoose';
 import config from '../config/index.js';
-import { AgentWorkflow, AgentRun, AgentCredential, User } from '../models/index.js';
-import { publicRegistry, getNodeDef, needsBrowser } from '../agentic/registry.js';
+import { AgentWorkflow, AgentRun, AgentBuild, AgentCredential, User } from '../models/index.js';
+import { publicRegistry, getNodeDef } from '../agentic/registry.js';
 import { validateGraph, suggestNodeId } from '../agentic/graph.js';
-import { compose } from '../agentic/composer.js';
-import { enqueueRun, computeNextRun } from '../agentic/queue.js';
+import { enqueueRun, enqueueBuild, computeNextRun } from '../agentic/queue.js';
 import { cancelRun, activeRunCount } from '../agentic/runner.js';
-import {
-  isBrowserConfigured,
-  browserCapabilities,
-  getReplayPlaylist,
-} from '../agentic/browser/session.js';
+import { cancelBuild, activeBuildCount } from '../agentic/architect/index.js';
 import { subscribe } from '../agentic/events.js';
-import { planAllows, planLimit, BROWSER_MINUTE_COST, creditCost } from '../billing/plans.js';
+import { isWebSearchConfigured } from '../ai/tools/webSearch.js';
+import { isLLMAvailable } from '../ai/llm.js';
+import { planAllows, planLimit, creditCost } from '../billing/plans.js';
 import { checkLimit, isUnmetered } from '../billing/credits.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 import { createLogger } from '../utils/logger.js';
@@ -61,37 +64,42 @@ async function ownedWorkflow(req, res) {
   return workflow;
 }
 
+/** Re-run the validator against the current graph *and* requirements. */
+function revalidate(workflow) {
+  const nodes = workflow.graph.nodes.map(n => n.toObject?.() ?? n);
+  const edges = workflow.graph.edges.map(e => e.toObject?.() ?? e);
+  return validateGraph({ nodes, edges }, { requirements: workflow.requirements || [] });
+}
+
 // ─── Registry ───────────────────────────────────────────────
 
 export const getRegistry = asyncHandler(async (req, res) => {
   const plan = req.user?.subscription?.plan;
-  const browser = browserCapabilities();
   res.json({
     success: true,
     data: {
       ...publicRegistry(),
       /**
-       * Capability report alongside the manifest, so the editor can grey out a
-       * browser node with a real reason ("no browser service on this
-       * deployment") instead of letting the user build a workflow that fails on
-       * its first run.
+       * Capability report alongside the manifest, so the editor can explain
+       * itself with a real reason rather than letting the user build something
+       * that fails on its first run. The distinction between "your plan doesn't
+       * include this" and "this deployment isn't configured for it" matters:
+       * they need completely different actions from the user, and collapsing
+       * them sends people to the pricing page to fix a server setting.
        */
       capabilities: {
-        browser: browser.configured,
-        browserProvider: browser.provider,
-        browserLiveView: browser.liveView,
-        browserReplay: browser.replay,
         agentic: config.agentic.enabled,
+        llm: isLLMAvailable(),
+        webSearch: isWebSearchConfigured(),
         plan: {
           agenticWorkflows: planAllows(plan, 'agenticWorkflows'),
-          browserAgents: planAllows(plan, 'browserAgents'),
           agentTriggers: planAllows(plan, 'agentTriggers'),
           maxWorkflows: planLimit(plan, 'agentWorkflows'),
         },
       },
       pricing: {
         runBase: creditCost('agent.run'),
-        browserMinute: BROWSER_MINUTE_COST,
+        buildStep: creditCost('agent.build'),
       },
     },
   });
@@ -116,41 +124,53 @@ export const listWorkflows = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * Create a workflow, and optionally set the architect going on it immediately.
+ *
+ * The `prompt` path is the primary one: someone types what they want and gets a
+ * workflow being built in front of them. Creating an empty canvas and asking
+ * them to find the palette is the fallback for people who already know what
+ * they're doing, not the front door.
+ */
 export const createWorkflow = asyncHandler(async (req, res) => {
-  const surface = req.body.surface === 'browser' ? 'browser' : 'flow';
+  const prompt = String(req.body.prompt || '').trim();
 
-  // A workflow with nothing on the canvas is a dead end — the user has to
-  // discover the palette before anything can happen. Seeding the trigger means
-  // the first thing they see is a graph they can extend.
+  // A workflow with nothing on the canvas is a dead end. Seeding the trigger
+  // means the first thing anyone sees is a graph they can extend.
   const triggerType = 'trigger.manual';
   const triggerId = suggestNodeId(triggerType, []);
 
   const workflow = await AgentWorkflow.create({
     user: req.user._id,
-    name: String(req.body.name || 'Untitled workflow').slice(0, 120),
+    name: String(req.body.name || (prompt ? 'Untitled workflow' : 'New workflow')).slice(0, 120),
     description: String(req.body.description || '').slice(0, 600),
-    surface,
     graph: {
       nodes: [
         {
           id: triggerId,
           type: triggerType,
-          position: { x: 260, y: 80 },
+          position: { x: 300, y: 90 },
           data: { title: getNodeDef(triggerType).label, values: {}, note: '' },
         },
       ],
       edges: [],
     },
-    composedFrom: String(req.body.prompt || '').slice(0, 2000),
+    composedFrom: prompt.slice(0, 2000),
   });
 
   log.info('Agentic workflow created', {
     user: String(req.user._id),
     workflow: String(workflow._id),
-    surface,
+    withPrompt: Boolean(prompt),
   });
 
-  res.status(201).json({ success: true, data: workflow.toEditorJSON() });
+  let buildId = null;
+  if (prompt) {
+    const build = await startBuildFor({ workflow, user: req.user, message: prompt, intent: 'build' });
+    buildId = String(build._id);
+  }
+
+  res.status(201).json({ success: true, data: { ...workflow.toEditorJSON(), buildId } });
 });
 
 export const getWorkflow = asyncHandler(async (req, res) => {
@@ -181,26 +201,9 @@ export const updateWorkflow = asyncHandler(async (req, res) => {
       });
     }
 
-    // Browser nodes are gated on the plan at *save* time as well as run time.
-    // Blocking only at run time lets someone build the whole thing and then be
-    // told no, which is a worse experience than being told before they start.
-    if (
-      needsBrowser(nodes) &&
-      !planAllows(req.user.subscription?.plan, 'browserAgents') &&
-      !isUnmetered(req.user)
-    ) {
-      return res.status(403).json({
-        success: false,
-        code: 'FEATURE_NOT_IN_PLAN',
-        message: 'Browser agents aren’t included in your plan.',
-      });
-    }
-
     workflow.graph = { nodes, edges };
     workflow.version += 1;
-
-    const validation = validateGraph({ nodes, edges }, { surface: workflow.surface });
-    workflow.validation = { ...validation, checkedAt: new Date() };
+    workflow.validation = { ...revalidate(workflow), checkedAt: new Date() };
   }
 
   if (req.body.schedule) {
@@ -246,60 +249,247 @@ export const deleteWorkflow = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Workflow archived.' });
 });
 
-// ─── Composer ───────────────────────────────────────────────
+// ─── Requirements ───────────────────────────────────────────
 
-export const composeWorkflow = asyncHandler(async (req, res) => {
+/**
+ * Attach a credential the user just created to the requirement it satisfies.
+ *
+ * Separate from credential creation on purpose. A credential is an account-wide
+ * secret that several workflows may use; a requirement is one workflow saying
+ * it needs one. Merging them would either re-prompt for the same Notion token
+ * on every workflow, or silently bind a secret to a workflow the user never
+ * meant to give it to.
+ */
+export const setRequirementCredential = asyncHandler(async (req, res) => {
   const workflow = await ownedWorkflow(req, res);
   if (!workflow) return;
 
-  const message = String(req.body.message || '').trim();
-  if (!message) {
-    return res.status(400).json({ success: false, message: 'Tell me what to build.' });
+  const requirement = (workflow.requirements || []).find(r => r.key === req.params.key);
+  if (!requirement) {
+    return res.status(404).json({ success: false, message: 'No such requirement.' });
   }
 
-  const result = await compose({
-    graph: {
-      nodes: workflow.graph.nodes.map(n => n.toObject()),
-      edges: workflow.graph.edges.map(e => e.toObject()),
-    },
-    message,
-    surface: workflow.surface,
-    history: Array.isArray(req.body.history) ? req.body.history : [],
-    name: workflow.name,
+  const credentialId = req.body.credentialId || null;
+
+  if (credentialId) {
+    const credential = await AgentCredential.findOne({ _id: credentialId, user: req.user._id });
+    if (!credential) {
+      return res.status(404).json({ success: false, message: 'Credential not found.' });
+    }
+    requirement.credentialId = credential._id;
+
+    // Push it onto the nodes that declared they need it, so the user doesn't
+    // have to open each one and pick the same credential again. That double
+    // entry is the single most confusing part of every automation tool that
+    // has both a checklist and a per-node picker.
+    for (const node of workflow.graph.nodes) {
+      if (!requirement.usedBy.includes(node.id)) continue;
+      const def = getNodeDef(node.type);
+      const field = def?.fields.find(f => f.type === 'credential');
+      if (field) node.data.values = { ...node.data.values, [field.key]: String(credential._id) };
+    }
+    workflow.markModified('graph.nodes');
+  } else {
+    requirement.credentialId = null;
+  }
+
+  workflow.validation = { ...revalidate(workflow), checkedAt: new Date() };
+  await workflow.save();
+
+  res.json({ success: true, data: workflow.toEditorJSON() });
+});
+
+// ─── Architect ──────────────────────────────────────────────
+
+/** Create the build document and hand it to a worker. Shared by three routes. */
+async function startBuildFor({ workflow, user, message, intent }) {
+  const build = await AgentBuild.create({
+    workflow: workflow._id,
+    user: user._id,
+    intent,
+    goal: message.slice(0, 4000),
+    // Prior turns come from earlier builds on this workflow, so a follow-up
+    // ("also send it to Slack") knows what was already decided rather than
+    // re-deriving the whole design from the graph.
+    messages: [{ role: 'user', content: message.slice(0, 8000) }],
   });
 
-  if (
-    needsBrowser(result.graph.nodes) &&
-    !planAllows(req.user.subscription?.plan, 'browserAgents') &&
-    !isUnmetered(req.user)
-  ) {
-    return res.status(403).json({
+  await enqueueBuild({ buildId: build._id, userId: user._id });
+  return build;
+}
+
+export const startBuild = asyncHandler(async (req, res) => {
+  const workflow = await ownedWorkflow(req, res);
+  if (!workflow) return;
+
+  if (!isLLMAvailable()) {
+    return res.status(503).json({
       success: false,
-      code: 'FEATURE_NOT_IN_PLAN',
-      message: 'That would need browser agents, which aren’t in your plan.',
+      code: 'AI_DISABLED',
+      message: 'The architect needs an AI provider, and none is configured on this server.',
     });
   }
 
-  // Persisted immediately rather than handed back for the client to save. The
-  // canvas and the chat would otherwise disagree the moment a request fails
-  // in between, and "my agent asked me to save something I can't see" is a
-  // worse bug than a redundant write.
-  workflow.graph = result.graph;
-  workflow.version += 1;
-  if (result.name) workflow.name = result.name;
-  if (!workflow.composedFrom) workflow.composedFrom = message.slice(0, 2000);
-  workflow.validation = { ...result.validation, checkedAt: new Date() };
-  await workflow.save();
+  const concurrency = config.agentic.architectConcurrency;
+  if (activeBuildCount(req.user._id) >= concurrency) {
+    return res.status(429).json({
+      success: false,
+      code: 'TOO_MANY_BUILDS',
+      message: `You already have ${concurrency} architect session${concurrency === 1 ? '' : 's'} running.`,
+    });
+  }
+
+  const message = String(req.body.message || '').trim();
+  if (!message) {
+    return res.status(400).json({ success: false, message: 'Tell the architect what to build.' });
+  }
+
+  // An existing graph with more than its seed trigger means this is an edit,
+  // and the architect opens with different instructions for one.
+  const intent = workflow.graph.nodes.length > 1 ? 'edit' : 'build';
+  const build = await startBuildFor({ workflow, user: req.user, message, intent });
+
+  res.status(202).json({
+    success: true,
+    data: { buildId: String(build._id), status: 'queued', intent },
+  });
+});
+
+/**
+ * Ask the architect to fix a run that failed.
+ *
+ * The failing step's configuration and the exact error are handed over as the
+ * opening message rather than left for the architect to go and find, because
+ * the whole value of this button is that the user did not have to read a stack
+ * trace to press it.
+ */
+export const repairWorkflow = asyncHandler(async (req, res) => {
+  const workflow = await ownedWorkflow(req, res);
+  if (!workflow) return;
+
+  if (!isLLMAvailable()) {
+    return res.status(503).json({
+      success: false,
+      code: 'AI_DISABLED',
+      message: 'The architect needs an AI provider, and none is configured on this server.',
+    });
+  }
+
+  const run = await AgentRun.findOne({
+    _id: mongoose.isValidObjectId(req.body.runId) ? req.body.runId : new mongoose.Types.ObjectId(),
+    workflow: workflow._id,
+    user: req.user._id,
+  });
+
+  if (!run) return res.status(404).json({ success: false, message: 'Run not found.' });
+  if (run.status !== 'failed') {
+    return res.status(400).json({ success: false, message: 'That run didn’t fail — there’s nothing to repair.' });
+  }
+
+  const failedStep = run.steps.find(step => step.status === 'failed');
+  const node = workflow.graph.nodes.find(n => n.id === run.failedNodeId);
+  const def = node ? getNodeDef(node.type) : null;
+
+  const message =
+    `A run of this workflow failed.\n\n` +
+    `FAILING STEP: ${run.failedNodeId || 'unknown'}` +
+    (def ? ` (${def.type} — ${def.label})` : '') +
+    `\nERROR: ${run.error}\n\n` +
+    (node
+      ? `ITS CONFIGURATION:\n${JSON.stringify(node.data?.values ?? {}, null, 2)}\n\n`
+      : '') +
+    (failedStep?.output ? `WHAT IT RETURNED:\n${JSON.stringify(failedStep.output).slice(0, 2000)}\n\n` : '') +
+    `STEPS THAT SUCCEEDED BEFORE IT:\n` +
+    (run.steps
+      .filter(step => step.status === 'done')
+      .map(step => `  ${step.nodeId}: ${JSON.stringify(step.output).slice(0, 400)}`)
+      .join('\n') || '  (none)') +
+    `\n\nFind the real cause and fix it.`;
+
+  const build = await startBuildFor({ workflow, user: req.user, message, intent: 'repair' });
+
+  res.status(202).json({ success: true, data: { buildId: String(build._id), status: 'queued' } });
+});
+
+export const listBuilds = asyncHandler(async (req, res) => {
+  const workflow = await ownedWorkflow(req, res);
+  if (!workflow) return;
+
+  const builds = await AgentBuild.find({ workflow: workflow._id })
+    .sort({ createdAt: -1 })
+    .limit(Math.min(Number(req.query.limit) || 20, 50))
+    // The timeline is the bulk of a build document and nothing in a list
+    // renders it.
+    .select('-timeline');
 
   res.json({
     success: true,
-    data: {
-      reply: result.reply,
-      operations: result.operations,
-      rejected: result.rejected,
-      workflow: workflow.toEditorJSON(),
-    },
+    data: builds.map(build => ({
+      id: String(build._id),
+      status: build.status,
+      intent: build.intent,
+      goal: build.goal,
+      summary: build.summary,
+      error: build.error,
+      steps: build.steps,
+      credits: build.credits,
+      createdAt: build.createdAt,
+      finishedAt: build.finishedAt,
+    })),
   });
+});
+
+export const getBuild = asyncHandler(async (req, res) => {
+  const build = await AgentBuild.findOne({ _id: req.params.buildId, user: req.user._id });
+  if (!build) return res.status(404).json({ success: false, message: 'Build not found.' });
+  res.json({ success: true, data: build.toJSONSafe() });
+});
+
+export const cancelBuildHandler = asyncHandler(async (req, res) => {
+  const build = await AgentBuild.findOne({ _id: req.params.buildId, user: req.user._id });
+  if (!build) return res.status(404).json({ success: false, message: 'Build not found.' });
+
+  const stopped = cancelBuild(build._id);
+
+  if (!stopped && build.status === 'queued') {
+    build.status = 'canceled';
+    build.finishedAt = new Date();
+    await build.save();
+  }
+
+  res.json({ success: true, data: { canceled: true, wasRunning: stopped } });
+});
+
+/**
+ * Live architect feed.
+ *
+ * Sends the current state first, then streams changes — every client connects
+ * late by definition, because the build is queued before the stream opens, and
+ * one that only received subsequent events would render a build that appears to
+ * start halfway through its own reasoning.
+ */
+export const streamBuild = asyncHandler(async (req, res) => {
+  const build = await AgentBuild.findOne({ _id: req.params.buildId, user: req.user._id });
+  if (!build) return res.status(404).json({ success: false, message: 'Build not found.' });
+
+  openStream(res);
+  const send = sender(res);
+
+  send('build.snapshot', build.toJSONSafe());
+
+  if (['succeeded', 'failed', 'canceled'].includes(build.status)) {
+    const workflow = await AgentWorkflow.findById(build.workflow);
+    send('build.finished', {
+      status: build.status,
+      summary: build.summary,
+      error: build.error,
+      credits: build.credits,
+      workflow: workflow ? workflow.toEditorJSON() : null,
+    });
+    return res.end();
+  }
+
+  keepAlive({ req, res, id: build._id, send, endOn: 'build.finished' });
 });
 
 // ─── Runs ───────────────────────────────────────────────────
@@ -319,10 +509,7 @@ async function guardRun({ workflow, user }) {
     };
   }
 
-  const nodes = workflow.graph.nodes.map(n => n.toObject?.() ?? n);
-  const edges = workflow.graph.edges.map(e => e.toObject?.() ?? e);
-
-  const validation = validateGraph({ nodes, edges }, { surface: workflow.surface });
+  const validation = revalidate(workflow);
   if (validation.errors.length) {
     return {
       ok: false,
@@ -330,15 +517,6 @@ async function guardRun({ workflow, user }) {
       code: 'GRAPH_INVALID',
       message: validation.errors[0],
       data: { errors: validation.errors },
-    };
-  }
-
-  if (needsBrowser(nodes) && !isBrowserConfigured()) {
-    return {
-      ok: false,
-      status: 503,
-      code: 'BROWSER_NOT_CONFIGURED',
-      message: 'This workflow needs a browser, and no browser service is configured.',
     };
   }
 
@@ -393,7 +571,6 @@ export const runWorkflow = asyncHandler(async (req, res) => {
     user: req.user._id,
     workflowVersion: workflow.version,
     workflowName: workflow.name,
-    surface: workflow.surface,
     trigger: { type: 'manual', payload: req.body.input || {} },
   });
 
@@ -413,7 +590,7 @@ export const listRuns = asyncHandler(async (req, res) => {
     .limit(Math.min(Number(req.query.limit) || 25, 100))
     // Steps and logs are the bulk of a run document and nothing in a list view
     // renders them.
-    .select('-steps -logs -output -browser.screenshots');
+    .select('-steps -logs -output');
 
   res.json({
     success: true,
@@ -423,6 +600,7 @@ export const listRuns = asyncHandler(async (req, res) => {
       trigger: r.trigger?.type,
       credits: r.credits?.total || 0,
       error: r.error,
+      failedNodeId: r.failedNodeId,
       startedAt: r.startedAt,
       finishedAt: r.finishedAt,
       createdAt: r.createdAt,
@@ -454,69 +632,12 @@ export const cancelRunHandler = asyncHandler(async (req, res) => {
   res.json({ success: true, data: { canceled: true, wasRunning: stopped } });
 });
 
-/**
- * Proxy a Browserbase session replay as HLS.
- *
- * The playlist needs the secret API key, so it is fetched server-side. Returns
- * 202 while Browserbase is still processing the recording after session close.
- */
-export const getSessionReplay = asyncHandler(async (req, res) => {
-  const sessionId = String(req.params.sessionId || '').trim();
-  if (!sessionId || sessionId.length > 120) {
-    return res.status(400).json({ success: false, message: 'Invalid session id.' });
-  }
-
-  const plan = req.user?.subscription?.plan;
-  if (!planAllows(plan, 'browserAgents') && !isUnmetered(req.user)) {
-    return res.status(403).json({
-      success: false,
-      code: 'FEATURE_NOT_IN_PLAN',
-      message: 'Session replay isn’t included in your plan.',
-    });
-  }
-
-  const caps = browserCapabilities();
-  if (!caps.replay) {
-    return res.status(503).json({
-      success: false,
-      code: 'BROWSER_NOT_CONFIGURED',
-      message: 'Session replay requires Browserbase (BROWSERBASE_API_KEY).',
-    });
-  }
-
-  const playlist = await getReplayPlaylist(sessionId);
-  if (!playlist) {
-    return res.status(202).end();
-  }
-
-  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-  res.setHeader('Cache-Control', 'no-store');
-  res.send(playlist);
-});
-
-/**
- * Live run feed.
- *
- * Sends the current state first, then streams changes. A client that connects
- * three seconds late — which is every client, because the run is queued before
- * the stream opens — would otherwise miss the first steps entirely and render a
- * run that appears to begin at step four.
- */
 export const streamRun = asyncHandler(async (req, res) => {
   const run = await AgentRun.findOne({ _id: req.params.runId, user: req.user._id });
   if (!run) return res.status(404).json({ success: false, message: 'Run not found.' });
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
-  res.flushHeaders?.();
-
-  const send = (event, data) => {
-    if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  };
+  openStream(res);
+  const send = sender(res);
 
   send('run.snapshot', run.toJSONSafe());
 
@@ -525,25 +646,51 @@ export const streamRun = asyncHandler(async (req, res) => {
     return res.end();
   }
 
-  const unsubscribe = subscribe(run._id, event => {
+  keepAlive({ req, res, id: run._id, send, endOn: 'run.finished' });
+});
+
+// ─── SSE plumbing ───────────────────────────────────────────
+// Shared by runs and builds. Both are "watch a long thing happen", and having
+// written it twice with a subtle difference in the cleanup path once already,
+// once is enough.
+
+function openStream(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders?.();
+}
+
+function sender(res) {
+  return (event, data) => {
+    if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+}
+
+function keepAlive({ req, res, id, send, endOn }) {
+  const unsubscribe = subscribe(id, event => {
     send(event.type, event);
-    if (event.type === 'run.finished') {
-      unsubscribe();
-      clearInterval(ping);
+    if (event.type === endOn) {
+      cleanup();
       res.end();
     }
   });
 
-  // Proxies close an idle connection well before a browser run finishes.
+  // Proxies close an idle connection well before a long build finishes.
   const ping = setInterval(() => {
     if (!res.writableEnded) res.write(': ping\n\n');
   }, 20_000);
 
-  req.on('close', () => {
+  const cleanup = () => {
     unsubscribe();
     clearInterval(ping);
-  });
-});
+  };
+
+  req.on('close', cleanup);
+}
 
 // ─── Webhook trigger ────────────────────────────────────────
 
@@ -604,7 +751,6 @@ export const webhookTrigger = asyncHandler(async (req, res) => {
     user: workflow.user,
     workflowVersion: workflow.version,
     workflowName: workflow.name,
-    surface: workflow.surface,
     trigger: {
       type: 'webhook',
       payload: {
@@ -661,6 +807,16 @@ export const deleteCredential = asyncHandler(async (req, res) => {
     user: req.user._id,
   });
   if (!deleted) return res.status(404).json({ success: false, message: 'Credential not found.' });
+
+  // Any requirement pointing at it is now unsatisfied, and the workflows that
+  // depend on it need to say so rather than failing on their next run with a
+  // credential-missing error three steps in.
+  await AgentWorkflow.updateMany(
+    { user: req.user._id, 'requirements.credentialId': deleted._id },
+    { $set: { 'requirements.$[entry].credentialId': null } },
+    { arrayFilters: [{ 'entry.credentialId': deleted._id }] }
+  ).catch(err => log.warn('Could not detach a deleted credential', { error: err.message }));
+
   res.json({ success: true, message: 'Credential deleted.' });
 });
 
@@ -671,13 +827,18 @@ export default {
   getWorkflow,
   updateWorkflow,
   deleteWorkflow,
-  composeWorkflow,
+  setRequirementCredential,
+  startBuild,
+  repairWorkflow,
+  listBuilds,
+  getBuild,
+  streamBuild,
+  cancelBuildHandler,
   runWorkflow,
   listRuns,
   getRun,
   streamRun,
   cancelRunHandler,
-  getSessionReplay,
   webhookTrigger,
   listCredentials,
   createCredential,

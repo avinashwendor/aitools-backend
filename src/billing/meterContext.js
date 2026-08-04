@@ -24,7 +24,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { llmCostPaise, searchCostPaise, browserCostPaise } from './pricing.js';
+import { llmCostPaise, searchCostPaise } from './pricing.js';
 
 const storage = new AsyncLocalStorage();
 
@@ -33,9 +33,6 @@ function emptyUsage() {
   return {
     llmPaise: 0,
     searchPaise: 0,
-    /** Amortised infra cost of any browser session the operation held open. */
-    browserPaise: 0,
-    browserSeconds: 0,
     promptTokens: 0,
     completionTokens: 0,
     llmCalls: 0,
@@ -80,20 +77,6 @@ export function recordLlmUsage({ model, promptTokens = 0, completionTokens = 0 }
   if (model) usage.models.set(model, (usage.models.get(model) || 0) + 1);
 }
 
-/**
- * Record browser session wall-clock. Called once by the runner when it closes
- * the session, with the whole held duration — the cost is the session being
- * open, not the individual steps, so attributing it per-step would double-count
- * the gaps between them.
- */
-export function recordBrowserUsage({ seconds = 0 } = {}) {
-  const usage = storage.getStore();
-  if (!usage) return;
-
-  usage.browserPaise += browserCostPaise(seconds);
-  usage.browserSeconds += Number(seconds) || 0;
-}
-
 /** Record one web search. Called from `ai/tools/webSearch.js` after a billed call. */
 export function recordSearchUsage({ credits = 1 } = {}) {
   const usage = storage.getStore();
@@ -110,12 +93,11 @@ export function recordSearchUsage({ credits = 1 } = {}) {
 export function summarize(usage) {
   if (!usage) {
     return {
-      cost: { llmPaise: 0, searchPaise: 0, browserPaise: 0, totalPaise: 0 },
+      cost: { llmPaise: 0, searchPaise: 0, totalPaise: 0 },
       tokens: { prompt: 0, completion: 0 },
       models: [],
       searchCalls: 0,
       llmCalls: 0,
-      browserSeconds: 0,
       durationMs: 0,
     };
   }
@@ -124,8 +106,7 @@ export function summarize(usage) {
     cost: {
       llmPaise: usage.llmPaise,
       searchPaise: usage.searchPaise,
-      browserPaise: usage.browserPaise,
-      totalPaise: usage.llmPaise + usage.searchPaise + usage.browserPaise,
+      totalPaise: usage.llmPaise + usage.searchPaise,
     },
     tokens: { prompt: usage.promptTokens, completion: usage.completionTokens },
     // Array of {model, calls} — model ids contain dots, which MongoDB rejects
@@ -133,7 +114,6 @@ export function summarize(usage) {
     models: [...usage.models].map(([model, calls]) => ({ model, calls })),
     searchCalls: usage.searchCalls,
     llmCalls: usage.llmCalls,
-    browserSeconds: usage.browserSeconds,
     durationMs: Date.now() - usage.startedAt,
   };
 }
@@ -143,6 +123,5 @@ export default {
   currentUsage,
   recordLlmUsage,
   recordSearchUsage,
-  recordBrowserUsage,
   summarize,
 };

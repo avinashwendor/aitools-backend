@@ -72,13 +72,6 @@ const agentWorkflowSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true, maxlength: 120, default: 'Untitled workflow' },
     description: { type: String, default: '', maxlength: 600 },
 
-    /**
-     * Which palette the editor shows and whether a Chrome session is expected.
-     * Not a hard partition — a browser workflow can still call an API, and the
-     * runner opens a browser only when it actually reaches a browser node.
-     */
-    surface: { type: String, enum: ['flow', 'browser'], default: 'flow', index: true },
-
     status: {
       type: String,
       enum: ['draft', 'active', 'paused'],
@@ -135,8 +128,77 @@ const agentWorkflowSchema = new mongoose.Schema(
       lastStatus: { type: String, default: null },
     },
 
-    /** Set by the chat composer so the editor can show what it was asked for. */
+    /** The original brief, so the editor can show what it was asked for. */
     composedFrom: { type: String, default: '', maxlength: 2000 },
+
+    /**
+     * What the architect worked out before it built anything.
+     *
+     * Kept on the workflow rather than on the build session that produced it,
+     * because it stays true after the session ends: six weeks later, "why does
+     * this call that endpoint?" is answered by the sources it read, and "what do
+     * I need to plug in?" is answered by the requirements — including the ones
+     * still unfilled, which is the single most common reason a run fails.
+     */
+    blueprint: {
+      goal: { type: String, default: '', maxlength: 4000 },
+      summary: { type: String, default: '', maxlength: 4000 },
+      plan: {
+        type: [
+          new mongoose.Schema(
+            {
+              title: { type: String, default: '', maxlength: 200 },
+              detail: { type: String, default: '', maxlength: 1000 },
+            },
+            { _id: false }
+          ),
+        ],
+        default: [],
+      },
+      /** Pages the architect actually read, so a claim can be traced to a source. */
+      sources: {
+        type: [
+          new mongoose.Schema(
+            {
+              title: { type: String, default: '', maxlength: 300 },
+              url: { type: String, default: '', maxlength: 1000 },
+              note: { type: String, default: '', maxlength: 600 },
+            },
+            { _id: false }
+          ),
+        ],
+        default: [],
+      },
+      builtAt: { type: Date, default: null },
+    },
+
+    /**
+     * Credentials this workflow needs before it can run.
+     *
+     * The architect writes these as it discovers them; the editor renders them
+     * as a checklist and fills `credentialId` when the user supplies one. A
+     * requirement whose id is null is why the Run button is disabled, and
+     * saying so is far better than letting the run fail on step four with a 401.
+     */
+    requirements: {
+      type: [
+        new mongoose.Schema(
+          {
+            key: { type: String, required: true, maxlength: 60 },
+            label: { type: String, default: '', maxlength: 120 },
+            provider: { type: String, default: 'generic', maxlength: 40 },
+            /** Plain-language steps for getting the key, written by the architect. */
+            instructions: { type: String, default: '', maxlength: 2000 },
+            docsUrl: { type: String, default: '', maxlength: 1000 },
+            /** Node ids that consume it, so the editor can point at them. */
+            usedBy: { type: [String], default: [] },
+            credentialId: { type: mongoose.Schema.Types.ObjectId, ref: 'AgentCredential', default: null },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
 
     archivedAt: { type: Date, default: null },
   },
@@ -152,7 +214,6 @@ agentWorkflowSchema.methods.toEditorJSON = function toEditorJSON() {
     id: String(this._id),
     name: this.name,
     description: this.description,
-    surface: this.surface,
     status: this.status,
     version: this.version,
     graph: {
@@ -185,6 +246,17 @@ agentWorkflowSchema.methods.toEditorJSON = function toEditorJSON() {
     schedule: this.schedule,
     stats: this.stats,
     composedFrom: this.composedFrom,
+    blueprint: this.blueprint,
+    requirements: (this.requirements || []).map(requirement => ({
+      key: requirement.key,
+      label: requirement.label,
+      provider: requirement.provider,
+      instructions: requirement.instructions,
+      docsUrl: requirement.docsUrl,
+      usedBy: requirement.usedBy,
+      credentialId: requirement.credentialId ? String(requirement.credentialId) : null,
+      satisfied: Boolean(requirement.credentialId),
+    })),
     createdAt: this.createdAt,
     updatedAt: this.updatedAt,
   };
@@ -196,10 +268,10 @@ agentWorkflowSchema.methods.toListJSON = function toListJSON() {
     id: String(this._id),
     name: this.name,
     description: this.description,
-    surface: this.surface,
     status: this.status,
     nodeCount: this.graph?.nodes?.length || 0,
     hasErrors: (this.validation?.errors?.length || 0) > 0,
+    pendingRequirements: (this.requirements || []).filter(r => !r.credentialId).length,
     schedule: { enabled: this.schedule?.enabled, every: this.schedule?.every },
     stats: this.stats,
     updatedAt: this.updatedAt,

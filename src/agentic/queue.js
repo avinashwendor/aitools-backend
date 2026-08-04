@@ -9,11 +9,11 @@
  *
  * What Redis buys, and why it's the recommended production shape:
  *
- *   • Runs stop competing with HTTP requests for the event loop. A browser run
- *     holds its worker for minutes; in-process that is a minute of added
- *     latency on every other request the instance is serving.
+ *   • Long work stops competing with HTTP requests for the event loop. An
+ *     architect session is a minute of model calls and page fetches; in-process
+ *     that is a minute of added latency on everything else the instance serves.
  *   • Concurrency becomes a number you set, not a number you discover.
- *   • A crash mid-run leaves the job on the queue instead of losing it.
+ *   • A crash mid-job leaves it on the queue instead of losing it.
  *
  * The scheduler is a single repeating job that sweeps for due workflows. One
  * sweep for all users rather than a timer per workflow: a thousand scheduled
@@ -22,8 +22,9 @@
 
 import { Queue, Worker } from 'bullmq';
 import config from '../config/index.js';
-import { AgentRun, AgentWorkflow, User } from '../models/index.js';
+import { AgentRun, AgentBuild, AgentWorkflow, User } from '../models/index.js';
 import { executeRun } from './runner.js';
+import { executeBuild } from './architect/index.js';
 import { tryAcquireLock } from '../jobs/lock.js';
 import { planAllows } from '../billing/plans.js';
 import { createLogger } from '../utils/logger.js';
@@ -31,10 +32,13 @@ import { createLogger } from '../utils/logger.js';
 const log = createLogger('agentic:queue');
 
 const RUN_QUEUE = 'agentic-runs';
+const BUILD_QUEUE = 'agentic-builds';
 const SWEEP_QUEUE = 'agentic-schedule';
 
 let runQueue = null;
 let runWorker = null;
+let buildQueue = null;
+let buildWorker = null;
 let sweepQueue = null;
 let sweepWorker = null;
 let sweepTimer = null;
@@ -111,6 +115,67 @@ async function markRunCrashed(runId, message) {
       $set: {
         status: 'failed',
         error: `The run could not be started: ${String(message).slice(0, 300)}`,
+        finishedAt: new Date(),
+      },
+    }
+  ).catch(() => {});
+}
+
+// ─── Architect builds ───────────────────────────────────────
+
+/**
+ * Hand a queued architect session to a worker.
+ *
+ * Same shape as `enqueueRun` and for the same reason: the HTTP handler answers
+ * with a build id so the client can open its stream and watch the architect
+ * think, rather than holding a request open for ninety seconds and showing
+ * nothing until it lands.
+ */
+export async function enqueueBuild({ buildId, userId }) {
+  if (!isQueueConfigured()) {
+    buildInline({ buildId, userId });
+    return { queued: false, inline: true };
+  }
+
+  if (!buildQueue) buildQueue = new Queue(BUILD_QUEUE, { connection: connection() });
+
+  await buildQueue.add(
+    'build',
+    { buildId: String(buildId), userId: String(userId) },
+    {
+      // No retries, for a softer version of the reason runs don't retry: a
+      // build has already partially edited the graph and already charged for
+      // the calls it made, so a silent second attempt doubles both.
+      attempts: 1,
+      removeOnComplete: 50,
+      removeOnFail: 100,
+      jobId: `build:${buildId}`,
+    }
+  );
+
+  return { queued: true, inline: false };
+}
+
+function buildInline({ buildId, userId }) {
+  setImmediate(async () => {
+    try {
+      const user = await User.findById(userId);
+      if (!user) throw new Error('The build’s owner no longer exists.');
+      await executeBuild({ buildId, user });
+    } catch (err) {
+      log.error('Inline build failed', { buildId: String(buildId), error: err.message });
+      await markBuildCrashed(buildId, err.message);
+    }
+  });
+}
+
+async function markBuildCrashed(buildId, message) {
+  await AgentBuild.updateOne(
+    { _id: buildId, status: { $in: ['queued', 'running'] } },
+    {
+      $set: {
+        status: 'failed',
+        error: `The architect could not be started: ${String(message).slice(0, 300)}`,
         finishedAt: new Date(),
       },
     }
@@ -215,7 +280,6 @@ export async function sweepSchedules() {
       user: workflow.user,
       workflowVersion: workflow.version,
       workflowName: workflow.name,
-      surface: workflow.surface,
       trigger: { type: 'schedule', payload: { firedAt: now.toISOString() } },
     });
 
@@ -257,13 +321,10 @@ export function startAgentWorkers() {
     },
     {
       connection: connection(),
-      // Sized against the plan concurrency limits rather than the box: a
-      // browser run holds a whole Chrome, and eight of those on one instance is
-      // an out-of-memory kill, not throughput.
       concurrency: Number(process.env.AGENT_WORKER_CONCURRENCY) || 4,
-      // A browser run legitimately takes minutes. The default 30s lock would
-      // have BullMQ declare it stalled and hand it to a second worker, which
-      // then runs the same side effects again.
+      // A run legitimately takes minutes. The default 30s lock would have
+      // BullMQ declare it stalled and hand it to a second worker, which then
+      // runs the same side effects again.
       lockDuration: config.agentic.maxRunMs + 60_000,
     }
   );
@@ -271,6 +332,28 @@ export function startAgentWorkers() {
   runWorker.on('failed', (job, err) => {
     log.warn('Agentic run job failed', { runId: job?.data?.runId, error: err.message });
     if (job?.data?.runId) markRunCrashed(job.data.runId, err.message);
+  });
+
+  buildWorker = new Worker(
+    BUILD_QUEUE,
+    async job => {
+      const user = await User.findById(job.data.userId);
+      if (!user) throw new Error('The build’s owner no longer exists.');
+      await executeBuild({ buildId: job.data.buildId, user });
+    },
+    {
+      connection: connection(),
+      // Lower than runs. A build is almost entirely waiting on model calls and
+      // page fetches, so it is cheap in CPU and expensive in tokens — the
+      // limiting resource is the provider's rate limit, not this box.
+      concurrency: Number(process.env.AGENT_BUILD_CONCURRENCY) || 3,
+      lockDuration: 10 * 60_000,
+    }
+  );
+
+  buildWorker.on('failed', (job, err) => {
+    log.warn('Architect build job failed', { buildId: job?.data?.buildId, error: err.message });
+    if (job?.data?.buildId) markBuildCrashed(job.data.buildId, err.message);
   });
 
   sweepWorker = new Worker(SWEEP_QUEUE, async () => sweepSchedules(), {
@@ -286,9 +369,11 @@ export function startAgentWorkers() {
     .catch(err => log.warn('Could not schedule the sweep', { error: err.message }));
 
   runQueue = runQueue || new Queue(RUN_QUEUE, { connection: connection() });
+  buildQueue = buildQueue || new Queue(BUILD_QUEUE, { connection: connection() });
 
   log.info('Agentic workers started', {
-    concurrency: Number(process.env.AGENT_WORKER_CONCURRENCY) || 4,
+    runConcurrency: Number(process.env.AGENT_WORKER_CONCURRENCY) || 4,
+    buildConcurrency: Number(process.env.AGENT_BUILD_CONCURRENCY) || 3,
   });
 }
 
@@ -296,14 +381,17 @@ export async function stopAgentWorkers() {
   if (sweepTimer) clearInterval(sweepTimer);
   await Promise.allSettled([
     runWorker?.close(),
+    buildWorker?.close(),
     sweepWorker?.close(),
     runQueue?.close(),
+    buildQueue?.close(),
     sweepQueue?.close(),
   ]);
 }
 
 export default {
   enqueueRun,
+  enqueueBuild,
   sweepSchedules,
   computeNextRun,
   startAgentWorkers,

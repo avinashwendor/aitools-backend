@@ -20,8 +20,12 @@ import {
   BOOKKEEPING_LABELS,
   MIN_ACTION_COST,
   MAX_OVERDRAFT_CREDITS,
+  TOKEN_METERED_ACTIONS,
   getPlan,
   creditCost,
+  creditsForCost,
+  meteredCost,
+  onDemandTerms,
   planAllows,
   planLimit,
   isUnlimited,
@@ -148,12 +152,69 @@ describe('credit pricing', () => {
     assert.equal(creditCost('not.a.real.action'), 0);
   });
 
-  test('MIN_ACTION_COST and MAX_OVERDRAFT_CREDITS bracket the price table', () => {
+  test('MIN_ACTION_COST is the cheapest thing anyone can do', () => {
     const prices = Object.values(CREDIT_COSTS);
     assert.equal(MIN_ACTION_COST, Math.min(...prices));
-    assert.equal(MAX_OVERDRAFT_CREDITS, Math.max(...prices));
     // The pre-flight check spends the minimum; it must be affordable on any plan.
     assert.ok(MIN_ACTION_COST <= PLANS.free.credits);
+  });
+
+  test('the overdraft clears every fixed price with room for a metered one', () => {
+    // It cannot be `max(prices)` any more: token-metered actions have no fixed
+    // price, and a build that settles above the overdraft would be refused
+    // *after* its tokens were already spent — we'd eat the cost silently.
+    assert.ok(MAX_OVERDRAFT_CREDITS > Math.max(...Object.values(CREDIT_COSTS)));
+  });
+
+  test('token-metered actions are base fees, not full prices', () => {
+    for (const action of TOKEN_METERED_ACTIONS) {
+      assert.ok(CREDIT_COSTS[action] > 0, `${action} has no base fee`);
+      // A base fee that rivals a whole advisory workflow stops being a base fee.
+      assert.ok(
+        CREDIT_COSTS[action] < CREDIT_COSTS['workflow.generate'],
+        `${action}'s base fee is priced like finished work`
+      );
+    }
+  });
+
+  test('cost converts to credits at the anchor rate, never rounding to free', () => {
+    assert.equal(creditsForCost(0), 0);
+    assert.equal(creditsForCost(100), 10);
+    // Sub-credit spend still costs a credit: a rounding rule that bills zero
+    // for real work is one a scripted client finds within a day.
+    assert.equal(creditsForCost(1), 1);
+    assert.equal(creditsForCost(101), 11);
+  });
+
+  test('a metered charge is the base fee plus the tokens plus any add-ons', () => {
+    assert.equal(
+      meteredCost('agent.run', 250, 12),
+      CREDIT_COSTS['agent.run'] + 25 + 12
+    );
+    // A run that made no model calls still pays the base fee and nothing more.
+    assert.equal(meteredCost('agent.run', 0), CREDIT_COSTS['agent.run']);
+  });
+
+  test('on-demand is off on free and priced at each plan’s own credit rate', () => {
+    assert.equal(onDemandTerms('free').available, false);
+
+    for (const id of ['pro', 'studio']) {
+      const terms = onDemandTerms(id);
+      const plan = PLANS[id];
+      assert.equal(terms.available, true, `${id} should offer on-demand`);
+
+      // Overage must cost what the plan costs, near enough. Charging a penalty
+      // rate for going over is how you make your best customers resent you.
+      const planRate = (plan.priceMonthly * 100) / plan.credits;
+      assert.ok(
+        Math.abs(terms.ratePaisePerCredit - planRate) <= 1,
+        `${id} overage is ${terms.ratePaisePerCredit}p against a plan rate of ${planRate.toFixed(1)}p`
+      );
+    }
+  });
+
+  test('an unknown plan gets no on-demand rather than the last one’s terms', () => {
+    assert.equal(onDemandTerms('nonsense').available, false);
   });
 
   test('headline equivalents are derived, never hand-written', () => {

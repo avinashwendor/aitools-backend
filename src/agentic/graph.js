@@ -101,7 +101,7 @@ export function findOrphans(nodes, edges) {
  * and failing at save time is far cheaper than failing nine steps into a run
  * that has already opened a browser and spent credits.
  */
-export function validateGraph({ nodes = [], edges = [] } = {}, { surface = 'flow' } = {}) {
+export function validateGraph({ nodes = [], edges = [] } = {}, { requirements = [] } = {}) {
   const errors = [];
   const warnings = [];
 
@@ -122,12 +122,15 @@ export function validateGraph({ nodes = [], edges = [] } = {}, { surface = 'flow
 
     const def = getNodeDef(node.type);
     if (!def) {
-      errors.push(`Unknown node type "${node.type}".`);
+      // Browser nodes were removed from the product, and a graph saved before
+      // that says so plainly rather than as a generic unknown-type error the
+      // author has no way to interpret.
+      errors.push(
+        node.type.startsWith('browser.')
+          ? `“${node.id}” is a browser step, which this product no longer runs. Delete it or replace it with an HTTP Request.`
+          : `Unknown node type "${node.type}".`
+      );
       continue;
-    }
-
-    if (!def.surfaces.includes(surface)) {
-      errors.push(`“${def.label}” isn’t available in a ${surface} workflow.`);
     }
 
     const label = node.data?.title || def.label;
@@ -169,6 +172,17 @@ export function validateGraph({ nodes = [], edges = [] } = {}, { surface = 'flow
         orphans.length === 1 ? 'it' : 'them'
       } to the trigger.`
     );
+  }
+
+  // An unfilled credential is an error, not a warning. It is the single most
+  // common reason a freshly built workflow fails, it fails late (after other
+  // steps have already spent credits), and it fails as a 401 body that reads
+  // like data rather than as an error — so catching it here is worth the
+  // slightly aggressive gate.
+  for (const requirement of requirements) {
+    if (!requirement.credentialId) {
+      errors.push(`Add your ${requirement.label || requirement.key} before running this.`);
+    }
   }
 
   return { errors, warnings };

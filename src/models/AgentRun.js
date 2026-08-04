@@ -11,8 +11,8 @@ import mongoose from 'mongoose';
  *
  * It also carries both billing numbers per step — credits charged to the user
  * and provider cost in paise — for the same reason the chat ledger does. A run
- * that costs us ₹40 in browser time and charges 60 credits is a fact you want
- * before the invoice, not after.
+ * that costs us ₹4 in tokens and charges 60 credits is a fact you want before
+ * the invoice, not after.
  */
 
 const stepSchema = new mongoose.Schema(
@@ -61,7 +61,6 @@ const agentRunSchema = new mongoose.Schema(
     /** Graph version executed — lets a stored run be replayed against its own shape. */
     workflowVersion: { type: Number, default: 1 },
     workflowName: { type: String, default: '' },
-    surface: { type: String, default: 'flow' },
 
     status: {
       type: String,
@@ -89,8 +88,8 @@ const agentRunSchema = new mongoose.Schema(
       base: { type: Number, default: 0 },
       /** Sum of per-node charges for steps that completed. */
       nodes: { type: Number, default: 0 },
-      /** Browser wall-clock, rounded up to the minute. */
-      browser: { type: Number, default: 0 },
+      /** Derived from the run's real token spend, at PAISE_PER_CREDIT. */
+      tokens: { type: Number, default: 0 },
       total: { type: Number, default: 0 },
     },
 
@@ -98,30 +97,11 @@ const agentRunSchema = new mongoose.Schema(
     cost: {
       llmPaise: { type: Number, default: 0 },
       searchPaise: { type: Number, default: 0 },
-      browserPaise: { type: Number, default: 0 },
       totalPaise: { type: Number, default: 0 },
     },
     tokens: {
       prompt: { type: Number, default: 0 },
       completion: { type: Number, default: 0 },
-    },
-
-    browser: {
-      used: { type: Boolean, default: false },
-      /** 'browserbase' | 'cdp' — which provider served this run. */
-      provider: { type: String, default: null },
-      sessionId: { type: String, default: null },
-      /**
-       * Embeddable URL showing the session as it happens. Only the hosted
-       * provider offers one, and only while the session is open — it is stored
-       * rather than fetched on demand because by the time anyone opens an old
-       * run, the URL is dead and refetching it would just fail slowly.
-       */
-      liveViewUrl: { type: String, default: null },
-      /** Seconds the Chrome session was held open, the billable quantity. */
-      seconds: { type: Number, default: 0 },
-      /** Screenshots captured during the run, newest last. */
-      screenshots: { type: [String], default: [] },
     },
 
     /** Ledger row this run was charged against, for reconciliation. */
@@ -150,7 +130,6 @@ agentRunSchema.methods.toJSONSafe = function toJSONSafe() {
     id: String(this._id),
     workflowId: String(this.workflow),
     workflowName: this.workflowName,
-    surface: this.surface,
     status: this.status,
     trigger: this.trigger,
     steps: this.steps,
@@ -159,14 +138,6 @@ agentRunSchema.methods.toJSONSafe = function toJSONSafe() {
     error: this.error,
     failedNodeId: this.failedNodeId,
     credits: this.credits,
-    browser: {
-      used: this.browser?.used,
-      provider: this.browser?.provider,
-      sessionId: this.browser?.sessionId,
-      liveViewUrl: this.browser?.liveViewUrl,
-      seconds: this.browser?.seconds,
-      screenshots: this.browser?.screenshots || [],
-    },
     startedAt: this.startedAt,
     finishedAt: this.finishedAt,
     createdAt: this.createdAt,

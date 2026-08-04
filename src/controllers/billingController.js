@@ -5,18 +5,27 @@
  *   GET  /api/billing/me        → plan, period, credit balance, breakdown
  *   GET  /api/billing/activity  → recent metered actions, paginated
  *   GET  /api/billing/history   → daily credit usage, for the dashboard chart
+ *   PUT  /api/billing/on-demand → opt in/out of usage-based billing, set a cap
  *   POST /api/billing/upgrade   → register upgrade intent (no gateway yet)
  *   DELETE /api/billing/upgrade → withdraw a pending request
  *
  * Note what is deliberately absent: nothing here lets a user change their own
  * plan. With no payment gateway in front, a self-serve plan change would be a
  * free upgrade button. Intent is captured; an admin grants the plan.
+ *
+ * On-demand is the exception, and it isn't one: turning it on doesn't grant
+ * anything, it agrees to be billed for what is used. That is a decision only
+ * the account holder can make, which is exactly why it can't live in the admin
+ * panel.
  */
 
 import mongoose from 'mongoose';
 import { UsageLedger, UpgradeRequest } from '../models/index.js';
-import { getUsageSummary, isUnmetered } from '../billing/credits.js';
-import { listPlans, isValidPlanId, getPlan, ACTION_LABELS, CREDIT_COSTS } from '../billing/plans.js';
+import { getUsageSummary, isUnmetered, setOnDemand } from '../billing/credits.js';
+import {
+  listPlans, isValidPlanId, getPlan, onDemandTerms,
+  ACTION_LABELS, CREDIT_COSTS,
+} from '../billing/plans.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import config from '../config/index.js';
 import { createLogger } from '../utils/logger.js';
@@ -68,6 +77,41 @@ export const getMyBilling = async (req, res, next) => {
         pendingUpgrade: pendingRequest || null,
       },
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * PUT /api/billing/on-demand — opt in or out of usage-based billing.
+ *
+ * The plan gate is enforced here rather than only in `spend()`, because a
+ * setting that saves successfully and then silently never applies is worse
+ * than one that refuses: the user believes their scheduled workflow will keep
+ * running past the allowance, and it won't.
+ */
+export const updateOnDemand = async (req, res, next) => {
+  try {
+    const terms = onDemandTerms(req.user.subscription?.plan);
+
+    if (req.body.enabled && !terms.available) {
+      throw new ApiError(
+        403,
+        'Usage-based billing is available on Pro and above. Upgrade to keep scheduled workflows running past your allowance.',
+        'ON_DEMAND_NOT_AVAILABLE'
+      );
+    }
+
+    const updated = await setOnDemand({
+      userId: req.user._id,
+      enabled: Boolean(req.body.enabled),
+      capCredits: req.body.capCredits === undefined ? null : req.body.capCredits,
+    });
+
+    if (!updated) throw new ApiError(404, 'Account not found.');
+
+    const summary = await getUsageSummary(updated);
+    res.json({ success: true, data: summary.onDemand });
   } catch (error) {
     next(error);
   }

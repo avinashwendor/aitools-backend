@@ -55,9 +55,10 @@ const usageLedgerSchema = new mongoose.Schema(
       llmPaise: { type: Number, default: 0, min: 0 },
       searchPaise: { type: Number, default: 0, min: 0 },
       /**
-       * Amortised browser-session infra for agentic runs. Zero on every other
-       * action, and the only cost column that isn't a per-call provider price —
-       * see `pricing.browserCostPaise` for how it's derived.
+       * Legacy: amortised browser-session infra, from when agentic runs could
+       * drive a real browser. Nothing writes it any more, but historical rows
+       * carry a non-zero value and the margin aggregation still has to add it
+       * up or last quarter's numbers change retroactively.
        */
       browserPaise: { type: Number, default: 0, min: 0 },
       totalPaise: { type: Number, default: 0, min: 0, index: true },

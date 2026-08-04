@@ -1,0 +1,883 @@
+/**
+ * The workflow architect.
+ *
+ * A tool-calling agent whose job is to produce a workflow that runs. It plans,
+ * reads the actual API documentation, declares the credentials it will need,
+ * writes the graph as operations, and — the part that matters — executes
+ * individual steps to check they work before it says it is finished.
+ *
+ * This replaces a single-shot composer that emitted a graph from memory in one
+ * model call. That design has one failure mode and it happens constantly: asked
+ * for "upload my video to YouTube every Friday", a model will happily produce a
+ * beautifully laid-out graph pointing at `https://api.youtube.com/v3/upload`,
+ * an endpoint that does not exist. Nothing in a one-shot design can catch that,
+ * because nothing in it ever touches the network. The user gets a picture of a
+ * workflow, presses Run, and watches it fail.
+ *
+ * Three things here are what turn that around:
+ *
+ * • **Research is a step, not a suggestion.** `read_url` fetches the real docs
+ *   page. The endpoint, the auth header and the parameter names come from that
+ *   page rather than from the model's recollection of it.
+ *
+ * • **Edits are validated synchronously.** `edit_graph` returns the validator's
+ *   errors in the same tool result, so a missing required field is something
+ *   the model fixes on its next turn rather than something the user discovers.
+ *
+ * • **Steps are actually executed.** `test_step` runs one node for real and
+ *   hands back the response. That is how a `{{ }}` reference gets written
+ *   against the field names the API really returns instead of the ones the
+ *   model assumed.
+ *
+ * Everything the architect does is streamed as it happens, and persisted to the
+ * build document as it streams — a user watching a ninety-second build needs to
+ * see it thinking, and a user who reconnects needs to see what they missed.
+ */
+
+import config from '../../config/index.js';
+import { AgentBuild, AgentWorkflow } from '../../models/index.js';
+import { runAgentLoop, defineTool } from '../../ai/agentLoop.js';
+import { webSearch, searchDocs, isWebSearchConfigured } from '../../ai/tools/webSearch.js';
+import { fetchPage } from '../../ai/tools/fetchPage.js';
+import { search as searchCatalog } from '../../ai/retriever.js';
+import { getNodeDef, NODE_LIST } from '../registry.js';
+import { validateGraph } from '../graph.js';
+import { applyOperations, describeGraph } from '../operations.js';
+import { getExecutor } from '../executors.js';
+import { resolveValues } from '../interpolate.js';
+import { capOutput, safeMessage } from '../safety.js';
+import { publish } from '../events.js';
+import { withMetering, summarize } from '../../billing/meterContext.js';
+import { spend, recordFailure } from '../../billing/credits.js';
+import { meteredCost } from '../../billing/plans.js';
+import { architectSystemPrompt } from './prompt.js';
+import { createLogger } from '../../utils/logger.js';
+
+const log = createLogger('agentic:architect');
+
+/**
+ * Steps `test_step` will execute.
+ *
+ * The rule is "does running this twice change the world?" — because the
+ * architect will run it, and a build that quietly emails a customer or posts to
+ * a live Slack channel while checking its work is a far worse bug than an
+ * unverified node. Everything on this list reads or computes. Everything that
+ * delivers is verified by the user pressing Run, once, deliberately.
+ */
+const TESTABLE_TYPES = new Set([
+  'core.http',
+  'core.code',
+  'core.template',
+  'core.condition',
+  'core.websearch',
+  'core.fetchPage',
+  'core.rss',
+  'core.catalog',
+  'core.llm',
+  'trigger.manual',
+  'trigger.webhook',
+  'trigger.schedule',
+]);
+
+/** Builds currently running in this process, so a cancel can reach them. */
+const inFlight = new Map();
+
+export function cancelBuild(buildId) {
+  const entry = inFlight.get(String(buildId));
+  if (!entry) return false;
+  entry.controller.abort();
+  return true;
+}
+
+export function activeBuildCount(userId) {
+  let count = 0;
+  for (const entry of inFlight.values()) {
+    if (String(entry.userId) === String(userId)) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Run one architect session against a workflow.
+ *
+ * The build document is created by the caller in `queued` state, exactly like a
+ * run, so the API can hand back an id immediately and the client can open its
+ * stream before the first model call returns.
+ *
+ * @param {object} opts
+ * @param {string} opts.buildId
+ * @param {object} opts.user
+ */
+export async function executeBuild({ buildId, user }) {
+  const build = await AgentBuild.findById(buildId);
+  if (!build) throw new Error(`Build ${buildId} not found`);
+  if (build.status !== 'queued') {
+    log.warn('Refusing to execute a build that is not queued', { buildId, status: build.status });
+    return build;
+  }
+
+  const workflow = await AgentWorkflow.findById(build.workflow);
+  if (!workflow) {
+    build.status = 'failed';
+    build.error = 'The workflow was deleted before this build started.';
+    build.finishedAt = new Date();
+    await build.save();
+    return build;
+  }
+
+  const controller = new AbortController();
+  inFlight.set(String(build._id), { userId: user._id, controller });
+
+  try {
+    return await withMetering(usage => buildInner({ build, workflow, user, controller, usage }));
+  } finally {
+    inFlight.delete(String(build._id));
+  }
+}
+
+async function buildInner({ build, workflow, user, controller, usage }) {
+  const startedAt = Date.now();
+  const { signal } = controller;
+
+  build.status = 'running';
+  build.startedAt = new Date();
+  await build.save();
+
+  /**
+   * Everything the architect is allowed to change, held in memory and flushed
+   * to Mongo after each mutation. Kept as one object so a tool handler never
+   * has to know whether it is looking at the saved copy or the working copy.
+   */
+  const state = {
+    graph: {
+      nodes: workflow.graph.nodes.map(n => n.toObject?.() ?? n),
+      edges: workflow.graph.edges.map(e => e.toObject?.() ?? e),
+    },
+    name: workflow.name,
+    plan: [],
+    sources: [],
+    requirements: (workflow.requirements || []).map(r => r.toObject?.() ?? r),
+    /** Outputs of steps `test_step` has run, so a later test can reference them. */
+    testScope: { trigger: {} },
+  };
+
+  const emit = async event => {
+    const entry = {
+      at: new Date(),
+      type: event.type,
+      title: safeMessage(event.title, 300),
+      detail: safeMessage(event.detail, 4000),
+      url: safeMessage(event.url, 1000),
+      ok: event.ok !== false,
+      meta: event.meta ?? null,
+    };
+
+    build.timeline.push(entry);
+    // Bounded, for the same reason run logs are: a fifteen-step build with
+    // chatty tool results should not be able to push the document past Mongo's
+    // limit, because the thing that would fail to write is the summary.
+    if (build.timeline.length > 300) build.timeline.splice(0, build.timeline.length - 300);
+
+    publish(build._id, { type: 'build.event', event: { ...entry, at: entry.at.toISOString() } });
+
+    await AgentBuild.updateOne(
+      { _id: build._id },
+      { $set: { timeline: build.timeline, status: build.status } }
+    ).catch(() => {
+      // A dropped timeline write is cosmetic — the event already went out live
+      // and the graph itself is persisted separately.
+    });
+  };
+
+  /** Persist the graph as it stands, so a build that dies leaves its work. */
+  const flushGraph = async () => {
+    workflow.graph = state.graph;
+    workflow.name = state.name;
+    workflow.version += 1;
+    workflow.requirements = state.requirements;
+    workflow.validation = {
+      ...validateGraph(state.graph, { requirements: state.requirements }),
+      checkedAt: new Date(),
+    };
+    await workflow.save();
+    publish(build._id, { type: 'build.graph', workflow: workflow.toEditorJSON() });
+  };
+
+  const searchable = isWebSearchConfigured();
+  const tools = buildTools({ state, emit, flushGraph, user, signal, searchable });
+
+  let outcome = null;
+  let error = null;
+
+  try {
+    outcome = await runAgentLoop({
+      system: architectSystemPrompt({ intent: build.intent, webSearchAvailable: searchable }),
+      messages: build.messages.map(message => ({
+        role: message.role,
+        content: message.content,
+      })),
+      tools,
+      maxSteps: config.agentic.architectMaxSteps,
+      // The frontier tier. This model's output is a program that will run
+      // unattended against real APIs with the user's credentials — the one
+      // place in the product where being confidently wrong is expensive after
+      // the fact rather than just annoying at the time.
+      role: 'reasoning',
+      task: 'agentic:architect',
+      temperature: 0.2,
+      /*
+       * Four times the loop's default. A tool result here is a rendered
+       * documentation page, and the endpoint, its auth header and its request
+       * body are rarely in the first six thousand characters. Truncating to
+       * the chat-sized default is how the architect ends up having "read" a
+       * reference and still guessing the body. The tokens are billed, so the
+       * larger window costs the user proportionally rather than costing us.
+       */
+      maxResultChars: 24_000,
+      signal,
+      onEvent: async event => {
+        // Prose between tool calls is the model narrating its own reasoning,
+        // and it is the most useful thing on the timeline — it is the part that
+        // explains *why* the next four tool calls are about to happen.
+        if (event.type === 'thinking' && event.text?.trim()) {
+          await emit({ type: 'thought', detail: event.text });
+        }
+      },
+    });
+  } catch (err) {
+    error = err.message;
+    log.error('Architect failed', { buildId: String(build._id), error: err.message });
+  }
+
+  // The plan, sources and summary belong on the workflow, not just on the
+  // build: they stay true after this session is forgotten, and they are what
+  // answers "why does this call that endpoint?" six weeks from now.
+  workflow.blueprint = {
+    goal: build.goal.slice(0, 4000),
+    summary: safeMessage(outcome?.result?.summary || '', 4000),
+    plan: state.plan,
+    sources: state.sources,
+    builtAt: new Date(),
+  };
+  if (!workflow.composedFrom) workflow.composedFrom = build.goal.slice(0, 2000);
+  await flushGraph().catch(err => log.warn('Final graph flush failed', { error: err.message }));
+
+  await finishBuild({
+    build,
+    user,
+    usage,
+    startedAt,
+    workflow,
+    steps: outcome?.steps || 0,
+    summary: outcome?.result?.summary || outcome?.text || '',
+    error:
+      error ||
+      (outcome && !outcome.finished
+        ? 'The architect ran out of steps before it finished. Ask it to continue.'
+        : null),
+    canceled: signal.aborted,
+  });
+
+  return build;
+}
+
+/** Settle the bill, write the terminal state, publish it. */
+async function finishBuild({ build, user, usage, startedAt, workflow, steps, summary, error, canceled }) {
+  build.status = canceled ? 'canceled' : error ? 'failed' : 'succeeded';
+  build.summary = safeMessage(summary, 4000);
+  build.error = error ? safeMessage(error, 1000) : null;
+  build.steps = steps;
+  build.finishedAt = new Date();
+
+  if (build.summary) {
+    build.messages.push({ role: 'assistant', content: build.summary, at: new Date() });
+  }
+
+  const usageSummary = summarize(usage);
+  build.cost = {
+    llmPaise: usageSummary.cost.llmPaise,
+    searchPaise: usageSummary.cost.searchPaise,
+    totalPaise: usageSummary.cost.totalPaise,
+  };
+  build.tokens = usageSummary.tokens;
+
+  /*
+   * Base fee plus what the tokens actually cost.
+   *
+   * Not per step, which was the previous rule and was wrong in the direction
+   * that matters: a step is a model call, and a call that read a 14,000-token
+   * rendered docs page costs twenty times one that renamed a node. Charging
+   * both the same forces a cap on how much the architect is allowed to read,
+   * and a capped architect stops halfway through the reference and invents the
+   * rest — the exact failure this rebuild exists to remove. Metering tokens is
+   * what lets the ceiling come off.
+   */
+  build.credits = meteredCost('agent.build', usageSummary.cost.totalPaise);
+
+  try {
+    const charge = await spend({
+      user,
+      action: 'agent.build',
+      cost: build.credits,
+      usage,
+      allowOverdraft: true,
+      meta: {
+        buildId: String(build._id),
+        workflowId: String(build.workflow),
+        intent: build.intent,
+        steps,
+        outcome: build.status,
+      },
+    });
+    build.ledgerId = charge.ledgerId || null;
+  } catch (err) {
+    log.error('Failed to charge an architect build', { buildId: String(build._id), error: err.message });
+  }
+
+  if (error) {
+    await recordFailure({
+      user,
+      action: 'agent.build',
+      usage,
+      reason: safeMessage(error, 200),
+      meta: { buildId: String(build._id) },
+    }).catch(() => {});
+  }
+
+  await AgentBuild.updateOne(
+    { _id: build._id },
+    {
+      $set: {
+        status: build.status,
+        summary: build.summary,
+        error: build.error,
+        steps: build.steps,
+        messages: build.messages,
+        timeline: build.timeline,
+        credits: build.credits,
+        cost: build.cost,
+        tokens: build.tokens,
+        ledgerId: build.ledgerId,
+        finishedAt: build.finishedAt,
+      },
+    }
+  );
+
+  publish(build._id, {
+    type: 'build.finished',
+    status: build.status,
+    summary: build.summary,
+    error: build.error,
+    credits: build.credits,
+    steps: build.steps,
+    durationMs: Date.now() - startedAt,
+    workflow: workflow.toEditorJSON(),
+  });
+
+  log.info('Architect build finished', {
+    buildId: String(build._id),
+    status: build.status,
+    steps,
+    credits: build.credits,
+    costPaise: build.cost.totalPaise,
+  });
+}
+
+// ─── Tools ──────────────────────────────────────────────────
+
+function buildTools({ state, emit, flushGraph, user, signal, searchable }) {
+  const tools = {};
+
+  tools.plan = defineTool({
+    description:
+      'Record the stages you intend to build, in order. Call this once, early, before you ' +
+      'start editing the graph. The user watches this while you work.',
+    properties: {
+      steps: {
+        type: 'array',
+        description: '3–7 stages.',
+        items: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'Short stage name.' },
+            detail: { type: 'string', description: 'One line on what happens here.' },
+          },
+          required: ['title'],
+        },
+      },
+    },
+    required: ['steps'],
+    run: async ({ steps }) => {
+      state.plan = (steps || []).slice(0, 12).map(step => ({
+        title: safeMessage(step.title, 200),
+        detail: safeMessage(step.detail, 1000),
+      }));
+      await emit({
+        type: 'plan',
+        title: `Planned ${state.plan.length} stages`,
+        meta: { plan: state.plan },
+      });
+      return { ok: true, stages: state.plan.length };
+    },
+  });
+
+  if (searchable) {
+    /**
+     * The one to reach for when the question is "how do I call this service".
+     *
+     * It exists next to `search_web` rather than instead of it because the two
+     * failures it removes are both real. Left to a bare search, a model reads
+     * the snippets and picks the marketing page over the reference — the
+     * snippets are written to sell, and the reference ranks lower. And when it
+     * does pick the reference, that page is usually a JavaScript application
+     * whose HTML contains an empty div, so it reads nothing and quietly
+     * proceeds on memory. This searches with documentation-shaped intent,
+     * re-ranks toward references, and renders what it picks.
+     */
+    tools.find_api_docs = defineTool({
+      description:
+        "Find and read a service's official API documentation in one step. Prefer this " +
+        'over search_web + read_url whenever you need to know how to call an API. ' +
+        'Returns the ranked search results and the full text of the most reference-like pages.',
+      properties: {
+        service: {
+          type: 'string',
+          description: 'The service and the operation, e.g. "Notion create a page" or "Resend send email".',
+        },
+      },
+      required: ['service'],
+      run: async ({ service }) => {
+        const found = await searchDocs(String(service), { maxPages: 2 });
+        if (!found) {
+          throw new Error('Documentation search is unavailable right now — try search_web and read_url.');
+        }
+
+        for (const page of found.pages) {
+          const hit = found.results.find(r => r.url === page.url);
+          if (!state.sources.some(source => source.url === page.url)) {
+            state.sources.push({ title: hit?.title || page.url, url: page.url, note: `Docs for ${service}` });
+          }
+        }
+
+        await emit({
+          type: 'read',
+          title: `Docs: ${String(service).slice(0, 120)}`,
+          url: found.pages[0]?.url,
+          detail: found.pages.map(p => p.url).join(' · ') || 'no page could be read',
+          meta: { results: found.results.slice(0, 5) },
+        });
+
+        return {
+          results: found.results.slice(0, 5),
+          pages: found.pages.map(page => ({ url: page.url, text: page.text.slice(0, 14_000) })),
+        };
+      },
+    });
+
+    tools.search_web = defineTool({
+      description:
+        'Search the live web. Use it for anything that is not an API reference — comparing ' +
+        'services, checking whether something is still free, finding a status page. ' +
+        'Returns titles, URLs and snippets.',
+      properties: {
+        query: { type: 'string', description: 'The search query.' },
+      },
+      required: ['query'],
+      run: async ({ query }) => {
+        const results = await webSearch(String(query), { maxResults: 6 });
+        if (!results) throw new Error('Web search is unavailable right now — build from what you know and say so.');
+        await emit({
+          type: 'search',
+          title: String(query).slice(0, 200),
+          detail: results.map(r => r.title).join(' · '),
+          meta: { results },
+        });
+        return results;
+      },
+    });
+  }
+
+  tools.read_url = defineTool({
+    description:
+      'Fetch a page and return its readable text. This is how you learn an API: read the ' +
+      'reference page and take the exact base URL, path, method, auth scheme, parameters and ' +
+      'response shape from it. Also works on JSON endpoints and OpenAPI documents.',
+    properties: {
+      url: { type: 'string', description: 'An http(s) URL.' },
+      why: { type: 'string', description: 'One short line on what you are looking for here.' },
+    },
+    required: ['url'],
+    run: async ({ url, why }) => {
+      // `allowRender` on: a build reads a given page once, so a rendered retry
+      // costs one credit to turn an empty app shell into the reference the
+      // whole step was for. Workflow nodes, which fetch on every run, don't
+      // get it.
+      const page = await fetchPage(String(url), { maxChars: 12000, signal, allowRender: true });
+
+      // Recorded as a source only when it worked, so the provenance list on the
+      // workflow is pages that were actually read rather than every URL tried.
+      if (!state.sources.some(source => source.url === page.url)) {
+        state.sources.push({
+          title: page.title || page.url,
+          url: page.url,
+          note: safeMessage(why, 600),
+        });
+      }
+
+      await emit({
+        type: 'read',
+        title: page.title || page.url,
+        url: page.url,
+        detail: safeMessage(why, 600),
+      });
+
+      return { title: page.title, url: page.url, text: page.text };
+    },
+  });
+
+  tools.search_tool_catalog = defineTool({
+    description:
+      'Search our own catalog of AI tools. Use this when the user needs a product ' +
+      'recommendation ("which tool should I use to edit the video?"), not when you need an API.',
+    properties: {
+      query: { type: 'string', description: 'What kind of tool they need.' },
+    },
+    required: ['query'],
+    run: async ({ query }) => {
+      const results = await searchCatalog(String(query), { limit: 6 });
+      await emit({
+        type: 'catalog',
+        title: String(query).slice(0, 200),
+        detail: (results || []).map(tool => tool.name).join(' · '),
+      });
+      return (results || []).map(tool => ({
+        name: tool.name,
+        category: tool.category,
+        pricing: tool.pricing,
+        tagline: tool.tagline,
+        url: tool.websiteUrl,
+      }));
+    },
+  });
+
+  tools.describe_node = defineTool({
+    description:
+      'Get the full field list, defaults and output paths for one node type. Use it when you ' +
+      'are unsure what a field expects.',
+    properties: {
+      type: { type: 'string', description: 'A node type, e.g. "core.http".' },
+    },
+    required: ['type'],
+    run: async ({ type }) => {
+      const def = getNodeDef(String(type));
+      if (!def) {
+        throw new Error(`No node type "${type}". Available: ${NODE_LIST.map(n => n.type).join(', ')}.`);
+      }
+      return {
+        type: def.type,
+        label: def.label,
+        description: def.description,
+        credits: def.credits,
+        fields: def.fields,
+        outputs: def.outputs,
+        handles: def.handles,
+      };
+    },
+  });
+
+  tools.require_credential = defineTool({
+    description:
+      'Declare an API key, token or secret the user must provide before this workflow can run. ' +
+      'Write instructions they can actually follow. Never put the secret itself anywhere.',
+    properties: {
+      key: { type: 'string', description: 'Short stable id, e.g. "notion_token".' },
+      label: { type: 'string', description: 'What to call it in the UI, e.g. "Notion integration token".' },
+      provider: {
+        type: 'string',
+        description: 'One of: http, openai, anthropic, slack, discord, telegram, notion, generic.',
+      },
+      instructions: { type: 'string', description: 'Step-by-step, in plain language, on how to obtain it.' },
+      docsUrl: { type: 'string', description: 'Link to the page where they get it.' },
+      usedBy: {
+        type: 'array',
+        description: 'Node ids that will use it.',
+        items: { type: 'string' },
+      },
+    },
+    required: ['key', 'label', 'instructions'],
+    run: async ({ key, label, provider, instructions, docsUrl, usedBy }) => {
+      const requirement = {
+        key: safeMessage(key, 60),
+        label: safeMessage(label, 120),
+        provider: safeMessage(provider || 'generic', 40),
+        instructions: safeMessage(instructions, 2000),
+        docsUrl: safeMessage(docsUrl, 1000),
+        usedBy: (usedBy || []).map(id => safeMessage(id, 60)).slice(0, 20),
+        credentialId: null,
+      };
+
+      // Re-declaring is an update, not a duplicate: the architect routinely
+      // names a requirement before it knows which node will consume it, then
+      // says so again once the node exists.
+      const existing = state.requirements.findIndex(r => r.key === requirement.key);
+      if (existing >= 0) {
+        state.requirements[existing] = { ...state.requirements[existing], ...requirement,
+          credentialId: state.requirements[existing].credentialId };
+      } else {
+        state.requirements.push(requirement);
+      }
+
+      await emit({
+        type: 'requirement',
+        title: requirement.label,
+        detail: requirement.instructions,
+        url: requirement.docsUrl,
+        meta: { key: requirement.key, provider: requirement.provider },
+      });
+      await flushGraph();
+
+      return { ok: true, message: 'Recorded. Leave the credential field on the node empty.' };
+    },
+  });
+
+  tools.inspect_graph = defineTool({
+    description: 'Read the workflow as it currently stands, with any validation errors.',
+    properties: {},
+    run: async () => {
+      const validation = validateGraph(state.graph, { requirements: state.requirements });
+      return {
+        name: state.name,
+        graph: describeGraph(state.graph),
+        errors: validation.errors,
+        warnings: validation.warnings,
+      };
+    },
+  });
+
+  tools.edit_graph = defineTool({
+    description:
+      'Apply operations to the workflow. Operations: addNode {id, type, title, values}, ' +
+      'updateNode {id, values, title}, deleteNode {id}, connect {from, to, handle}, ' +
+      'disconnect {from, to}, rename {name}. Returns what applied, what was rejected, and the ' +
+      'current validation errors — read them and fix them.',
+    properties: {
+      operations: {
+        type: 'array',
+        description: 'The operations to apply, in order.',
+        items: {
+          type: 'object',
+          properties: {
+            op: {
+              type: 'string',
+              enum: ['addNode', 'updateNode', 'deleteNode', 'connect', 'disconnect', 'rename'],
+            },
+            id: { type: 'string' },
+            type: { type: 'string' },
+            title: { type: 'string' },
+            note: { type: 'string' },
+            values: { type: 'object', additionalProperties: true },
+            from: { type: 'string' },
+            to: { type: 'string' },
+            handle: { type: 'string' },
+            name: { type: 'string' },
+          },
+          required: ['op'],
+        },
+      },
+    },
+    required: ['operations'],
+    run: async ({ operations }) => {
+      const result = applyOperations(state.graph, operations || []);
+      state.graph = result.graph;
+      if (result.name) state.name = result.name;
+
+      const validation = validateGraph(state.graph, { requirements: state.requirements });
+
+      await emit({
+        type: 'graph',
+        title:
+          result.applied.length === 0
+            ? 'No changes applied'
+            : `${result.applied.length} change${result.applied.length === 1 ? '' : 's'} applied`,
+        detail: result.applied
+          .map(op => (op.id ? `${op.op} ${op.id}` : `${op.op} ${op.from ?? ''}→${op.to ?? ''}`))
+          .join(', '),
+        ok: result.rejected.length === 0,
+        meta: { applied: result.applied, rejected: result.rejected, errors: validation.errors },
+      });
+
+      await flushGraph();
+
+      return {
+        applied: result.applied,
+        rejected: result.rejected,
+        errors: validation.errors,
+        warnings: validation.warnings,
+        graph: describeGraph(state.graph),
+      };
+    },
+  });
+
+  tools.test_step = defineTool({
+    description:
+      'Actually execute one step and return its real output. Use it on every HTTP request and ' +
+      'on any step whose output shape you are guessing at — then correct the {{ }} references ' +
+      'downstream to match the field names that really came back. Steps that send things ' +
+      '(email, Slack, Discord, Telegram, Notion) cannot be tested, and neither can non-GET ' +
+      'requests, because running them twice would be a real side effect.',
+    properties: {
+      nodeId: { type: 'string', description: 'The id of the node to run.' },
+      triggerInput: {
+        type: 'object',
+        description: 'Optional sample payload to expose as {{ trigger.* }}.',
+        additionalProperties: true,
+      },
+    },
+    required: ['nodeId'],
+    run: async ({ nodeId, triggerInput }) => {
+      const node = state.graph.nodes.find(n => n.id === nodeId);
+      if (!node) {
+        throw new Error(`No node "${nodeId}". The graph has: ${state.graph.nodes.map(n => n.id).join(', ') || 'nothing'}.`);
+      }
+
+      const def = getNodeDef(node.type);
+      if (!def) throw new Error(`"${node.type}" is not a known node type.`);
+
+      if (!TESTABLE_TYPES.has(node.type)) {
+        throw new Error(
+          `${def.label} has side effects, so it can't be test-run. Check its configuration by reading the docs instead.`
+        );
+      }
+
+      const method = String(node.data?.values?.method || 'GET').toUpperCase();
+      if (node.type === 'core.http' && method !== 'GET') {
+        throw new Error(
+          `This is a ${method} request, so running it would change something on the other end. ` +
+          `Verify it against the documentation instead.`
+        );
+      }
+
+      const missing = def.fields
+        .filter(field => field.required)
+        .filter(field => {
+          const value = node.data?.values?.[field.key];
+          return value === undefined || value === null || String(value).trim() === '';
+        })
+        .map(field => field.label);
+
+      if (missing.length) {
+        throw new Error(`"${nodeId}" is missing ${missing.join(', ')}. Fill it in first.`);
+      }
+
+      if (triggerInput && typeof triggerInput === 'object') {
+        state.testScope.trigger = triggerInput;
+      }
+
+      const startedAt = Date.now();
+      const values = resolveValues(node.data?.values || {}, def.fields, state.testScope);
+
+      try {
+        const output = await getExecutor(node.type)({
+          values,
+          nodeId: node.id,
+          userId: user._id,
+          user,
+          trigger: { payload: state.testScope.trigger },
+          scope: state.testScope,
+          edges: state.graph.edges,
+          signal,
+          onLog: () => {},
+        });
+
+        state.testScope[node.id] = output;
+        const capped = capOutput(output, 4000);
+
+        await emit({
+          type: 'test',
+          title: `Ran ${node.data?.title || def.label}`,
+          detail: JSON.stringify(capped).slice(0, 1200),
+          ok: true,
+          meta: { nodeId, ms: Date.now() - startedAt },
+        });
+
+        return {
+          ok: true,
+          ms: Date.now() - startedAt,
+          output: capped,
+          hint: 'Reference these exact field names downstream.',
+        };
+      } catch (err) {
+        await emit({
+          type: 'test',
+          title: `${node.data?.title || def.label} failed`,
+          detail: err.message,
+          ok: false,
+          meta: { nodeId },
+        });
+        // Rethrown so the loop reports it to the model as a tool failure, which
+        // is what prompts it to go back to the docs rather than carry on.
+        throw new Error(`Running "${nodeId}" failed: ${err.message}`);
+      }
+    },
+  });
+
+  tools.finish = defineTool({
+    description:
+      'End the session. Call this once the workflow is built, valid and — where possible — ' +
+      'tested. The summary is shown to the user as your reply. If the graph still has ' +
+      'validation errors this call is refused and you must fix them first.',
+    properties: {
+      name: { type: 'string', description: 'A short, specific name for the workflow.' },
+      summary: {
+        type: 'string',
+        description:
+          'Written to the user: what it does, what they must plug in before running, and ' +
+          'anything you could not verify. A few short paragraphs at most.',
+      },
+    },
+    required: ['summary'],
+    terminal: true,
+    run: async ({ name, summary }) => {
+      /*
+       * The gate. `finish` is the only way out of the loop, so checking here is
+       * the one place a broken graph cannot get past.
+       *
+       * A model that has been working for twelve steps is strongly inclined to
+       * declare victory, and the previous behaviour took it at its word — which
+       * is how a workflow with an empty required field arrived at the user
+       * looking finished and failed on its first run. Refusing the call turns
+       * that into another round with a specific list of what is wrong, which is
+       * exactly the input the model needs and cannot produce for itself.
+       *
+       * Structural errors only. Missing credentials are not a defect — the
+       * user supplies those after the build, by design — and warnings are
+       * judgement calls the author is allowed to overrule.
+       */
+      const check = validateGraph(state.graph, { requirements: state.requirements });
+      if (check.errors.length) {
+        await emit({
+          type: 'test',
+          title: 'Not finished yet',
+          detail: check.errors.slice(0, 6).join(' · '),
+          ok: false,
+        });
+
+        throw new Error(
+          `The workflow is not valid yet, so it cannot be handed over:\n` +
+          `${check.errors.map(problem => `- ${problem}`).join('\n')}\n\n` +
+          `Fix every one of these with edit_graph, then call finish again.`
+        );
+      }
+
+      if (name) {
+        state.name = safeMessage(name, 120);
+        await flushGraph();
+      }
+      return { name: state.name, summary: safeMessage(summary, 4000) };
+    },
+  });
+
+  return tools;
+}
+
+export default { executeBuild, cancelBuild, activeBuildCount };

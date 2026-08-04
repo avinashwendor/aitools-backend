@@ -1,9 +1,9 @@
 /**
- * Agentic engine tests — graph ordering, templating, registry integrity and
- * the composer's operation applier.
+ * Agentic engine tests — graph ordering, templating, registry integrity, the
+ * architect's operation applier and the code sandbox.
  *
- * No database, no LLM, no browser. Everything here is pure derivation, which
- * is deliberate: these are the parts where a bug is silent. A wrong topological
+ * No database, no LLM, no network. Everything here is pure derivation, which is
+ * deliberate: these are the parts where a bug is silent. A wrong topological
  * order or a placeholder that resolves to the string "undefined" doesn't throw,
  * it produces a run that completes and is wrong — and the only place that gets
  * caught cheaply is here.
@@ -17,17 +17,19 @@ import assert from 'node:assert/strict';
 import {
   NODE_REGISTRY,
   NODE_LIST,
+  GROUPS,
   getNodeDef,
   nodeCredits,
-  needsBrowser,
-  typesForSurface,
+  publicRegistry,
 } from '../src/agentic/registry.js';
 import { topoSort, validateGraph, findOrphans, suggestNodeId, ancestors } from '../src/agentic/graph.js';
 import { interpolate, interpolateDeep, resolveValues, getByPath } from '../src/agentic/interpolate.js';
-import { applyOperations } from '../src/agentic/composer.js';
+import { applyOperations, describeGraph } from '../src/agentic/operations.js';
 import { executorTypes } from '../src/agentic/executors.js';
 import { assertUrlAllowed, capOutput } from '../src/agentic/safety.js';
 import { computeNextRun } from '../src/agentic/queue.js';
+import { runScript } from '../src/agentic/sandbox.js';
+import { defineTool, safeCutPoint, estimateTokens } from '../src/ai/agentLoop.js';
 
 const node = (id, type, values = {}) => ({
   id,
@@ -62,7 +64,7 @@ describe('node registry', () => {
 
   test('node definitions are internally consistent', () => {
     for (const def of NODE_LIST) {
-      assert.ok(def.surfaces.length, `${def.type} belongs to no surface`);
+      assert.ok(GROUPS.includes(def.group), `${def.type} is in unknown group "${def.group}"`);
       assert.ok(def.handles.out.length, `${def.type} has no outputs`);
       assert.equal(def.kind === 'trigger', def.handles.in === false,
         `${def.type}: triggers must have no input, actions must have one`);
@@ -72,24 +74,33 @@ describe('node registry', () => {
     }
   });
 
-  test('browser nodes appear only on the browser surface', () => {
-    const flowTypes = typesForSurface('flow');
-    for (const def of NODE_LIST.filter(n => n.requiresBrowser)) {
-      assert.ok(!flowTypes.includes(def.type), `${def.type} leaked into the flow palette`);
+  test('nothing browser-shaped survives in the palette', () => {
+    for (const def of NODE_LIST) {
+      assert.ok(!def.type.startsWith('browser.'), `${def.type} is still registered`);
+    }
+  });
+
+  /**
+   * The manifest is the contract with the editor: the palette, the inspector
+   * and the validator all render from it. A field the browser can't describe
+   * shows up as an empty input the user cannot fill in.
+   */
+  test('the public manifest carries everything the editor renders from', () => {
+    const manifest = publicRegistry();
+    assert.ok(manifest.groups.length);
+    assert.equal(manifest.nodes.length, NODE_LIST.length);
+    for (const def of manifest.nodes) {
+      assert.ok(def.type && def.label && def.group);
+      assert.ok(Array.isArray(def.fields) && Array.isArray(def.handles.out));
     }
   });
 
   test('agent credits scale with steps actually taken', () => {
-    const short = nodeCredits('browser.agent', { steps: 2 });
-    const long = nodeCredits('browser.agent', { steps: 12 });
+    const short = nodeCredits('core.agent', { steps: 2 });
+    const long = nodeCredits('core.agent', { steps: 12 });
     assert.ok(long > short, 'a 12-step agent must cost more than a 2-step one');
-    assert.ok(nodeCredits('browser.agent', { steps: 0 }) > 0, 'a zero-step agent still costs');
+    assert.ok(nodeCredits('core.agent', { steps: 0 }) > 0, 'a zero-step agent still costs');
     assert.equal(nodeCredits('core.template'), 0, 'deterministic nodes are free');
-  });
-
-  test('needsBrowser only fires on browser nodes', () => {
-    assert.equal(needsBrowser([node('a', 'core.http')]), false);
-    assert.equal(needsBrowser([node('a', 'core.http'), node('b', 'browser.act')]), true);
   });
 });
 
@@ -139,8 +150,8 @@ describe('graph ordering', () => {
   });
 
   test('suggested ids do not collide', () => {
-    assert.equal(suggestNodeId('browser.open', []), 'open_1');
-    assert.equal(suggestNodeId('browser.open', ['open_1', 'open_2']), 'open_3');
+    assert.equal(suggestNodeId('core.http', []), 'http_1');
+    assert.equal(suggestNodeId('core.http', ['http_1', 'http_2']), 'http_3');
   });
 });
 
@@ -152,7 +163,7 @@ describe('graph validation', () => {
   };
 
   test('accepts a well-formed graph', () => {
-    assert.deepEqual(validateGraph(valid, { surface: 'flow' }).errors, []);
+    assert.deepEqual(validateGraph(valid).errors, []);
   });
 
   test('requires exactly one trigger', () => {
@@ -169,13 +180,17 @@ describe('graph validation', () => {
     assert.match(validateGraph(missing).errors.join(' '), /missing URL/i);
   });
 
-  test('rejects a browser node on the flow surface', () => {
-    const wrong = {
+  /**
+   * Workflows saved before browser support was removed still exist in the
+   * database. Opening one has to say what happened, because the alternative is
+   * an unrecognised node type and a graph the editor silently drops.
+   */
+  test('a workflow saved with browser nodes explains itself', () => {
+    const legacy = {
       nodes: [node('t', 'trigger.manual'), node('b', 'browser.act', { instruction: 'click' })],
       edges: [edge('t', 'b')],
     };
-    assert.match(validateGraph(wrong, { surface: 'flow' }).errors.join(' '), /isn’t available in a flow workflow/);
-    assert.deepEqual(validateGraph(wrong, { surface: 'browser' }).errors, []);
+    assert.match(validateGraph(legacy).errors.join(' '), /no longer runs/);
   });
 
   test('rejects an edge from a handle the node does not have', () => {
@@ -194,6 +209,20 @@ describe('graph validation', () => {
     const result = validateGraph(orphaned);
     assert.deepEqual(result.errors, []);
     assert.match(result.warnings.join(' '), /won’t run/);
+  });
+
+  /**
+   * The architect declares what secrets a workflow needs; the user supplies
+   * them afterwards. Until they do, pressing Run has to fail here rather than
+   * three nodes in with an opaque 401 from someone else's API.
+   */
+  test('an unfulfilled credential requirement blocks the run', () => {
+    const requirements = [{ key: 'notion_token', label: 'Notion token', credentialId: null, usedBy: ['h'] }];
+    const result = validateGraph(valid, { requirements });
+    assert.match(result.errors.join(' '), /Notion token/);
+
+    const fulfilled = [{ ...requirements[0], credentialId: 'abc123' }];
+    assert.deepEqual(validateGraph(valid, { requirements: fulfilled }).errors, []);
   });
 });
 
@@ -259,7 +288,7 @@ describe('templating', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-describe('composer operations', () => {
+describe('graph operations', () => {
   const base = { nodes: [node('t', 'trigger.manual')], edges: [] };
 
   test('adds and connects a node', () => {
@@ -304,6 +333,15 @@ describe('composer operations', () => {
     assert.notEqual(graph.nodes[1].id, 't');
   });
 
+  test('updateNode merges values rather than replacing them', () => {
+    const { graph } = applyOperations(base, [
+      { op: 'addNode', id: 'h1', type: 'core.http', values: { url: 'https://x.dev', method: 'POST' } },
+      { op: 'updateNode', id: 'h1', values: { url: 'https://y.dev' } },
+    ]);
+    assert.equal(graph.nodes[1].data.values.url, 'https://y.dev');
+    assert.equal(graph.nodes[1].data.values.method, 'POST', 'the untouched field survived');
+  });
+
   test('deleting a node takes its edges with it', () => {
     const wired = {
       nodes: [node('t', 'trigger.manual'), node('h', 'core.http', { url: 'https://x.dev' })],
@@ -329,6 +367,139 @@ describe('composer operations', () => {
       [{ op: 'connect', from: 't', to: 'h' }, { op: 'connect', from: 't', to: 'h' }]
     );
     assert.equal(graph.edges.length, 1);
+  });
+
+  /**
+   * `describeGraph` is what the architect reads back between edits. If it
+   * omitted the configured values, the model would re-derive them from its own
+   * earlier tool calls — which is exactly the memory we don't trust.
+   */
+  test('describeGraph renders ids, types, wiring and values', () => {
+    const { graph } = applyOperations(base, [
+      { op: 'addNode', id: 'h1', type: 'core.http', values: { url: 'https://x.dev' } },
+      { op: 'connect', from: 't', to: 'h1' },
+    ]);
+    const described = describeGraph(graph);
+    const text = JSON.stringify(described);
+    assert.match(text, /h1/);
+    assert.match(text, /core\.http/);
+    assert.match(text, /x\.dev/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('code sandbox', () => {
+  test('returns what the script returns', async () => {
+    const result = await runScript('return input.a + input.b;', { input: { a: 2, b: 3 } });
+    assert.equal(result, 5);
+  });
+
+  test('async scripts are awaited', async () => {
+    const result = await runScript('return await Promise.resolve("done");', {});
+    assert.equal(result, 'done');
+  });
+
+  test('a thrown error comes back as a message, not a crash', async () => {
+    await assert.rejects(() => runScript('throw new Error("nope");', {}), /nope/);
+  });
+
+  /**
+   * The whole point of the child process. `process.env` inside the sandbox must
+   * not be able to see the API keys the server was started with — a user-authored
+   * script that can read them can exfiltrate them with one fetch.
+   */
+  test('the host environment is not visible', async () => {
+    process.env.SANDBOX_CANARY = 'leaked';
+    try {
+      const result = await runScript('return typeof process === "undefined" ? "no process" : (process.env.SANDBOX_CANARY || "empty");', {});
+      assert.notEqual(result, 'leaked');
+    } finally {
+      delete process.env.SANDBOX_CANARY;
+    }
+  });
+
+  test('an infinite loop is killed rather than hanging the run', async () => {
+    await assert.rejects(() => runScript('while (true) {}', {}, { timeoutMs: 500 }), /too long|timed out/i);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('tool definitions', () => {
+  /**
+   * Tools are handed to the provider as JSON Schema. A malformed one is
+   * rejected by the API with a 400 that mentions neither the tool nor the
+   * field, which is a miserable thing to debug at run time.
+   */
+  test('defineTool produces a valid function schema', () => {
+    const tool = defineTool({
+      description: 'Do a thing.',
+      properties: { url: { type: 'string', description: 'Where.' } },
+      required: ['url'],
+      run: async () => ({ ok: true }),
+    });
+    assert.equal(tool.parameters.type, 'object');
+    assert.deepEqual(tool.parameters.required, ['url']);
+    assert.equal(tool.parameters.properties.url.type, 'string');
+    assert.equal(typeof tool.run, 'function');
+  });
+
+  test('a terminal tool is marked as one, so the loop knows to stop', () => {
+    const tool = defineTool({ description: 'End.', run: async () => ({}), terminal: true });
+    assert.equal(tool.terminal, true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('transcript compaction', () => {
+  /**
+   * The wire format requires every `tool` message to follow the assistant turn
+   * that called it. Cutting between them produces a 400 naming a
+   * `tool_call_id` — and only on long runs, which are the ones you least want
+   * to lose. So the cut point is the part worth testing directly.
+   */
+  const transcript = [
+    { role: 'system', content: 'rules' },
+    { role: 'user', content: 'build me a thing' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'a', function: { name: 'search_web' } }] },
+    { role: 'tool', tool_call_id: 'a', name: 'search_web', content: 'results' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'b', function: { name: 'read_url' } }] },
+    { role: 'tool', tool_call_id: 'b', name: 'read_url', content: 'docs' },
+    { role: 'assistant', content: 'now I will build it' },
+  ];
+
+  test('a cut that would orphan a tool result moves past it', () => {
+    // Index 3 is a tool result whose assistant turn is at 2. Keeping from 3
+    // would send a tool message with no call in front of it.
+    assert.equal(safeCutPoint(transcript, 3), 4);
+    assert.equal(safeCutPoint(transcript, 5), 6);
+  });
+
+  test('a cut already on a safe boundary is left alone', () => {
+    assert.equal(safeCutPoint(transcript, 2), 2);
+    assert.equal(safeCutPoint(transcript, 4), 4);
+    assert.equal(safeCutPoint(transcript, 6), 6);
+  });
+
+  test('the system prompt is never cut away', () => {
+    // It carries the rules the whole loop depends on; a summary cannot replace it.
+    assert.ok(safeCutPoint(transcript, 0) >= 1);
+    assert.ok(safeCutPoint(transcript, -5) >= 1);
+  });
+
+  test('token estimates count tool call arguments, not just content', () => {
+    // Arguments live outside `content`, and a graph edit's arguments are
+    // routinely the largest thing in the transcript. Missing them would let it
+    // grow well past the compaction threshold unnoticed.
+    const bare = [{ role: 'assistant', content: '' }];
+    const withCall = [
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'x', function: { name: 'edit_graph', arguments: 'y'.repeat(4000) } }],
+      },
+    ];
+    assert.equal(estimateTokens(bare), 0);
+    assert.ok(estimateTokens(withCall) > 900);
   });
 });
 

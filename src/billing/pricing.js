@@ -39,7 +39,18 @@ export const MODEL_PRICES_USD = {
   'gpt-oss-120b': { input: 0.15, output: 0.6 },
   'gpt-oss-20b': { input: 0.075, output: 0.3 },
 
-  // Anthropic
+  /*
+   * Anthropic.
+   *
+   * Ordered specific → general, and the generic `claude-opus-4` / `claude-
+   * sonnet-4` entries below the versioned ones are the safety net: longest
+   * substring wins, so `claude-opus-4-8` matches its own row while an
+   * unreleased `claude-opus-4-9` still falls back to opus pricing rather than
+   * to DEFAULT_MODEL_PRICE, which would under-report the most expensive model
+   * in the chain by a factor of thirty.
+   */
+  'claude-opus-4-8': { input: 15.0, output: 75.0 },
+  'claude-sonnet-6': { input: 3.0, output: 15.0 },
   'claude-haiku-4': { input: 1.0, output: 5.0 },
   'claude-sonnet-4': { input: 3.0, output: 15.0 },
   'claude-opus-4': { input: 15.0, output: 75.0 },
@@ -52,6 +63,7 @@ export const MODEL_PRICES_USD = {
 
   // Mistral / DeepSeek / Qwen commonly seen on OpenRouter
   'mixtral-8x7b': { input: 0.24, output: 0.24 },
+  'deepseek-pro-v4': { input: 0.6, output: 2.4 },
   'deepseek-chat': { input: 0.27, output: 1.1 },
   'deepseek-r1': { input: 0.55, output: 2.19 },
   'qwen-2.5-72b': { input: 0.35, output: 0.4 },
@@ -116,25 +128,6 @@ export function searchCostPaise(credits = 1) {
   return Math.round(Number(credits) * config.billing.searchCreditUsd * config.billing.usdToInr * 100);
 }
 
-/**
- * Cost of holding a browser session open, in paise per second.
- *
- * Unlike tokens, this isn't a published per-unit price — it's our own infra
- * amortised. A Railway browser service sized for the concurrency the plans
- * allow costs a fixed monthly figure; divided by the session-seconds it can
- * actually serve at a realistic utilisation, that lands near ₹0.10/minute.
- * `BILLING_BROWSER_PAISE_PER_MINUTE` makes it tunable without a deploy, because
- * the right number only becomes knowable once real runs are on the graph.
- *
- * Recorded on the ledger exactly like token cost so `/api/admin/billing/actions`
- * reports agentic margin on the same footing as chat margin. Without it, browser
- * runs would look like pure profit — the one place cost is *not* tokens.
- */
-export function browserCostPaise(seconds = 0) {
-  const perMinute = config.billing.browserPaisePerMinute;
-  return Math.round((Number(seconds) / 60) * perMinute);
-}
-
 /** Format paise for display: 12345 → "₹123.45". */
 export function formatPaise(paise) {
   const rupees = Number(paise || 0) / 100;
@@ -147,6 +140,5 @@ export default {
   priceForModel,
   llmCostPaise,
   searchCostPaise,
-  browserCostPaise,
   formatPaise,
 };

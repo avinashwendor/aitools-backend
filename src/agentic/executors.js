@@ -9,10 +9,7 @@
  *
  * No executor touches the run document, the ledger, the event bus or the
  * database directly. That belongs to the runner, and keeping it there is what
- * makes an executor testable by calling it with an object — the node-based
- * reference threaded a whole step-tools object and a publish function through
- * every executor, and the result is that none of them can be exercised without
- * standing up the queue.
+ * makes an executor testable by calling it with an object.
  *
  * Failures throw. The runner catches, marks the step failed, and decides
  * whether the run continues — a decision no individual node should be making.
@@ -21,10 +18,13 @@
 import config from '../config/index.js';
 import { complete, completeJson } from '../ai/llm.js';
 import { search as searchCatalog } from '../ai/retriever.js';
+import { webSearch, isWebSearchConfigured } from '../ai/tools/webSearch.js';
+import { fetchPage } from '../ai/tools/fetchPage.js';
+import { runAgentLoop, defineTool } from '../ai/agentLoop.js';
 import { sendEmail, isEmailConfigured } from '../services/email/index.js';
 import { AgentCredential } from '../models/index.js';
 import { assertUrlAllowed } from './safety.js';
-import * as browser from './browser/primitives.js';
+import { runScript } from './sandbox.js';
 
 /** Load a credential the node referenced, scoped to the run's owner. */
 async function loadCredential(credentialId, userId) {
@@ -47,6 +47,12 @@ async function loadCredential(credentialId, userId) {
   AgentCredential.updateOne({ _id: credential._id }, { lastUsedAt: new Date() }).catch(() => {});
 
   return credential;
+}
+
+/** The raw secret behind a credential, for APIs that want it in a URL path. */
+async function loadSecret(credentialId, userId) {
+  const credential = await loadCredential(credentialId, userId);
+  return credential?.plaintext ?? null;
 }
 
 const executors = {
@@ -105,28 +111,21 @@ const executors = {
     };
   },
 
-  'core.llm': async ({ values, signal }) => {
-    const messages = [];
-    if (values.system) messages.push({ role: 'system', content: String(values.system) });
-    messages.push({ role: 'user', content: String(values.prompt) });
+  'core.code': async ({ values, scope, trigger, nodeId, edges }) => {
+    // `input` is the single upstream node's output when there is exactly one,
+    // which is the case that covers almost every script anyone writes. With
+    // several parents there is no defensible choice, so it is null and the
+    // author reaches into `steps` by name instead of us guessing.
+    const parents = (edges || []).filter(e => e.target === nodeId).map(e => e.source);
+    const input = parents.length === 1 ? scope[parents[0]] ?? null : null;
 
-    if (values.json) {
-      const { data, model } = await completeJson({
-        messages,
-        role: values.role === 'fast' ? 'fast' : 'planner',
-        task: 'agentic:node-llm',
-        signal,
-      });
-      return { json: data, text: JSON.stringify(data), model };
-    }
-
-    const result = await complete({
-      messages,
-      role: values.role === 'fast' ? 'fast' : 'planner',
-      task: 'agentic:node-llm',
-      signal,
+    const result = await runScript(String(values.script || ''), {
+      input,
+      steps: scope,
+      trigger: trigger?.payload || {},
     });
-    return { text: result.content, model: result.model };
+
+    return { result };
   },
 
   'core.template': async ({ values }) => {
@@ -167,7 +166,7 @@ const executors = {
     await new Promise((resolve, reject) => {
       const timer = setTimeout(resolve, ms);
       // Without this, cancelling a run leaves the worker asleep for five
-      // minutes holding a concurrency slot that the user has already given up on.
+      // minutes holding a concurrency slot the user has already given up on.
       signal?.addEventListener('abort', () => {
         clearTimeout(timer);
         reject(new Error('Run canceled'));
@@ -176,23 +175,196 @@ const executors = {
     return { waitedMs: ms };
   },
 
-  'core.email': async ({ values, user }) => {
-    if (!isEmailConfigured()) {
-      throw new Error('Email is not configured on this server.');
+  // ─── Intelligence ────────────────────────────────────────
+
+  'core.llm': async ({ values, signal }) => {
+    const messages = [];
+    if (values.system) messages.push({ role: 'system', content: String(values.system) });
+    messages.push({ role: 'user', content: String(values.prompt) });
+
+    if (values.json) {
+      const { data, model } = await completeJson({
+        messages,
+        role: values.role === 'fast' ? 'fast' : 'planner',
+        task: 'agentic:node-llm',
+        signal,
+      });
+      return { json: data, text: JSON.stringify(data), model };
     }
 
-    // Only to addresses the account owns or has already been in touch with is
-    // too strict to be useful, but unrestricted send turns every account into
-    // an open relay wearing our sending domain. The compromise: the recipient
-    // is whatever the author typed, and the sender identity is always ours with
-    // the owning account named in the body footer, so abuse is attributable.
-    const result = await sendEmail({
-      to: String(values.to),
-      subject: String(values.subject).slice(0, 200),
-      text: `${values.body}\n\n—\nSent by an automated workflow (${user?.email || 'unknown account'}).`,
+    const result = await complete({
+      messages,
+      role: values.role === 'fast' ? 'fast' : 'planner',
+      task: 'agentic:node-llm',
+      signal,
+    });
+    return { text: result.content, model: result.model };
+  },
+
+  /**
+   * An autonomous agent as a single node.
+   *
+   * Its tools are deliberately read-only — search and fetch. A node that could
+   * also write would be a second, invisible workflow hiding inside a box on the
+   * canvas, and the whole point of the graph is that side effects are things
+   * you can see and connect. Anything that changes the world is a node the
+   * author placed.
+   */
+  'core.agent': async ({ values, signal, onLog }) => {
+    const allowed = String(values.tools || 'search + fetch');
+    const canSearch = allowed.includes('search') && isWebSearchConfigured();
+    const canFetch = allowed.includes('fetch');
+    const sources = new Set();
+
+    const tools = {};
+
+    if (canSearch) {
+      tools.search_web = defineTool({
+        description: 'Search the live web. Returns titles, URLs and snippets.',
+        properties: {
+          query: { type: 'string', description: 'What to search for.' },
+        },
+        required: ['query'],
+        run: async ({ query }) => {
+          const results = await webSearch(String(query), { maxResults: 5 });
+          if (!results) throw new Error('Web search is unavailable right now.');
+          results.forEach(r => sources.add(r.url));
+          return results;
+        },
+      });
+    }
+
+    if (canFetch) {
+      tools.read_url = defineTool({
+        description:
+          'Fetch a public URL and return its readable text or JSON. Use this to read a page ' +
+          'a search turned up, or to call a public API endpoint.',
+        properties: {
+          url: { type: 'string', description: 'An http(s) URL.' },
+        },
+        required: ['url'],
+        run: async ({ url }) => {
+          const page = await fetchPage(String(url), { maxChars: 6000, signal });
+          sources.add(page.url);
+          return { title: page.title, text: page.text };
+        },
+      });
+    }
+
+    tools.finish = defineTool({
+      description:
+        'Call this when you have the answer. This ends your turn — do not call it before ' +
+        'you have actually gathered what you were asked for.',
+      properties: {
+        answer: { type: 'string', description: 'The answer, in plain prose.' },
+        data: {
+          type: 'object',
+          description: 'The answer as structured data, matching the requested shape if one was given.',
+          additionalProperties: true,
+        },
+      },
+      required: ['answer'],
+      terminal: true,
+      run: async ({ answer, data }) => ({ answer, data: data ?? null }),
     });
 
-    return { id: result?.id || null, to: values.to, sent: true };
+    const shape = values.schema
+      ? `\n\nReturn \`data\` matching this shape exactly:\n${JSON.stringify(values.schema, null, 2)}`
+      : '';
+
+    const outcome = await runAgentLoop({
+      system:
+        'You are a research agent inside an automation workflow. You are given a goal and a ' +
+        'small set of read-only tools. Work in small steps: gather what you actually need, ' +
+        'then call `finish`.\n\n' +
+        'Rules:\n' +
+        '- Never invent a fact you did not read from a tool result.\n' +
+        '- Prefer two good sources over six shallow ones.\n' +
+        '- If a tool fails, try a different query or URL rather than repeating it.\n' +
+        '- You must end by calling `finish`.' +
+        shape,
+      messages: [
+        {
+          role: 'user',
+          content:
+            `GOAL: ${values.goal}` +
+            (values.context ? `\n\nCONTEXT FROM EARLIER STEPS:\n${String(values.context).slice(0, 6000)}` : ''),
+        },
+      ],
+      tools,
+      maxSteps: Math.min(Math.max(Number(values.maxSteps) || 8, 1), 40),
+      // Same tier as the architect: this node's job is to be right about
+      // something the workflow will then act on unattended.
+      role: 'reasoning',
+      // Pages, not paragraphs. The node is charged for the tokens it reads.
+      maxResultChars: 16_000,
+      task: 'agentic:node-agent',
+      signal,
+      onEvent: event => {
+        if (event.type === 'tool.start') {
+          onLog?.({ level: 'info', message: `${event.name}(${JSON.stringify(event.args).slice(0, 160)})` });
+        } else if (event.type === 'thinking' && event.text) {
+          onLog?.({ level: 'debug', message: event.text.slice(0, 400) });
+        }
+      },
+    });
+
+    // An agent that ran out of budget still has whatever prose it last wrote,
+    // and that is usually most of the answer. Returning it with success:false
+    // lets a downstream If branch on the difference instead of the run simply
+    // failing with nothing to show for the credits it spent.
+    return {
+      success: outcome.finishReason === 'finished',
+      answer: outcome.result?.answer ?? outcome.text ?? '',
+      data: outcome.result?.data ?? null,
+      steps: outcome.steps,
+      sources: [...sources],
+      finishReason: outcome.finishReason,
+    };
+  },
+
+  // ─── Data ────────────────────────────────────────────────
+
+  'core.websearch': async ({ values }) => {
+    if (!isWebSearchConfigured()) {
+      throw new Error('Web search is not configured on this server (TAVILY_API_KEY).');
+    }
+    const results = await webSearch(String(values.query), {
+      maxResults: Math.min(Number(values.limit) || 5, 10),
+    });
+    if (!results) throw new Error('Web search is unavailable right now — try again shortly.');
+
+    return {
+      results,
+      // A pre-joined text form so the common next step (feed it to an AI Step)
+      // doesn't need a Code node in between just to flatten an array.
+      text: results.map(r => `${r.title}\n${r.url}\n${r.snippet}`).join('\n\n'),
+      count: results.length,
+    };
+  },
+
+  'core.fetchPage': async ({ values, signal }) => {
+    const page = await fetchPage(String(values.url), {
+      maxChars: Math.min(Number(values.maxChars) || 8000, 40000),
+      signal,
+    });
+    return { title: page.title, text: page.text, url: page.url };
+  },
+
+  'core.rss': async ({ values, signal }) => {
+    const url = assertUrlAllowed(values.url);
+    const response = await fetch(url.toString(), {
+      signal,
+      headers: { 'User-Agent': 'AIToolsWorkflow/1.0', Accept: 'application/rss+xml, application/xml, text/xml, */*' },
+    });
+    if (!response.ok) throw new Error(`Feed returned ${response.status}.`);
+
+    const xml = await response.text();
+    const limit = Math.min(Number(values.limit) || 10, 50);
+    const items = parseFeed(xml, limit);
+
+    if (!items.length) throw new Error('No items found — is that URL an RSS or Atom feed?');
+    return { items, count: items.length };
   },
 
   'core.catalog': async ({ values }) => {
@@ -213,59 +385,163 @@ const executors = {
     };
   },
 
-  // ─── Browser ─────────────────────────────────────────────
-  // `getBrowser()` is provided by the runner and opens the session on first
-  // call. Nodes never see the connection details, and a graph that reaches no
-  // browser node never opens one — which is the difference between a flow
-  // workflow costing nothing extra and costing a Chrome container.
+  // ─── Deliver ─────────────────────────────────────────────
 
-  'browser.open': async ({ values, getBrowser }) => {
-    const session = await getBrowser();
-    return session.goto(values.url, { waitUntil: values.waitUntil || 'load' });
-  },
+  'core.email': async ({ values, user }) => {
+    if (!isEmailConfigured()) {
+      throw new Error('Email is not configured on this server.');
+    }
 
-  'browser.act': async ({ values, getBrowser }) => {
-    const session = await getBrowser();
-    return browser.act({ page: session.page(), instruction: values.instruction });
-  },
-
-  'browser.extract': async ({ values, getBrowser }) => {
-    const session = await getBrowser();
-    return browser.extract({
-      page: session.page(),
-      instruction: values.instruction,
-      schema: values.schema || null,
+    // Unrestricted send would turn every account into an open relay wearing our
+    // sending domain. The compromise: the recipient is whatever the author
+    // typed, the sender identity is always ours, and the owning account is
+    // named in the footer, so abuse is attributable.
+    const result = await sendEmail({
+      to: String(values.to),
+      subject: String(values.subject).slice(0, 200),
+      text: `${values.body}\n\n—\nSent by an automated workflow (${user?.email || 'unknown account'}).`,
     });
+
+    return { id: result?.id || null, to: values.to, sent: true };
   },
 
-  'browser.observe': async ({ values, getBrowser }) => {
-    const session = await getBrowser();
-    return browser.observe({ page: session.page(), instruction: values.instruction });
-  },
+  'core.slack': async ({ values, signal }) => {
+    const url = assertUrlAllowed(values.webhookUrl);
+    const content = String(values.content || '').slice(0, 4000);
+    if (!content) throw new Error('Slack message content is required.');
 
-  'browser.agent': async ({ values, getBrowser, onLog }) => {
-    const session = await getBrowser();
-    return browser.agent({
-      page: session.page(),
-      instruction: values.instruction,
-      maxSteps: values.maxSteps,
-      // Streamed to the run console as they happen. An autonomous agent that
-      // shows nothing for ninety seconds is indistinguishable from a hung one,
-      // and users kill runs that look hung.
-      onStep: ({ step, thought, action }) =>
-        onLog({ level: 'info', message: `Step ${step}: ${action}${thought ? ` — ${thought}` : ''}` }),
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: content }),
+      signal,
     });
+    if (!response.ok) {
+      throw new Error(`Slack webhook failed (${response.status}).`);
+    }
+    return { messageContent: content };
   },
 
-  'browser.screenshot': async ({ values, getBrowser, onScreenshot }) => {
-    const session = await getBrowser();
-    const dataUrl = await session.screenshot({ fullPage: Boolean(values.fullPage) });
-    onScreenshot(dataUrl);
-    // The image goes on the run document, not in the node's output: a data URL
-    // in the context would be re-serialized into every downstream prompt.
-    return { captured: true, fullPage: Boolean(values.fullPage) };
+  'core.discord': async ({ values, signal }) => {
+    const url = assertUrlAllowed(values.webhookUrl);
+    const content = String(values.content || '').slice(0, 2000);
+    if (!content) throw new Error('Discord message content is required.');
+
+    const body = { content };
+    if (values.username) body.username = String(values.username).slice(0, 80);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(`Discord webhook failed (${response.status}).`);
+    }
+    return { messageContent: content };
+  },
+
+  'core.telegram': async ({ values, userId, signal }) => {
+    const token = await loadSecret(values.credentialId, userId);
+    if (!token) throw new Error('Select the credential holding your Telegram bot token.');
+
+    const content = String(values.content || '').slice(0, 4000);
+    if (!content) throw new Error('Telegram message content is required.');
+
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: String(values.chatId), text: content }),
+      signal,
+    });
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      // Telegram's own description is far more useful than the status code —
+      // "chat not found" and "bot was blocked" are both 400.
+      throw new Error(`Telegram rejected the message: ${data.description || response.status}.`);
+    }
+
+    return { messageId: data.result?.message_id ?? null, messageContent: content };
+  },
+
+  'core.notion': async ({ values, userId, signal }) => {
+    const token = await loadSecret(values.credentialId, userId);
+    if (!token) throw new Error('Select the credential holding your Notion integration token.');
+
+    const properties = {
+      // Notion requires the title property by name, and it differs per
+      // database. "Name" is the default Notion itself creates, and an author
+      // who renamed it can override through the extra properties field.
+      Name: { title: [{ text: { content: String(values.title).slice(0, 2000) } }] },
+      ...(values.properties || {}),
+    };
+
+    const children = values.content
+      ? [{
+          object: 'block',
+          type: 'paragraph',
+          paragraph: { rich_text: [{ text: { content: String(values.content).slice(0, 2000) } }] },
+        }]
+      : [];
+
+    const response = await fetch('https://api.notion.com/v1/pages', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+      },
+      body: JSON.stringify({
+        parent: { database_id: String(values.databaseId).replace(/-/g, '') },
+        properties,
+        ...(children.length ? { children } : {}),
+      }),
+      signal,
+    });
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(`Notion rejected the page: ${data.message || response.status}.`);
+    }
+
+    return { id: data.id, url: data.url };
   },
 };
+
+/**
+ * Minimal RSS/Atom reader.
+ *
+ * A regex rather than an XML parser, for the same reason `fetchPage` uses one:
+ * feeds are read to be summarised, and the five fields anyone summarises are
+ * unambiguous in both dialects. A parser would add a dependency to gain
+ * correctness on namespaced extensions nothing downstream reads.
+ */
+function parseFeed(xml, limit) {
+  const blocks = xml.match(/<(item|entry)\b[\s\S]*?<\/\1>/gi) || [];
+
+  const field = (block, name) => {
+    const match = block.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, 'i'));
+    if (!match) return '';
+    return match[1]
+      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
+
+  return blocks.slice(0, limit).map(block => {
+    // Atom puts the URL in an attribute, RSS in the element body.
+    const href = block.match(/<link\b[^>]*href=["']([^"']+)["']/i);
+    return {
+      title: field(block, 'title').slice(0, 300),
+      link: (href ? href[1] : field(block, 'link')).slice(0, 800),
+      publishedAt: field(block, 'pubDate') || field(block, 'updated') || field(block, 'published'),
+      summary: (field(block, 'description') || field(block, 'summary') || field(block, 'content')).slice(0, 1000),
+    };
+  });
+}
 
 export function getExecutor(type) {
   const executor = executors[type];

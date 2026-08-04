@@ -121,6 +121,40 @@ const userSchema = new mongoose.Schema(
       used: { type: Number, default: 0 },
       /** Lifetime total, never reset — the number the admin table sorts on. */
       lifetimeUsed: { type: Number, default: 0, min: 0 },
+      /**
+       * The part of `used` that went past the allowance on on-demand terms.
+       *
+       * A subset of `used`, not a sibling of it — so the balance arithmetic
+       * everywhere else stays "allowance minus used" and doesn't have to know
+       * this exists. It is here so the amount owed can be recomputed from the
+       * account at any time rather than trusted from a running total.
+       */
+      onDemandUsed: { type: Number, default: 0, min: 0 },
+    },
+
+    /**
+     * Usage-based billing beyond the plan allowance.
+     *
+     * Off until the account turns it on. That is the whole point: a workflow on
+     * a cron shouldn't start failing at 6am because an allowance ran out, but
+     * nobody should ever discover they agreed to unbounded spend by reading an
+     * invoice. See ON_DEMAND in `billing/plans.js`.
+     *
+     * There is no payment gateway. `accruedPaise` is an amount *owed*, settled
+     * out of band; nothing in this codebase moves money.
+     */
+    onDemand: {
+      enabled: { type: Boolean, default: false },
+      /**
+       * The user's own ceiling, in credits per period. 0 means "the plan's
+       * limit is my limit". Always the tighter of the two applies.
+       */
+      capCredits: { type: Number, default: 0, min: 0 },
+      /** Owed for the current period, in paise. Reset on rollover. */
+      accruedPaise: { type: Number, default: 0, min: 0 },
+      /** Never reset — what this account has run up in total. */
+      lifetimePaise: { type: Number, default: 0, min: 0 },
+      enabledAt: { type: Date, default: null },
     },
 
     /** Reminder preferences — used by Resend digests and Google/n8n runners. */

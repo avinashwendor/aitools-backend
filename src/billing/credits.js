@@ -29,6 +29,7 @@ import {
   getPlan,
   creditCost,
   planLimit,
+  onDemandTerms,
   ACTION_LABELS,
   MAX_OVERDRAFT_CREDITS,
 } from './plans.js';
@@ -76,6 +77,11 @@ export async function ensureCurrentPeriod(user) {
         'subscription.periodKey': next.periodKey,
         'credits.included': plan.credits,
         'credits.used': 0,
+        // Cleared with the allowance they overflowed. What was owed for the
+        // closing period survives on `onDemand.lifetimePaise` and in the ledger
+        // rows, which is what an invoice would be reconstructed from.
+        'credits.onDemandUsed': 0,
+        'onDemand.accruedPaise': 0,
       },
     },
     { new: true }
@@ -115,7 +121,30 @@ export function balanceOf(user) {
 export function canAfford(user, cost) {
   if (isUnmetered(user)) return true;
   if (config.billing.softLimits) return true;
-  return balanceOf(user) >= cost;
+  if (balanceOf(user) >= cost) return true;
+  return onDemandHeadroom(user) >= cost - balanceOf(user);
+}
+
+/**
+ * How many more credits this account may run up on on-demand terms.
+ *
+ * The tighter of the plan's cap and the user's own. Zero unless on-demand is
+ * both offered and switched on — the default answer is no.
+ */
+export function onDemandHeadroom(user) {
+  if (!user?.onDemand?.enabled) return 0;
+
+  const terms = onDemandTerms(user.subscription?.plan);
+  if (!terms.available) return 0;
+
+  const used = user.credits?.onDemandUsed || 0;
+  const userCap = user.onDemand?.capCredits || 0;
+
+  // 0 means unlimited on both sides, which is why they can't just be `Math.min`ed.
+  const caps = [terms.maxCreditsPerPeriod, userCap].filter(cap => cap > 0);
+  if (!caps.length) return Number.MAX_SAFE_INTEGER;
+
+  return Math.max(0, Math.min(...caps) - used);
 }
 
 /**
@@ -194,11 +223,43 @@ export async function spend({
   );
 
   if (!updated) {
+    // The allowance won't cover it. Before refusing, see whether the account
+    // has opted in to paying for the overflow.
+    const overflow = await spendOnDemand({ user, charge });
+
+    if (overflow.ok) {
+      const entry = await writeLedger({
+        user, action, credits: charge, charge, plan: plan.id, periodKey,
+        sessionId, summary,
+        meta: {
+          ...meta,
+          onDemandCredits: overflow.credits,
+          onDemandPaise: overflow.paise,
+        },
+      });
+
+      log.info('Charged on demand', {
+        user: String(user._id),
+        action,
+        charge,
+        onDemandCredits: overflow.credits,
+        onDemandPaise: overflow.paise,
+      });
+
+      return {
+        ok: true,
+        ledgerId: entry?._id,
+        balance: balanceOf(overflow.user),
+        charged: charge,
+        onDemand: { credits: overflow.credits, paise: overflow.paise },
+      };
+    }
+
     // Record the refusal: demand turned away by plan limits is the clearest
     // upgrade signal there is, and it's invisible if you only log successes.
     await writeLedger({
       user, action, credits: 0, charge, plan: plan.id, periodKey,
-      sessionId, summary, denied: true, meta,
+      sessionId, summary, denied: true, meta: { ...meta, reason: overflow.reason },
     });
 
     log.info('Credit check failed', {
@@ -207,13 +268,14 @@ export async function spend({
       charge,
       balance: balanceOf(user),
       plan: plan.id,
+      reason: overflow.reason,
     });
 
     return {
       ok: false,
       balance: balanceOf(user),
       charged: 0,
-      reason: 'INSUFFICIENT_CREDITS',
+      reason: overflow.reason,
     };
   }
 
@@ -228,6 +290,113 @@ export async function spend({
     balance: balanceOf(updated),
     charged: charge,
   };
+}
+
+/**
+ * Spend past the allowance, if the account agreed to that.
+ *
+ * Written as an aggregation-pipeline update because the amount owed depends on
+ * fields of the document being written: only the part of this charge that
+ * lands *above* the allowance is billable, and a user already 30 credits over
+ * who spends 10 more owes for 10, not for 40. Computing that in application
+ * code would mean a read, then a write, with the balance free to move in
+ * between — and it moves most when a user is at their limit and retrying.
+ *
+ * The cap is enforced in the filter, so the write simply doesn't happen when it
+ * would breach it.
+ *
+ * @returns {Promise<{ok:boolean, credits?:number, paise?:number, user?:object, reason?:string}>}
+ */
+async function spendOnDemand({ user, charge }) {
+  const headroom = onDemandHeadroom(user);
+  if (headroom <= 0) {
+    return {
+      ok: false,
+      reason: user?.onDemand?.enabled ? 'ON_DEMAND_CAP_REACHED' : 'INSUFFICIENT_CREDITS',
+    };
+  }
+
+  const terms = onDemandTerms(user.subscription?.plan);
+  const capCredits = [terms.maxCreditsPerPeriod, user.onDemand?.capCredits || 0]
+    .filter(cap => cap > 0);
+  // MAX_SAFE_INTEGER would overflow the `$add` below; this is still far beyond
+  // any plausible period.
+  const ceiling = capCredits.length ? Math.min(...capCredits) : 10_000_000;
+
+  /** Credits of this charge that fall above the allowance. */
+  const billable = {
+    $let: {
+      vars: {
+        allowance: { $add: ['$credits.included', '$credits.bonus'] },
+        after: { $add: ['$credits.used', charge] },
+      },
+      in: {
+        $subtract: [
+          { $max: [0, { $subtract: ['$$after', '$$allowance'] }] },
+          { $max: [0, { $subtract: ['$credits.used', '$$allowance'] }] },
+        ],
+      },
+    },
+  };
+
+  const updated = await User.findOneAndUpdate(
+    {
+      _id: user._id,
+      'onDemand.enabled': true,
+      $expr: { $lte: [{ $add: ['$credits.onDemandUsed', billable] }, ceiling] },
+    },
+    [
+      {
+        $set: {
+          'credits.used': { $add: ['$credits.used', charge] },
+          'credits.lifetimeUsed': { $add: ['$credits.lifetimeUsed', charge] },
+          'credits.onDemandUsed': { $add: ['$credits.onDemandUsed', billable] },
+          'onDemand.accruedPaise': {
+            $add: ['$onDemand.accruedPaise', { $multiply: [billable, terms.ratePaisePerCredit] }],
+          },
+          'onDemand.lifetimePaise': {
+            $add: ['$onDemand.lifetimePaise', { $multiply: [billable, terms.ratePaisePerCredit] }],
+          },
+        },
+      },
+    ],
+    { new: true }
+  );
+
+  if (!updated) return { ok: false, reason: 'ON_DEMAND_CAP_REACHED' };
+
+  const credits = (updated.credits?.onDemandUsed || 0) - (user.credits?.onDemandUsed || 0);
+  return {
+    ok: true,
+    credits,
+    paise: credits * terms.ratePaisePerCredit,
+    user: updated,
+  };
+}
+
+/**
+ * Turn usage-based billing on or off, or move the user's own ceiling.
+ *
+ * The cap is stored as the user set it rather than clamped to the plan's, so
+ * that a "stop at 2,000 credits" preference survives an upgrade instead of
+ * quietly becoming whatever the old plan allowed.
+ */
+export async function setOnDemand({ userId, enabled, capCredits = null }) {
+  const update = {
+    'onDemand.enabled': Boolean(enabled),
+    ...(enabled ? { 'onDemand.enabledAt': new Date() } : {}),
+    ...(capCredits === null ? {} : { 'onDemand.capCredits': Math.max(0, Math.round(Number(capCredits) || 0)) }),
+  };
+
+  const updated = await User.findByIdAndUpdate(userId, { $set: update }, { new: true });
+  if (updated) {
+    log.info('On-demand billing changed', {
+      user: String(userId),
+      enabled: Boolean(enabled),
+      capCredits: updated.onDemand?.capCredits,
+    });
+  }
+  return updated;
 }
 
 /**
@@ -417,6 +586,18 @@ export async function getUsageSummary(user) {
       unmetered: isUnmetered(current),
       lifetimeUsed: current.credits?.lifetimeUsed || 0,
     },
+    onDemand: {
+      /** Whether the plan offers it at all — drives "upgrade to enable". */
+      available: onDemandTerms(plan.id).available,
+      enabled: Boolean(current.onDemand?.enabled),
+      ratePaisePerCredit: onDemandTerms(plan.id).ratePaisePerCredit,
+      planCapCredits: onDemandTerms(plan.id).maxCreditsPerPeriod,
+      capCredits: current.onDemand?.capCredits || 0,
+      usedCredits: current.credits?.onDemandUsed || 0,
+      /** Owed this period. No gateway exists — this is a number, not a charge. */
+      accruedPaise: current.onDemand?.accruedPaise || 0,
+      remainingCredits: onDemandHeadroom(current),
+    },
     // Bookkeeping rows (`plan.change`, `credits.grant`) live in the same
     // collection so the audit trail is in one place, but they aren't work the
     // user asked for — showing them under "where your credits went" is just
@@ -497,6 +678,8 @@ export default {
   allowanceOf,
   balanceOf,
   canAfford,
+  onDemandHeadroom,
+  setOnDemand,
   isUnmetered,
   spend,
   recordFailure,

@@ -9,17 +9,17 @@
  * and our own private network — on Railway, `*.railway.internal`, where Mongo
  * and Redis live with no authentication beyond being unreachable.
  *
- * Both the HTTP node and every browser navigation run through here, because a
- * check on only one of them isn't a check: `browser.open` pointed at the
- * metadata service would render the credentials straight into an extract node.
+ * Every path that can reach the network runs through here — the HTTP node, the
+ * RSS reader, the page reader, and the architect's own `read_url` tool. A check
+ * on only some of them isn't a check: the architect pointed at the metadata
+ * service would read our instance credentials into a build transcript.
  *
  * A blocklist is the honest description of what this is. It cannot survive a
  * DNS name that resolves to a private address, and defeating that properly
  * means resolving before connecting and pinning the socket to the resolved IP.
  * That is worth doing; it is not worth pretending this already does it. The
  * durable control is the one in `config.agentic.allowPrivateNetwork`, which is
- * off in production, combined with running the browser as a separate service
- * that has no reason to be on our private network at all.
+ * off in production.
  */
 
 import config from '../config/index.js';

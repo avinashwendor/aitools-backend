@@ -17,10 +17,10 @@
  *    marked `skipped` rather than run. Skipped nodes cost nothing.
  *
  * 2. **The bill is assembled from what happened**, not from what was planned.
- *    Nodes are charged as they complete, browser time is charged on the
- *    session's real wall-clock, and the whole thing settles once — after the
- *    run — through the same `spend()` the chat pipeline uses. A run that fails
- *    on step two pays for step one and the base fee, and nothing else.
+ *    Nodes are charged as they complete — an AI Agent node by the number of
+ *    steps it actually took — and the whole thing settles once, after the run,
+ *    through the same `spend()` the chat pipeline uses. A run that fails on
+ *    step two pays for step one and the base fee, and nothing else.
  *
  * 3. **Failure is a first-class outcome.** The run document is written
  *    throughout, so a process that dies mid-run leaves a readable partial
@@ -28,21 +28,19 @@
  */
 
 import { AgentRun, AgentWorkflow } from '../models/index.js';
+import config from '../config/index.js';
 import { topoSort } from './graph.js';
 import { getNodeDef, nodeCredits } from './registry.js';
 import { getExecutor } from './executors.js';
 import { resolveValues } from './interpolate.js';
 import { capOutput, safeMessage } from './safety.js';
-import { openSession, isBrowserConfigured } from './browser/session.js';
 import { publish } from './events.js';
-import { withMetering, summarize, recordBrowserUsage } from '../billing/meterContext.js';
+import { withMetering, summarize } from '../billing/meterContext.js';
 import { spend, recordFailure } from '../billing/credits.js';
-import { BROWSER_MINUTE_COST, creditCost } from '../billing/plans.js';
+import { creditCost, creditsForCost } from '../billing/plans.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('agentic:runner');
-
-const MAX_BROWSER_SCREENSHOTS = 5;
 
 /** Runs currently executing in this process, so a cancel can reach them. */
 const inFlight = new Map();
@@ -94,8 +92,8 @@ export async function executeRun({ runId, user }) {
   inFlight.set(String(run._id), { userId: user._id, controller });
 
   // The whole run is wrapped in one metering scope, so every LLM call any node
-  // makes — including the ones inside browser primitives — is attributed to
-  // this run without a single executor knowing billing exists.
+  // makes — including the ones inside an AI Agent's own loop — is attributed
+  // to this run without a single executor knowing billing exists.
   try {
     return await withMetering(usage => runInner({ run, workflow, user, controller, usage }));
   } finally {
@@ -117,7 +115,7 @@ async function runInner({ run, workflow, user, controller, usage }) {
   try {
     ordered = topoSort(nodes, edges);
   } catch (err) {
-    return finish({ run, user, usage, startedAt, error: err.message, session: null });
+    return finish({ run, user, usage, startedAt, error: err.message });
   }
 
   // Seed every step as pending and publish before anything executes, so the
@@ -158,32 +156,6 @@ async function runInner({ run, workflow, user, controller, usage }) {
       // A node that didn't branch keeps every handle open.
       return chosen === undefined || chosen === (e.sourceHandle || 'main');
     });
-  };
-
-  // ─── Browser session, opened lazily ──────────────────────
-  let session = null;
-  const getBrowser = async () => {
-    if (session) return session;
-    if (!isBrowserConfigured()) {
-      throw new Error(
-        'This step needs a browser, but no browser service is configured. Set BROWSERBASE_API_KEY (hosted) or AGENT_BROWSER_WS (self-hosted).'
-      );
-    }
-    addLog(run, { level: 'info', message: 'Opening browser session…' });
-    session = await openSession({ onLog: entry => addLog(run, entry) });
-    run.browser.used = true;
-    run.browser.provider = session.provider;
-    run.browser.sessionId = session.sessionId;
-    run.browser.liveViewUrl = session.liveViewUrl;
-    // Published the moment it exists rather than at the end: the live view is
-    // only useful *during* the run, and a URL that arrives with the final
-    // result is a URL nobody can act on.
-    emit(run, 'run.browser', {
-      provider: session.provider,
-      sessionId: session.sessionId,
-      liveViewUrl: session.liveViewUrl,
-    });
-    return session;
   };
 
   let creditsForNodes = 0;
@@ -240,18 +212,13 @@ async function runInner({ run, workflow, user, controller, usage }) {
         user,
         trigger: run.trigger,
         scope,
+        // The Code node needs to know which node fed it, and it is the only
+        // one that reads the topology from inside an executor.
+        edges,
         signal,
-        getBrowser,
         onLog: entry => {
           addLog(run, { ...entry, nodeId: node.id });
           emit(run, 'run.log', { nodeId: node.id, ...entry });
-        },
-        onScreenshot: dataUrl => {
-          run.browser.screenshots.push(dataUrl);
-          if (run.browser.screenshots.length > MAX_BROWSER_SCREENSHOTS) {
-            run.browser.screenshots = run.browser.screenshots.slice(-MAX_BROWSER_SCREENSHOTS);
-          }
-          emit(run, 'run.screenshot', { nodeId: node.id, dataUrl });
         },
       });
 
@@ -295,7 +262,6 @@ async function runInner({ run, workflow, user, controller, usage }) {
     user,
     usage,
     startedAt,
-    session,
     creditsForNodes,
     error: failure?.message || null,
     failedNodeId: failure?.nodeId || null,
@@ -307,49 +273,47 @@ async function runInner({ run, workflow, user, controller, usage }) {
   });
 }
 
-/** Close the session, settle the bill, write the terminal state, publish it. */
+/** Settle the bill, write the terminal state, publish it. */
 async function finish({
   run,
   user,
   usage,
   startedAt,
-  session,
   creditsForNodes = 0,
   error = null,
   failedNodeId = null,
   canceled = false,
   output = null,
 }) {
-  let browserSeconds = 0;
-  if (session) {
-    browserSeconds = session.elapsedSeconds();
-    await session.close();
-    // Recorded after close so the number covers the full held duration, and
-    // recorded even on failure — a run that died with a browser open still cost
-    // us the browser.
-    recordBrowserUsage({ seconds: browserSeconds });
-  }
-
-  const browserMinutes = Math.ceil(browserSeconds / 60);
-  const base = creditCost('agent.run');
-  const browserCredits = browserMinutes * BROWSER_MINUTE_COST;
-
-  run.credits = {
-    base,
-    nodes: creditsForNodes,
-    browser: browserCredits,
-    total: base + creditsForNodes + browserCredits,
-  };
-
   const summary = summarize(usage);
   run.cost = {
     llmPaise: summary.cost.llmPaise,
     searchPaise: summary.cost.searchPaise,
-    browserPaise: summary.cost.browserPaise,
     totalPaise: summary.cost.totalPaise,
   };
   run.tokens = summary.tokens;
-  run.browser.seconds = browserSeconds;
+
+  /*
+   * Three parts, and each one prices something the others can't see.
+   *
+   *   base     the queue slot and the orchestration, paid by every run
+   *            including one that fails before its first node.
+   *   nodes    the registry's own price per node — what it costs us to *have*
+   *            an integration, independent of how much text moved through it.
+   *   tokens   the model calls the run actually made. This is the term that
+   *            distinguishes an agent node that answered in one turn from one
+   *            that spent twelve turns reading a page, which no per-node price
+   *            can, because the node is the same node.
+   */
+  const base = creditCost('agent.run');
+  const tokens = creditsForCost(summary.cost.totalPaise);
+
+  run.credits = {
+    base,
+    nodes: creditsForNodes,
+    tokens,
+    total: base + creditsForNodes + tokens,
+  };
 
   run.status = canceled ? 'canceled' : error ? 'failed' : 'succeeded';
   run.error = error;
@@ -373,9 +337,7 @@ async function finish({
         runId: String(run._id),
         workflowId: String(run.workflow),
         workflowName: run.workflowName,
-        surface: run.surface,
         nodes: run.steps.filter(s => s.status === 'done').length,
-        browserMinutes,
         outcome: run.status,
       },
     });
@@ -422,14 +384,6 @@ async function finish({
         tokens: run.tokens,
         steps: run.steps,
         logs: run.logs,
-        browser: {
-          used: run.browser.used,
-          provider: run.browser.provider,
-          sessionId: run.browser.sessionId,
-          liveViewUrl: run.browser.liveViewUrl,
-          seconds: run.browser.seconds,
-          screenshots: run.browser.screenshots,
-        },
         ledgerId: run.ledgerId,
         finishedAt: run.finishedAt,
       },
@@ -455,13 +409,6 @@ async function finish({
     credits: run.credits,
     output: run.output,
     durationMs: Date.now() - startedAt,
-    browser: {
-      used: run.browser.used,
-      provider: run.browser.provider,
-      sessionId: run.browser.sessionId,
-      liveViewUrl: run.browser.liveViewUrl,
-      seconds: run.browser.seconds,
-    },
   });
 
   log.info('Agentic run finished', {
@@ -470,7 +417,6 @@ async function finish({
     steps: run.steps.length,
     credits: run.credits.total,
     costPaise: run.cost.totalPaise,
-    browserSeconds,
   });
 
   return run;
@@ -519,9 +465,6 @@ async function persistStep(run, index) {
         $set: {
           [`steps.${index}`]: run.steps[index],
           logs: run.logs,
-          'browser.screenshots': run.browser.screenshots,
-          'browser.used': run.browser.used,
-          'browser.sessionId': run.browser.sessionId,
           status: run.status,
           startedAt: run.startedAt,
         },

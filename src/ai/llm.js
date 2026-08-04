@@ -48,6 +48,7 @@ const providers = config.ai.providers.map(p => ({
 if (providers.length) {
   log.info('LLM provider chain ready', {
     chain: providers.map(p => `${p.name}(${p.plannerModel})`).join(' → '),
+    reasoning: providers.map(p => `${p.name}(${p.reasoningModel})`).join(' → '),
   });
 } else {
   log.warn('No AI provider configured — LLM calls will fail fast with AI_DISABLED');
@@ -58,8 +59,29 @@ const QUOTA_COOLOFF_MS = 5 * 60 * 1000;
 
 export const isLLMAvailable = () => providers.length > 0;
 
-/** Resolve a role ('planner' | 'fast') to this provider's model list. */
+/**
+ * Resolve a role to this provider's model list.
+ *
+ * Three tiers, and the split is by what breaks if you get it wrong rather than
+ * by cost:
+ *
+ *   fast       classification and routing. A wrong answer costs one bad
+ *              retrieval, so the cheapest model that can read is correct.
+ *   planner    chat and workflow plans. Read by a person who can tell when
+ *              they're wrong.
+ *   reasoning  the architect and the agent node. These write programs that
+ *              then run unattended against real APIs with the user's
+ *              credentials, and a plausible-but-wrong answer here is not a
+ *              worse paragraph — it is a workflow that posts the wrong thing
+ *              to Slack every morning until someone notices. It gets the
+ *              strongest model available, and the fallback chain is skipped:
+ *              silently degrading a build to a small model produces exactly
+ *              the invented-endpoint graphs this system was rebuilt to stop.
+ */
 function modelsFor(provider, role) {
+  if (role === 'reasoning') {
+    return [provider.reasoningModel || provider.plannerModel].filter(Boolean);
+  }
   const primary = role === 'fast' ? provider.fastModel : provider.plannerModel;
   return [primary, ...provider.fallbackModels.filter(m => m !== primary)].filter(Boolean);
 }
@@ -177,28 +199,59 @@ export function extractJson(raw) {
 }
 
 /**
+ * Tool-call arguments, whatever shape the provider sent them in.
+ *
+ * The spec says a JSON string, and most providers comply. Some send an object
+ * already parsed, and some send a truncated string when the model ran out of
+ * tokens mid-call — which is why this goes through the same repair pass as
+ * every other JSON response rather than a bare `JSON.parse`.
+ */
+function parseToolArguments(args) {
+  if (args === null || args === undefined) return {};
+  if (typeof args === 'object') return args;
+  return extractJson(String(args)) ?? {};
+}
+
+/**
  * Chat completion with retry + model fallback.
  *
  * @param {object}  opts
  * @param {Array}   opts.messages       OpenAI-style message array
- * @param {string} [opts.model]         primary model (defaults to planner model)
+ * @param {string} [opts.role]          'fast' | 'planner' | 'reasoning'
+ * @param {string} [opts.model]         primary model (defaults to the role's model)
  * @param {number} [opts.temperature]
- * @param {number} [opts.maxTokens]
+ * @param {number} [opts.maxTokens]     0 or null sends no ceiling at all
+ * @param {number} [opts.timeoutMs]     overrides the provider client's default
  * @param {boolean}[opts.json]          request a JSON object response
+ * @param {Array}  [opts.tools]         OpenAI function-tool definitions
+ * @param {string|object} [opts.toolChoice]
  * @param {string} [opts.task]          label used in telemetry
  * @param {AbortSignal} [opts.signal]
- * @returns {Promise<{content: string, model: string, usage: object, ms: number}>}
+ * @returns {Promise<{content, toolCalls, finishReason, model, usage, ms}>}
  */
 export async function complete({
   messages,
   role = 'planner',
   model = null,
   temperature = config.ai.temperature,
-  maxTokens = config.ai.maxTokens,
+  maxTokens,
+  timeoutMs,
   json = false,
+  tools = null,
+  toolChoice = undefined,
   task = 'generic',
   signal,
 } = {}) {
+  // Resolved from the role rather than defaulted in the signature, so a caller
+  // that asks for reasoning gets the agentic budget without having to know
+  // there are two of them.
+  const tokenCeiling = maxTokens === undefined
+    ? (role === 'reasoning' ? config.ai.agenticMaxTokens : config.ai.maxTokens)
+    : maxTokens;
+
+  const callTimeout = timeoutMs
+    ?? (role === 'reasoning' ? config.ai.agenticTimeoutMs : config.ai.timeoutMs);
+
   if (!providers.length) {
     throw new LLMError('AI is not configured on this server.', {
       code: 'AI_DISABLED',
@@ -230,7 +283,10 @@ export async function complete({
               messages,
               model: candidateModel,
               temperature,
-              max_tokens: maxTokens,
+              // Omitted entirely when there is no ceiling, rather than sent as
+              // null: providers differ on whether null means "unlimited" or is
+              // a 400, and absent means the model's own maximum everywhere.
+              ...(tokenCeiling > 0 ? { max_tokens: tokenCeiling } : {}),
               top_p: 0.9,
               stream: false,
               // Some providers (e.g. Perplexity Sonar) only accept
@@ -238,11 +294,16 @@ export async function complete({
               ...(json && !provider.noJsonMode
                 ? { response_format: { type: 'json_object' } }
                 : {}),
+              // Tool definitions are only sent when there are any: a provider
+              // that doesn't support them 400s on an empty array, which would
+              // bench a perfectly healthy model for every tool-free call.
+              ...(tools?.length ? { tools, ...(toolChoice ? { tool_choice: toolChoice } : {}) } : {}),
             },
-            { signal }
+            { signal, timeout: callTimeout }
           );
 
-          const content = response.choices?.[0]?.message?.content ?? '';
+          const choice = response.choices?.[0];
+          const content = choice?.message?.content ?? '';
           const ms = Date.now() - startedAt;
 
           recordCall({
@@ -273,6 +334,16 @@ export async function complete({
 
           return {
             content,
+            // Normalised here rather than at every call site, because providers
+            // disagree about whether arguments arrive as a string or an object
+            // and an agent loop that guesses wrong fails on its first tool call.
+            toolCalls: (choice?.message?.tool_calls || []).map(call => ({
+              id: call.id,
+              name: call.function?.name,
+              arguments: parseToolArguments(call.function?.arguments),
+              raw: call,
+            })),
+            finishReason: choice?.finish_reason || 'stop',
             model: candidateModel,
             provider: provider.name,
             usage: response.usage ?? {},
@@ -397,6 +468,7 @@ export function getProviderStatus() {
     baseUrl: p.baseUrl,
     planner: p.plannerModel,
     fast: p.fastModel,
+    reasoning: p.reasoningModel,
     available: p.disabledUntil <= now,
     benchedForSeconds: p.disabledUntil > now ? Math.round((p.disabledUntil - now) / 1000) : 0,
   }));

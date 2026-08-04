@@ -236,7 +236,6 @@ const FEATURE_LABELS = {
   webSearch: 'Searching the web beyond our catalog',
   agenticWorkflows: 'Agentic workflows',
   agentTriggers: 'Scheduled and webhook triggers',
-  browserAgents: 'Browser agents',
   memoryRecall: 'Cross-project memory',
   exportWorkflow: 'Exporting workflows',
   deepDive: 'Stage deep dives',

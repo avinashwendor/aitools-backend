@@ -72,46 +72,79 @@ export const CREDIT_COSTS = {
   'catalog.search': 1,
 
   /**
-   * Agentic runs are metered differently from everything above, and the
-   * difference is worth stating plainly.
+   * Agentic runs and architect sessions are metered differently from
+   * everything above, and the difference is worth stating plainly.
    *
    * Every action above is one bounded burst of inference: we know within a
-   * factor of two what it will cost before it starts. An agentic run is a
-   * *program someone else wrote*. It can be four free template nodes, or it can
-   * be an autonomous browser agent grinding through forty model calls against a
-   * Chrome process we're paying to keep alive. A flat price is either extortion
-   * for the first or a subsidy for the second.
+   * factor of two what it will cost before it starts, so a fixed credit price
+   * is honest. Agentic work is not bounded. A run is *a program someone else
+   * wrote* — four free template nodes, or an agent node grinding through
+   * twenty model calls against a rendered documentation page. A build is an
+   * open-ended research loop: "add a Slack message at the end" is two model
+   * calls, "watch three competitor pricing pages and email me a weekly diff"
+   * is fifteen. Any fixed price is simultaneously extortion for the small case
+   * and a subsidy for the large one.
    *
-   * So the charge is assembled from three parts, settled after the run:
-   *
-   *   base      this entry — covers the queue slot, the run document, the
-   *             orchestration, and the runs that fail before doing any work.
-   *   nodes     each node's own price, from the registry (`nodeCredits`).
-   *             Deterministic nodes are free; LLM and browser nodes are not.
-   *   browser   BROWSER_MINUTE_COST per started minute of session wall-clock.
-   *
-   * The browser term is the one that stops a runaway from being free to the
-   * user and expensive to us. A page that hangs for eight minutes burns eight
-   * minutes of a container whether or not a single token is spent, and a
-   * per-node price cannot see that at all.
+   * So these two entries are **base fees only**. They cover the queue slot,
+   * the run or build document, the orchestration, and the attempts that fail
+   * before doing any work. The rest of the charge is the tokens actually
+   * consumed, converted to credits by `creditsForCost` after the work
+   * finishes — see TOKEN_METERED_ACTIONS.
    */
-  'agent.run': 15,
+  'agent.run': 8,
+  'agent.build': 10,
 };
 
 /**
- * Credits per started minute of browser session wall-clock.
+ * Actions charged as `base fee + what the tokens actually cost`.
  *
- * Anchored on what a Chrome session actually costs on Railway: a browser
- * service sized for ~4 concurrent sessions runs about ₹1,800/month, so a
- * session-minute is roughly ₹0.10 at a realistic 40% utilisation, plus the
- * headroom to absorb a bad month. At the standard 1 credit ≈ ₹0.10 anchor that
- * is 1 credit — priced at 4 to hold the same ~75% margin as everything else and
- * to make an abandoned tab visibly expensive rather than silently so.
- *
- * Rounded *up* per started minute. A 10-second run pays for a minute because a
- * container cold-start costs us most of one either way.
+ * The rest of the catalog is fixed-price because its cost is predictable.
+ * These are not, and pretending otherwise has a specific failure mode: to make
+ * a fixed price safe you have to cap the work, and capping agentic work is how
+ * you get an architect that stops reading documentation halfway through and
+ * invents the rest of the endpoint. Metering the tokens instead means the
+ * ceiling can come off — a build that needs to read six pages reads six pages,
+ * and costs what six pages cost.
  */
-export const BROWSER_MINUTE_COST = 4;
+export const TOKEN_METERED_ACTIONS = new Set(['agent.run', 'agent.build']);
+
+/**
+ * Provider paise that one credit is meant to cover.
+ *
+ * This is the anchor the whole catalog is derived from, made explicit: the
+ * fixed prices above were each set at roughly `measured cost ÷ 10 paise`, and
+ * token-metered actions apply the same conversion at settlement instead of in
+ * advance. Against ₹0.40 of revenue per credit at the Pro tier (₹999 ÷ 2,500)
+ * it leaves a ~75% gross margin, with the same room for cache misses, the free
+ * tier and failover onto a pricier provider.
+ *
+ * Lower this number to charge more credits for the same work.
+ */
+export const PAISE_PER_CREDIT = 10;
+
+/**
+ * Convert real provider cost into credits.
+ *
+ * Rounded up, and never to zero for work that cost anything: a build that
+ * consumed a rupee of tokens and billed nothing is a rounding rule that a
+ * scripted client will find and exploit within a day.
+ */
+export function creditsForCost(paise) {
+  const spent = Math.max(0, Number(paise) || 0);
+  if (!spent) return 0;
+  return Math.max(1, Math.ceil(spent / PAISE_PER_CREDIT));
+}
+
+/**
+ * The full charge for a token-metered action.
+ *
+ * @param {string} action
+ * @param {number} providerPaise  measured cost of the work, from the meter
+ * @param {number} [extra]        fixed add-ons, e.g. per-node prices on a run
+ */
+export function meteredCost(action, providerPaise, extra = 0) {
+  return creditCost(action) + creditsForCost(providerPaise) + Math.max(0, Math.round(extra));
+}
 
 /**
  * Intents that are never charged.
@@ -138,13 +171,56 @@ export const MIN_ACTION_COST = Math.min(...Object.values(CREDIT_COSTS));
 /**
  * How far a single action may push a balance negative.
  *
- * Because chat turns settle after the work is done, a user sitting at 1 credit
- * can start a turn that the router then classifies as a workflow. Refusing to
- * deliver work already paid for (in real tokens) is worse than letting the
- * balance dip; the overdraft is capped at one action and the next request is
- * refused normally.
+ * Because metered work settles after it is done, a user sitting at 1 credit can
+ * start a turn that the router then classifies as a workflow, or a build that
+ * turns out to need eight documentation pages. Refusing to record work already
+ * paid for in real tokens is worse than letting the balance dip: the tokens are
+ * gone either way, and a rejected `spend()` means we ate the cost silently.
+ *
+ * Set well above the largest fixed price rather than equal to it, because
+ * token-metered actions have no fixed price to bound. It is still a bound —
+ * the next request is refused normally, so the exposure is one action deep.
  */
-export const MAX_OVERDRAFT_CREDITS = Math.max(...Object.values(CREDIT_COSTS));
+export const MAX_OVERDRAFT_CREDITS = 500;
+
+/**
+ * Usage-based billing beyond the plan allowance.
+ *
+ * The alternative — hard-stopping at zero — is the right behaviour for a
+ * hobbyist and the wrong one for anyone with a workflow on a schedule. Their
+ * cron does not stop because their allowance ran out; it just starts failing,
+ * silently, at 6am, and they find out from the absence of a report.
+ *
+ * So paid plans can opt in to continuing past the allowance at a per-credit
+ * rate. Three properties make that safe to offer:
+ *
+ *   • **Opt-in.** Off until the account turns it on. Nobody is ever surprised
+ *     by a charge they did not agree to.
+ *   • **Capped.** Both by the plan and by a limit the user sets themselves.
+ *     A runaway loop costs a known maximum, not an unknown one.
+ *   • **Accrued, not charged.** There is no payment gateway here. Overage
+ *     accumulates as an amount owed on the account, visible to the user and to
+ *     the admin, settled out of band. Anything that says "billed" means
+ *     "recorded"; no money moves in this codebase.
+ *
+ * `ratePaisePerCredit` is set to each plan's own effective credit price, so
+ * overage costs the same per unit of work as the plan does. Charging a penalty
+ * rate for going over is a way to make your best customers resent you.
+ */
+export const ON_DEMAND = {
+  free: { available: false, ratePaisePerCredit: 0, maxCreditsPerPeriod: 0 },
+  /** ₹999 ÷ 2,500 credits = 40 paise. Cap doubles the plan before it stops. */
+  pro: { available: true, ratePaisePerCredit: 40, maxCreditsPerPeriod: 5_000 },
+  /** ₹2,999 ÷ 9,000 = 33 paise. */
+  studio: { available: true, ratePaisePerCredit: 33, maxCreditsPerPeriod: 20_000 },
+  /** Negotiated per contract; enforcement lives in the agreement, not here. */
+  enterprise: { available: true, ratePaisePerCredit: 0, maxCreditsPerPeriod: 0 },
+};
+
+/** On-demand terms for a plan. Unknown plans get the free tier's (none). */
+export function onDemandTerms(planId) {
+  return ON_DEMAND[planId] || ON_DEMAND.free;
+}
 
 /**
  * Plan definitions.
@@ -188,8 +264,8 @@ export const PLANS = {
       agentWorkflows: -1,
       /** Runs per billing period, on top of the credit charge. */
       agentRunsPerMonth: -1,
-      /** Browser session minutes per period — the hard cost ceiling. */
-      browserMinutesPerMonth: -1,
+      /** Architect sessions per period — the expensive half of the feature. */
+      agentBuildsPerMonth: -1,
       /** Runs allowed in flight at once. */
       agentConcurrency: -1,
     },
@@ -205,21 +281,19 @@ export const PLANS = {
       prioritySupport: false,
       apiAccess: false,
       /**
-       * Executable workflows — the node canvas and browser agents.
+       * Executable workflows — the canvas, the architect and the runner.
        *
        * Off here, and it is the one feature that genuinely cannot be sampled on
-       * a free tier. Everything else the free plan includes costs us a bounded
-       * burst of inference; an agentic run holds a real browser open and is
-       * schedulable, which means one free account with a five-minute cron can
-       * cost more in a week than the entire free tier is budgeted for in a
-       * month. The credit allowance alone doesn't stop that, because the
-       * expensive resource is wall-clock, not tokens.
+       * a free tier. Everything else the free plan includes is a bounded burst
+       * of inference the user waits for; an agentic workflow is *schedulable*,
+       * which means one free account with a five-minute cron can cost more in a
+       * week than the entire free tier is budgeted for in a month. The credit
+       * allowance alone doesn't stop that, because the run happens whether or
+       * not anyone is watching.
        */
       agenticWorkflows: false,
       /** Webhook and cron triggers — unattended execution. */
       agentTriggers: false,
-      /** Browser-automation nodes specifically, the priciest class. */
-      browserAgents: false,
     },
     /**
      * Plain-English equivalents shown on the pricing page. Derived from
@@ -250,11 +324,11 @@ export const PLANS = {
       /**
        * A run cap on top of the credit charge, because credits alone don't
        * bound concurrency or wall-clock — and a cron firing every fifteen
-       * minutes would exhaust an allowance in a day and generate 2,880 Chrome
-       * sessions doing it.
+       * minutes would exhaust an allowance in a day, 2,880 runs deep, before
+       * anyone noticed the schedule was wrong.
        */
       agentRunsPerMonth: 400,
-      browserMinutesPerMonth: 200,
+      agentBuildsPerMonth: 60,
       agentConcurrency: 2,
     },
     features: {
@@ -268,7 +342,6 @@ export const PLANS = {
       apiAccess: false,
       agenticWorkflows: true,
       agentTriggers: true,
-      browserAgents: true,
     },
     headline: ['workflow.generate', 'agent.run', 'chat.message'],
   },
@@ -292,7 +365,7 @@ export const PLANS = {
       seats: 5,
       agentWorkflows: 100,
       agentRunsPerMonth: 3000,
-      browserMinutesPerMonth: 1500,
+      agentBuildsPerMonth: 400,
       agentConcurrency: 6,
     },
     features: {
@@ -306,7 +379,6 @@ export const PLANS = {
       apiAccess: false,
       agenticWorkflows: true,
       agentTriggers: true,
-      browserAgents: true,
     },
     headline: ['workflow.generate', 'agent.run', 'chat.message'],
   },
@@ -329,7 +401,7 @@ export const PLANS = {
       seats: 0,
       agentWorkflows: 0,
       agentRunsPerMonth: 0,
-      browserMinutesPerMonth: 0,
+      agentBuildsPerMonth: 0,
       agentConcurrency: 20,
     },
     features: {
@@ -343,7 +415,6 @@ export const PLANS = {
       apiAccess: true,
       agenticWorkflows: true,
       agentTriggers: true,
-      browserAgents: true,
     },
     headline: [],
   },
@@ -418,6 +489,7 @@ export const ACTION_LABELS = {
   'taskboard.create': 'Task boards created',
   'catalog.search': 'Catalog searches',
   'agent.run': 'Agentic runs',
+  'agent.build': 'Architect sessions',
 };
 
 /**
@@ -429,7 +501,7 @@ export const LIMIT_LABELS = {
   seats: 'seats',
   agentWorkflows: 'saved agentic workflows',
   agentRunsPerMonth: 'agentic runs this period',
-  browserMinutesPerMonth: 'browser minutes this period',
+  agentBuildsPerMonth: 'architect sessions this period',
   agentConcurrency: 'agentic runs at once',
 };
 
@@ -463,7 +535,9 @@ export default {
   PLANS,
   PLAN_IDS,
   CREDIT_COSTS,
-  BROWSER_MINUTE_COST,
+  TOKEN_METERED_ACTIONS,
+  PAISE_PER_CREDIT,
+  ON_DEMAND,
   ACTION_LABELS,
   LIMIT_LABELS,
   DEFAULT_PLAN_ID,
@@ -472,6 +546,9 @@ export default {
   getPlan,
   isValidPlanId,
   creditCost,
+  creditsForCost,
+  meteredCost,
+  onDemandTerms,
   planAllows,
   planLimit,
   isUnlimited,

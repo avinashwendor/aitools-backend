@@ -26,13 +26,18 @@ import {
   getWorkflow,
   updateWorkflow,
   deleteWorkflow,
-  composeWorkflow,
+  setRequirementCredential,
+  startBuild,
+  repairWorkflow,
+  listBuilds,
+  getBuild,
+  streamBuild,
+  cancelBuildHandler,
   runWorkflow,
   listRuns,
   getRun,
   streamRun,
   cancelRunHandler,
-  getSessionReplay,
   webhookTrigger,
   listCredentials,
   createCredential,
@@ -47,7 +52,7 @@ import {
   requireLimit,
   planRateLimit,
 } from '../middleware/entitlements.js';
-import { AgentWorkflow } from '../models/index.js';
+import { AgentWorkflow, AgentBuild } from '../models/index.js';
 
 const router = Router();
 
@@ -77,6 +82,17 @@ router.use(requireFeature('agenticWorkflows'));
 
 const aiLimiter = planRateLimit();
 
+const CREDENTIAL_PROVIDERS = [
+  'http',
+  'openai',
+  'anthropic',
+  'slack',
+  'discord',
+  'telegram',
+  'notion',
+  'generic',
+];
+
 // ─── Credentials ────────────────────────────────────────────
 router.get('/credentials', listCredentials);
 router.post(
@@ -84,7 +100,7 @@ router.post(
   [
     body('name').trim().notEmpty().isLength({ max: 80 }),
     body('value').isString().isLength({ min: 1, max: 4000 }),
-    body('provider').optional().isIn(['http', 'openai', 'anthropic', 'slack', 'discord', 'generic']),
+    body('provider').optional().isIn(CREDENTIAL_PROVIDERS),
     body('scheme').optional().isIn(['bearer', 'header', 'query', 'raw']),
     body('paramName').optional().isString().isLength({ max: 80 }),
   ],
@@ -93,20 +109,25 @@ router.post(
 );
 router.delete('/credentials/:credentialId', [param('credentialId').isMongoId()], validate, deleteCredential);
 
+// ─── Builds (addressed by build id, not workflow id) ────────
+router.get('/builds/:buildId', [param('buildId').isMongoId()], validate, getBuild);
+router.get('/builds/:buildId/stream', [param('buildId').isMongoId()], validate, streamBuild);
+router.post('/builds/:buildId/cancel', [param('buildId').isMongoId()], validate, cancelBuildHandler);
+
 // ─── Runs (addressed by run id, not workflow id) ────────────
 router.get('/runs/:runId', [param('runId').isMongoId()], validate, getRun);
 router.get('/runs/:runId/stream', [param('runId').isMongoId()], validate, streamRun);
 router.post('/runs/:runId/cancel', [param('runId').isMongoId()], validate, cancelRunHandler);
-router.get(
-  '/replays/:sessionId',
-  [param('sessionId').isString().isLength({ min: 8, max: 120 })],
-  validate,
-  getSessionReplay
-);
 
 // ─── Workflows ──────────────────────────────────────────────
 router.get('/', listWorkflows);
 
+/**
+ * Creating with a `prompt` starts an architect session in the same request, so
+ * the credit gate has to be the build's, not the workflow's — otherwise an
+ * empty account could open a build it can't pay for and watch it fail on its
+ * first model call.
+ */
 router.post(
   '/',
   // Counted here rather than in the controller so the cap is enforced by the
@@ -115,11 +136,11 @@ router.post(
   requireLimit('agentWorkflows', req =>
     AgentWorkflow.countDocuments({ user: req.user._id, archivedAt: null })
   ),
+  requireCredits('agent.build'),
   [
     body('name').optional().isString().isLength({ max: 120 }),
-    body('surface').optional().isIn(['flow', 'browser']),
     body('description').optional().isString().isLength({ max: 600 }),
-    body('prompt').optional().isString().isLength({ max: 2000 }),
+    body('prompt').optional().isString().isLength({ max: 4000 }),
   ],
   validate,
   createWorkflow
@@ -145,30 +166,55 @@ router.patch(
 
 router.delete('/:id', [param('id').isMongoId()], validate, deleteWorkflow);
 
-/**
- * Composing is an LLM call, so it is rate-limited and charged like one — it is
- * a chat turn that happens to answer in graph operations rather than prose,
- * and pricing it at zero would make "rebuild this five different ways" free
- * while the equivalent question in the chat costs credits.
- */
-router.post(
-  '/:id/compose',
-  aiLimiter,
-  requireCredits('chat.message'),
+router.put(
+  '/:id/requirements/:key',
   [
     param('id').isMongoId(),
-    body('message').trim().notEmpty().isLength({ max: 2000 }),
-    body('history').optional().isArray({ max: 20 }),
+    param('key').isString().isLength({ max: 60 }),
+    body('credentialId').optional({ nullable: true }).isMongoId(),
   ],
   validate,
-  composeWorkflow
+  setRequirementCredential
 );
 
 /**
+ * The architect is a multi-step LLM session, so it is rate-limited and charged
+ * like one. The gate only checks the account isn't empty; the real price
+ * depends on how many steps the session took, which nobody knows until it is
+ * over — the same after-the-fact settlement the chat pipeline uses.
+ */
+router.post(
+  '/:id/build',
+  aiLimiter,
+  requireCredits('agent.build'),
+  requireLimit('agentBuildsPerMonth', req =>
+    AgentBuild.countDocuments({
+      user: req.user._id,
+      createdAt: { $gte: req.user.subscription?.periodStart || new Date(0) },
+    })
+  ),
+  [
+    param('id').isMongoId(),
+    body('message').trim().notEmpty().isLength({ max: 4000 }),
+  ],
+  validate,
+  startBuild
+);
+
+router.post(
+  '/:id/repair',
+  aiLimiter,
+  requireCredits('agent.build'),
+  [param('id').isMongoId(), body('runId').isMongoId()],
+  validate,
+  repairWorkflow
+);
+
+router.get('/:id/builds', [param('id').isMongoId()], validate, listBuilds);
+
+/**
  * The gate only checks the account isn't empty. A run's real price depends on
- * which nodes executed and how long a browser stayed open, so the runner
- * settles the exact amount after the fact — the same pattern the chat pipeline
- * uses, for the same reason.
+ * which nodes executed, so the runner settles the exact amount after the fact.
  */
 router.post(
   '/:id/run',

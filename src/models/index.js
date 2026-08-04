@@ -14,6 +14,7 @@ import SharedWorkflow from './SharedWorkflow.js';
 import Integration from './Integration.js';
 import AgentWorkflow from './AgentWorkflow.js';
 import AgentRun from './AgentRun.js';
+import AgentBuild from './AgentBuild.js';
 import AgentCredential from './AgentCredential.js';
 
 export {
@@ -33,5 +34,6 @@ export {
   Integration,
   AgentWorkflow,
   AgentRun,
+  AgentBuild,
   AgentCredential,
 };

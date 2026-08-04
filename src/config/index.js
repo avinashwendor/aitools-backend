@@ -151,6 +151,12 @@ function buildProviders() {
         apiKey: p.apiKey ? String(p.apiKey) : '',
         plannerModel: p.planner || p.plannerModel,
         fastModel: p.fast || p.fastModel || p.planner || p.plannerModel,
+        /**
+         * The frontier tier, used only by the architect and the agent node.
+         * Falls back to the planner so a provider that doesn't name one still
+         * works — it just builds workflows with a cheaper model.
+         */
+        reasoningModel: p.reasoning || p.reasoningModel || p.planner || p.plannerModel,
         fallbackModels: Array.isArray(p.fallbacks) ? p.fallbacks : [],
         /** Providers whose models reject response_format:{type:'json_object'}. */
         noJsonMode: Boolean(p.noJsonMode),
@@ -161,12 +167,15 @@ function buildProviders() {
   const apiKey = process.env.AI_API_KEY || process.env.GROQ_API_KEY;
   if (!apiKey) return [];
 
+  const planner = process.env.AI_MODEL_PLANNER || 'openai/gpt-oss-120b';
+
   return [{
     name: 'default',
     baseUrl: process.env.AI_BASE_URL || 'https://api.groq.com/openai/v1',
     apiKey,
-    plannerModel: process.env.AI_MODEL_PLANNER || 'openai/gpt-oss-120b',
-    fastModel: process.env.AI_MODEL_FAST || process.env.AI_MODEL_PLANNER || 'llama-3.3-70b-versatile',
+    plannerModel: planner,
+    fastModel: process.env.AI_MODEL_FAST || planner || 'llama-3.3-70b-versatile',
+    reasoningModel: process.env.AI_MODEL_REASONING || planner,
     fallbackModels: list(process.env.AI_MODEL_FALLBACKS, []),
     noJsonMode: false,
   }];
@@ -209,7 +218,34 @@ const config = {
 
     temperature: num(process.env.AI_TEMPERATURE, 0.35),
     maxTokens: num(process.env.AI_MAX_TOKENS, 4096),
+
+    /**
+     * The ceiling for agentic work — the architect and the agent node.
+     *
+     * Separate from `maxTokens`, and much larger, because the two are bounding
+     * different things. A chat reply has a natural length and 4k is a guard
+     * against a runaway; an architect turn is a reasoning trace followed by a
+     * graph edit carrying full request bodies, and truncating it mid-tool-call
+     * produces a malformed edit rather than a shorter one. That is a failure
+     * the user pays for twice: once for the tokens, once for the rebuild.
+     *
+     * Set AI_AGENTIC_MAX_TOKENS=0 to send no ceiling at all and let the model
+     * use its whole output window. Nothing here is a cost control — cost is
+     * controlled by charging for the tokens actually used, which happens in
+     * `billing/pricing.js` on the way out.
+     */
+    agenticMaxTokens: num(process.env.AI_AGENTIC_MAX_TOKENS, 32_000),
+
     timeoutMs: num(process.env.AI_TIMEOUT_MS, 45000),
+
+    /**
+     * Longer than a chat call: a frontier model reasoning over a rendered docs
+     * page routinely takes more than 45 seconds before its first token, and
+     * timing that out mid-thought bills for the whole trace and returns
+     * nothing.
+     */
+    agenticTimeoutMs: num(process.env.AI_AGENTIC_TIMEOUT_MS, 180_000),
+
     maxRetries: num(process.env.AI_MAX_RETRIES, 2),
 
     /** Retrieval */
@@ -265,103 +301,34 @@ const config = {
      */
     softLimits: bool(process.env.BILLING_SOFT_LIMITS, false),
 
-    /**
-     * Amortised cost of one minute of browser session, in paise.
-     *
-     * Not a published price — it's our Railway browser service's monthly cost
-     * divided by the session-minutes it can realistically serve. Env-tunable
-     * because the honest number only appears once real runs are on the graph,
-     * and re-deploying to correct an accounting constant is the wrong shape of
-     * fix. Read by `pricing.browserCostPaise`.
-     */
-    browserPaisePerMinute: num(process.env.BILLING_BROWSER_PAISE_PER_MINUTE, 10),
-
     /** Where "Talk to us" enquiries from the pricing page should land. */
     salesEmail: process.env.BILLING_SALES_EMAIL || 'sales@example.com',
   },
 
   // ─── Agentic workflows ───────────────────────────────────────
-  // Executable workflows: the node canvas and browser agents. The browser half
-  // needs a Chrome that speaks CDP; everything else runs in-process.
+  // Executable workflows: the architect that designs them and the runner that
+  // executes them. Both run in-process; neither needs external infrastructure
+  // beyond the LLM provider chain.
   agentic: {
-    /**
-     * Whether runs execute at all. Off by default in development so a checkout
-     * without a browser service doesn't queue runs that can never finish.
-     */
+    /** Whether runs execute at all. */
     enabled: bool(process.env.AGENTIC_ENABLED, true),
 
     /**
-     * Where the browser comes from.
+     * Model calls one architect session may make.
      *
-     * Two providers, and the default is deliberate.
-     *
-     * **browserbase** (default) — a hosted browser API. You pay per
-     * session-minute actually used and nothing when idle. It also hands back a
-     * live view URL and a recording of every session, which are the two things
-     * that make a failed browser run debuggable rather than mysterious.
-     *
-     * **cdp** — a Chrome you host yourself (Browserless or Steel on Railway,
-     * or a local Chrome with --remote-debugging-port). Cheaper at sustained
-     * volume because you're paying for a container rather than per minute, but
-     * it bills whether or not anyone runs anything, and there is no recording.
-     *
-     * The economics decide it for most people: an idle container costs money
-     * every hour of every day, and browser workflows are bursty. Self-hosting
-     * only wins once you're running enough sessions to keep it busy.
-     *
-     * Resolution is automatic — whichever is configured — so neither has to be
-     * declared explicitly. `AGENT_BROWSER_PROVIDER` forces one when both are.
+     * This is the budget for the whole build: planning, searching, reading
+     * documentation, writing the graph and testing steps. Twenty is roughly
+     * three doc pages plus a six-node workflow with two test runs, which covers
+     * the large majority of real requests. Raising it does not make builds
+     * better so much as longer — the failure mode past this point is a model
+     * that has already succeeded and is polishing.
      */
-    browser: {
-      provider: (process.env.AGENT_BROWSER_PROVIDER || '').trim().toLowerCase(),
+    architectMaxSteps: num(process.env.AGENT_ARCHITECT_MAX_STEPS, 20),
 
-      /**
-       * Browserbase. `BROWSERBASE_PROJECT_ID` is required alongside the key —
-       * the API accepts a session create without it but bills it to no project,
-       * which shows up as sessions you can't find in the dashboard.
-       */
-      browserbase: {
-        apiKey: process.env.BROWSERBASE_API_KEY || '',
-        projectId: process.env.BROWSERBASE_PROJECT_ID || '',
-        /** us-west-2 | us-east-1 | eu-central-1 | ap-southeast-1 */
-        region: process.env.BROWSERBASE_REGION || 'us-west-2',
-        /** Ad blocking cuts page weight, which cuts both latency and cost. */
-        blockAds: bool(process.env.BROWSERBASE_BLOCK_ADS, true),
-        /** Stealth mode. Off by default: it costs more and most pages don't need it. */
-        stealth: bool(process.env.BROWSERBASE_STEALTH, false),
-      },
+    /** Architect sessions one user may have running at once. */
+    architectConcurrency: num(process.env.AGENT_ARCHITECT_CONCURRENCY, 2),
 
-      /**
-       * Self-hosted CDP endpoint, used when `provider` resolves to `cdp`.
-       *
-       * On Railway that means the Browserless v2 or Steel Browser template
-       * deployed as a **private** service:
-       *
-       *   AGENT_BROWSER_WS=ws://browserless.railway.internal:3000?token=${{browserless.TOKEN}}
-       *
-       * Two things bite here. The service must bind to `::` (Railway's private
-       * network is IPv6), and it must never be publicly exposed — an open CDP
-       * socket is remote code execution, not merely an unauthenticated API.
-       */
-      wsEndpoint: process.env.AGENT_BROWSER_WS || process.env.BROWSER_WS_ENDPOINT || '',
-      /**
-       * Some images (Steel) mint a session over REST before handing out a CDP
-       * socket. Set this to that base URL; leave empty to connect straight to
-       * `wsEndpoint`.
-       */
-      apiUrl: process.env.AGENT_BROWSER_API_URL || '',
-      apiToken: process.env.AGENT_BROWSER_TOKEN || '',
-      /** Hard ceiling on a single session's life. Stops a hung page billing forever. */
-      maxSessionMs: num(process.env.AGENT_BROWSER_MAX_SESSION_MS, 5 * 60 * 1000),
-      /** Per-navigation and per-action timeout. */
-      timeoutMs: num(process.env.AGENT_BROWSER_TIMEOUT_MS, 30_000),
-      viewport: {
-        width: num(process.env.AGENT_BROWSER_WIDTH, 1280),
-        height: num(process.env.AGENT_BROWSER_HEIGHT, 800),
-      },
-    },
-
-    /** Ceiling on a whole run, browser or not. */
+    /** Ceiling on a whole run. */
     maxRunMs: num(process.env.AGENT_MAX_RUN_MS, 10 * 60 * 1000),
     /** Nodes a single graph may contain. Bounds worst-case run cost. */
     maxNodes: num(process.env.AGENT_MAX_NODES, 60),
@@ -373,8 +340,8 @@ const config = {
     maxOutputBytes: num(process.env.AGENT_MAX_OUTPUT_BYTES, 24_000),
     /**
      * Hosts a workflow may never reach. Blocks the classic SSRF targets: cloud
-     * metadata services and our own private network. Enforced by the HTTP node
-     * and by every browser navigation.
+     * metadata services and our own private network. Enforced by the HTTP node,
+     * the page reader and every tool the architect can point at a URL.
      */
     blockedHosts: list(process.env.AGENT_BLOCKED_HOSTS, [
       '169.254.169.254',
