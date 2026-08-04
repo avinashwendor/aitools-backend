@@ -13,9 +13,8 @@ import TaskBoard from '../models/TaskBoard.js';
 import UserProfile from '../models/UserProfile.js';
 import { loadConversation } from '../ai/memory.js';
 import { applySchedule, scheduleTasks, computeEstimateBias } from '../tasks/schedule.js';
+import { commitWorkflowToBoard } from '../tasks/commitBoard.js';
 import { ApiError } from '../middleware/errorHandler.js';
-import { checkLimit } from '../billing/credits.js';
-import { getPlan, nextPlanUp } from '../billing/plans.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('tasks');
@@ -40,10 +39,7 @@ async function getEstimateBias(userId) {
   return profile?.estimateBias || 1;
 }
 
-/**
- * Recalibrate the user's estimate bias from everything they've completed.
- * Fire-and-forget: a calibration failure must never fail a checkbox.
- */
+/** Recalibrate estimate bias from completed work. Fire-and-forget. */
 async function recalibrate(userId) {
   const boards = await TaskBoard.find({ user: userId }).select('tasks').lean();
   const allTasks = boards.flatMap(b => b.tasks);
@@ -58,7 +54,7 @@ async function recalibrate(userId) {
   );
 }
 
-/** Build the task list for a board from a generated workflow. */
+/** Build the task list for a schedule preview from a generated workflow. */
 function tasksFromWorkflow(workflow) {
   return (workflow.stages || []).map((stage, index) => ({
     taskId: newTaskId(),
@@ -77,109 +73,31 @@ function tasksFromWorkflow(workflow) {
   }));
 }
 
-/**
- * Carry completion across a re-commit or a regenerated playbook.
- *
- * Matched by (stageId, subtask title): a refine keeps stage ids stable for
- * anything it didn't touch (see ai/workflowDiff.js), so a stage the user
- * already worked through keeps its ticks. A stage whose steps were rewritten
- * legitimately starts over — the old ticks refer to instructions that no
- * longer exist.
- */
-function mergeProgress(nextTasks, priorTasks) {
-  const priorByStage = new Map((priorTasks || []).map(t => [t.stageId, t]));
-
-  for (const task of nextTasks) {
-    const prior = priorByStage.get(task.stageId);
-    if (!prior) continue;
-
-    const priorByTitle = new Map(prior.subtasks.map(s => [s.title, s]));
-    for (const subtask of task.subtasks) {
-      const match = priorByTitle.get(subtask.title);
-      if (!match?.done) continue;
-      subtask.done = true;
-      subtask.completedAt = match.completedAt;
-    }
-    task.actualMinutes = prior.actualMinutes ?? null;
-    task.actualMinutesOverridden = prior.actualMinutesOverridden || false;
-  }
-
-  return nextTasks;
-}
-
 // ─────────────────────────────────────────────────────────────
 // POST /api/tasks — commit to a workflow
 // ─────────────────────────────────────────────────────────────
 export const createBoard = async (req, res, next) => {
   try {
     const { sessionId, targetDate, weeklyHours } = req.body;
-    const userId = req.user._id;
-
-    const conversation = await loadConversation(userId, sessionId);
-    const workflow = conversation.lastWorkflow;
-
-    if (!workflow?.stages?.length) {
-      throw new ApiError(404, 'No workflow in that session to add to tasks yet.');
-    }
-
-    const existing = await TaskBoard.findOne({ user: userId, sourceSessionId: sessionId });
-
-    // Re-committing a session updates the board it already owns, so the cap
-    // only applies to genuinely new boards. Counting active boards rather than
-    // all of them means archiving finished work frees a slot, which is the
-    // behaviour that makes a small free-tier cap livable instead of a wall.
-    if (!existing) {
-      const activeBoards = await TaskBoard.countDocuments({ user: userId, status: 'active' });
-      const limit = checkLimit(req.user, 'taskBoards', activeBoards);
-
-      if (!limit.allowed) {
-        const plan = getPlan(req.user.subscription?.plan);
-        const next = nextPlanUp(plan.id);
-        return res.status(403).json({
-          success: false,
-          code: 'BOARD_LIMIT_REACHED',
-          message:
-            `The ${plan.name} plan keeps ${limit.limit} task boards active at a time. ` +
-            `Archive one you've finished, or upgrade for more room.`,
-          data: {
-            limit: limit.limit,
-            used: limit.used,
-            currentPlan: plan.id,
-            upgrade: next
-              ? { planId: next.id, planName: next.name, limit: next.limits.taskBoards || 'Unlimited' }
-              : null,
-          },
-        });
-      }
-    }
-
-    const tasks = mergeProgress(tasksFromWorkflow(workflow), existing?.tasks);
-
-    const board =
-      existing ||
-      new TaskBoard({ user: userId, sourceSessionId: sessionId, workflowId: workflow.id });
-
-    board.workflowId = workflow.id;
-    board.workflowVersion = workflow.version || 1;
-    board.title = workflow.title || 'Untitled workflow';
-    board.outcome = workflow.outcome || '';
-    board.tasks = tasks;
-    if (targetDate) board.targetDate = new Date(targetDate);
-    if (weeklyHours) board.weeklyHours = Number(weeklyHours);
-    if (board.status === 'archived') board.status = 'active';
-
-    board.recompute();
-    applySchedule(board, { estimateBias: await getEstimateBias(userId) });
-    await board.save();
-
-    log.info('Task board committed', {
-      userId: String(userId),
-      tasks: board.tasks.length,
-      reused: Boolean(existing),
+    const { board, created } = await commitWorkflowToBoard({
+      user: req.user,
+      sessionId,
+      targetDate,
+      weeklyHours,
     });
-
-    res.status(existing ? 200 : 201).json({ success: true, data: { board } });
+    res.status(created ? 201 : 200).json({ success: true, data: { board } });
   } catch (error) {
+    if (error.status === 403 && error.code === 'BOARD_LIMIT_REACHED') {
+      return res.status(403).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+        data: error.data,
+      });
+    }
+    if (error.status === 404) {
+      return next(new ApiError(404, error.message));
+    }
     next(error);
   }
 };
@@ -463,6 +381,62 @@ export async function syncStagePlaybook({ userId, sessionId, stageId, steps }) {
   }
 }
 
+/** Authenticated: return a signed ICS feed URL for this board. */
+export const getCalendarFeedLink = async (req, res, next) => {
+  try {
+    const board = await TaskBoard.findOne({
+      _id: req.params.boardId,
+      user: req.user._id,
+    }).select('_id');
+    if (!board) throw new ApiError(404, 'Board not found');
+
+    const { signCalendarToken } = await import('../integrations/crypto.js');
+    const token = signCalendarToken(String(board._id), String(req.user._id));
+    const path = `/api/tasks/calendar.ics?token=${encodeURIComponent(token)}`;
+
+    res.json({
+      success: true,
+      data: {
+        path,
+        token,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/** Public (token-signed): download ICS for a board. Gated conceptually by exportWorkflow at link-creation time. */
+export const downloadCalendarIcs = async (req, res, next) => {
+  try {
+    const { verifyCalendarToken } = await import('../integrations/crypto.js');
+    const { boardToIcs } = await import('../tasks/ics.js');
+
+    const verified = verifyCalendarToken(req.query.token);
+    if (!verified) {
+      return res.status(401).json({ success: false, message: 'Invalid calendar token' });
+    }
+
+    const board = await TaskBoard.findOne({
+      _id: verified.boardId,
+      user: verified.userId,
+    });
+    if (!board) {
+      return res.status(404).json({ success: false, message: 'Board not found' });
+    }
+
+    const ics = boardToIcs(board);
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${String(board.title || 'tasks').slice(0, 40)}.ics"`
+    );
+    res.send(ics);
+  } catch (err) {
+    next(err);
+  }
+};
+
 export default {
   createBoard,
   listBoards,
@@ -475,4 +449,6 @@ export default {
   previewSchedule,
   deleteBoard,
   syncStagePlaybook,
+  getCalendarFeedLink,
+  downloadCalendarIcs,
 };

@@ -96,6 +96,9 @@ const taskBoardSchema = new mongoose.Schema(
     weeklyHours: { type: Number, default: null, min: 1, max: 80 },
 
     tasks: { type: [taskSchema], default: [] },
+
+    /** Dedupes daily email / Gmail nudges — one per board per calendar day. */
+    lastRemindedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );

@@ -14,6 +14,11 @@ import chatRoutes from './chatRoutes.js';
 import categoryRoutes from './categoryRoutes.js';
 import taskRoutes from './taskRoutes.js';
 import billingRoutes from './billingRoutes.js';
+import apiKeyRoutes from './apiKeyRoutes.js';
+import createMcpRouter from '../mcp/index.js';
+import shareRoutes from './shareRoutes.js';
+import integrationRoutes from './integrationRoutes.js';
+import internalRoutes from './internalRoutes.js';
 
 const router = Router();
 
@@ -92,6 +97,11 @@ router.use('/chat', chatRoutes);
 router.use('/categories', categoryRoutes);
 router.use('/tasks', taskRoutes);
 router.use('/billing', billingRoutes);
+router.use('/api-keys', apiKeyRoutes);
+router.use('/mcp', createMcpRouter());
+router.use(shareRoutes);
+router.use('/integrations', integrationRoutes);
+router.use('/internal', internalRoutes);
 
 export default router;
 

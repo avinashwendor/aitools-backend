@@ -480,6 +480,67 @@ export const clearHistory = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
+// GET /api/chat/export — n8n JSON or markdown (feature-gated)
+// ─────────────────────────────────────────────────────────────
+export const exportWorkflow = async (req, res) => {
+  try {
+    const sessionId = req.query.sessionId || 'default';
+    const format = String(req.query.format || 'n8n').toLowerCase();
+
+    if (!['n8n', 'markdown', 'md'].includes(format)) {
+      return res.status(400).json({
+        success: false,
+        message: 'format must be n8n or markdown',
+      });
+    }
+
+    const conversation = await loadConversation(req.user._id, sessionId);
+    const workflow = conversation.lastWorkflow;
+
+    if (!workflow?.stages?.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'No workflow to export in this session',
+      });
+    }
+
+    const source = {
+      workflowId: workflow.id || null,
+      title: workflow.title || '',
+      sessionId,
+    };
+
+    if (format === 'n8n') {
+      const { toN8nWorkflow, n8nFilename } = await import('../ai/exporters/n8n.js');
+      const n8n = toN8nWorkflow(workflow);
+      return res.json({
+        success: true,
+        data: {
+          format: 'n8n',
+          filename: n8nFilename(workflow),
+          workflow: n8n,
+          source,
+        },
+      });
+    }
+
+    const { toMarkdown, markdownFilename } = await import('../ai/exporters/markdown.js');
+    const markdown = toMarkdown(workflow);
+    return res.json({
+      success: true,
+      data: {
+        format: 'markdown',
+        filename: markdownFilename(workflow),
+        markdown,
+        source,
+      },
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
 // GET /api/chat/status — operational visibility
 // ─────────────────────────────────────────────────────────────
 export const getStatus = async (req, res) => {

@@ -9,6 +9,9 @@ import SuggestedTool from './SuggestedTool.js';
 import MessageFeedback from './MessageFeedback.js';
 import UsageLedger from './UsageLedger.js';
 import UpgradeRequest from './UpgradeRequest.js';
+import ApiKey from './ApiKey.js';
+import SharedWorkflow from './SharedWorkflow.js';
+import Integration from './Integration.js';
 
 export {
   User,
@@ -22,4 +25,7 @@ export {
   MessageFeedback,
   UsageLedger,
   UpgradeRequest,
+  ApiKey,
+  SharedWorkflow,
+  Integration,
 };

@@ -7,10 +7,12 @@ import crypto from 'crypto';
 
 import config from './config/index.js';
 import routes from './routes/index.js';
+import createMcpRouter from './mcp/index.js';
 import { notFound, errorHandler } from './middleware/errorHandler.js';
 import { rateLimit } from './middleware/rateLimit.js';
 import { getCatalog, warmVectorIndex } from './ai/catalog.js';
 import { createLogger } from './utils/logger.js';
+import { startJobWorkers, stopJobWorkers } from './jobs/index.js';
 
 const log = createLogger('server');
 const app = express();
@@ -70,9 +72,20 @@ app.use(
     keyGenerator: req => req.ip,
   })
 );
+// MCP sits outside /api — same IP safety net.
+app.use(
+  '/mcp',
+  rateLimit({
+    windowMs: 60_000,
+    max: 120,
+    keyGenerator: req => req.ip,
+  })
+);
 
 // ─── Routes ──────────────────────────────────────────────────
 app.use('/api', routes);
+// Short MCP URL for clients (same handlers as /api/mcp)
+app.use('/mcp', createMcpRouter());
 
 app.get('/', (req, res) => {
   res.json({
@@ -147,6 +160,7 @@ async function start() {
 
   server = app.listen(config.port, () => {
     log.info(`Server listening on :${config.port}`, { env: config.nodeEnv });
+    startJobWorkers();
   });
 }
 
@@ -161,6 +175,7 @@ async function shutdown(signal) {
   force.unref();
 
   try {
+    await stopJobWorkers().catch(() => {});
     await new Promise(resolve => (server ? server.close(resolve) : resolve()));
     await mongoose.connection.close(false);
     log.info('Shutdown complete');

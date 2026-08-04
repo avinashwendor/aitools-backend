@@ -11,6 +11,7 @@ import {
   getHistory,
   getSessions,
   clearHistory,
+  exportWorkflow,
   getStatus,
 } from '../controllers/chatController.js';
 import { submitFeedback } from '../controllers/feedbackController.js';
@@ -24,6 +25,7 @@ import { validate } from '../middleware/validate.js';
 import {
   withCurrentPeriod,
   requireCredits,
+  requireFeature,
   planRateLimit,
 } from '../middleware/entitlements.js';
 
@@ -91,6 +93,7 @@ router.post(
 
 router.get('/history', getHistory);
 router.get('/sessions', getSessions);
+router.get('/export', requireFeature('exportWorkflow'), exportWorkflow);
 router.get('/preferences', getPreferences);
 router.put(
   '/preferences',

@@ -57,6 +57,10 @@ const updateProfileValidation = [
     .optional()
     .isLength({ max: 500 })
     .withMessage('Bio cannot exceed 500 characters'),
+  body('reminders').optional().isObject(),
+  body('reminders.emailDigest').optional().isBoolean(),
+  body('reminders.staleNudge').optional().isBoolean(),
+  body('reminders.weeklySummary').optional().isBoolean(),
 ];
 
 const changePasswordValidation = [

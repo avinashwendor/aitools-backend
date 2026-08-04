@@ -132,12 +132,23 @@ export const getMe = async (req, res, next) => {
  */
 export const updateMe = async (req, res, next) => {
   try {
-    const { name, bio, avatar } = req.body;
+    const { name, bio, avatar, reminders } = req.body;
     
     const updates = {};
     if (name) updates.name = name;
     if (bio !== undefined) updates.bio = bio;
     if (avatar !== undefined) updates.avatar = avatar;
+    if (reminders && typeof reminders === 'object') {
+      if (typeof reminders.emailDigest === 'boolean') {
+        updates['reminders.emailDigest'] = reminders.emailDigest;
+      }
+      if (typeof reminders.staleNudge === 'boolean') {
+        updates['reminders.staleNudge'] = reminders.staleNudge;
+      }
+      if (typeof reminders.weeklySummary === 'boolean') {
+        updates['reminders.weeklySummary'] = reminders.weeklySummary;
+      }
+    }
     
     const user = await User.findByIdAndUpdate(
       req.user.id,

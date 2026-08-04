@@ -122,6 +122,13 @@ const userSchema = new mongoose.Schema(
       /** Lifetime total, never reset — the number the admin table sorts on. */
       lifetimeUsed: { type: Number, default: 0, min: 0 },
     },
+
+    /** Reminder preferences — used by Resend digests and Google/n8n runners. */
+    reminders: {
+      emailDigest: { type: Boolean, default: true },
+      staleNudge: { type: Boolean, default: true },
+      weeklySummary: { type: Boolean, default: true },
+    },
   },
   {
     timestamps: true,

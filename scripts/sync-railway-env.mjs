@@ -115,6 +115,14 @@ if (env.REDIS_URL) pairs.push(['REDIS_URL', env.REDIS_URL]);
 if (env.QDRANT_URL) pairs.push(['QDRANT_URL', env.QDRANT_URL]);
 if (env.QDRANT_API_KEY) pairs.push(['QDRANT_API_KEY', env.QDRANT_API_KEY]);
 if (env.CORS_ORIGINS) pairs.push(['CORS_ORIGINS', env.CORS_ORIGINS]);
+if (env.INTEGRATION_ENCRYPTION_KEY) pairs.push(['INTEGRATION_ENCRYPTION_KEY', env.INTEGRATION_ENCRYPTION_KEY]);
+if (env.GOOGLE_CLIENT_ID) pairs.push(['GOOGLE_CLIENT_ID', env.GOOGLE_CLIENT_ID]);
+if (env.GOOGLE_CLIENT_SECRET) pairs.push(['GOOGLE_CLIENT_SECRET', env.GOOGLE_CLIENT_SECRET]);
+if (env.GOOGLE_REDIRECT_URI) pairs.push(['GOOGLE_REDIRECT_URI', env.GOOGLE_REDIRECT_URI]);
+if (env.RESEND_API_KEY) pairs.push(['RESEND_API_KEY', env.RESEND_API_KEY]);
+if (env.EMAIL_FROM) pairs.push(['EMAIL_FROM', env.EMAIL_FROM]);
+if (env.INTERNAL_API_SECRET) pairs.push(['INTERNAL_API_SECRET', env.INTERNAL_API_SECRET]);
+if (env.BILLING_SALES_EMAIL) pairs.push(['BILLING_SALES_EMAIL', env.BILLING_SALES_EMAIL]);
 
 console.log('Checking Railway auth…');
 railway(['whoami']);

@@ -1,12 +1,9 @@
 /**
- * Task board routes — the execution half of the product. All require auth.
- *
- * Replaces the old `/api/workflows` tracking routes, which shadowed a board
- * that was created automatically on every generated workflow.
+ * Task board routes — the execution half of the product.
  */
 
 import { Router } from 'express';
-import { body, param } from 'express-validator';
+import { body, param, query } from 'express-validator';
 import {
   createBoard,
   listBoards,
@@ -18,18 +15,30 @@ import {
   updateTask,
   previewSchedule,
   deleteBoard,
+  getCalendarFeedLink,
+  downloadCalendarIcs,
 } from '../controllers/taskController.js';
 import { authenticate } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
+import { withCurrentPeriod, requireFeature } from '../middleware/entitlements.js';
 
 const router = Router();
-
-router.use(authenticate);
 
 const scheduleValidation = [
   body('targetDate').optional({ nullable: true }).isISO8601(),
   body('weeklyHours').optional({ nullable: true }).isInt({ min: 1, max: 80 }),
 ];
+
+/** Public ICS feed — signed token, no session cookie. */
+router.get(
+  '/calendar.ics',
+  [query('token').isString().isLength({ min: 10, max: 500 })],
+  validate,
+  downloadCalendarIcs
+);
+
+router.use(authenticate);
+router.use(withCurrentPeriod);
 
 router.post(
   '/',
@@ -46,10 +55,16 @@ router.post(
 );
 
 router.get('/', listBoards);
-
-// Declared before `/:boardId` so the literal path isn't captured as an id.
 router.get('/today', getToday);
 router.get('/by-session/:sessionId', getBoardBySession);
+
+router.get(
+  '/:boardId/calendar-link',
+  requireFeature('exportWorkflow'),
+  [param('boardId').isMongoId()],
+  validate,
+  getCalendarFeedLink
+);
 
 router.get('/:boardId', [param('boardId').isMongoId()], validate, getBoard);
 

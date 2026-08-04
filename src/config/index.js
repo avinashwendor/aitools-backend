@@ -190,6 +190,25 @@ const config = {
     salesEmail: process.env.BILLING_SALES_EMAIL || 'sales@example.com',
   },
 
+  // ─── Integrations & email ──────────────────────────────────
+  integrations: {
+    /** 64-char hex preferred. Rotating JWT must not invalidate OAuth tokens. */
+    encryptionKey: process.env.INTEGRATION_ENCRYPTION_KEY || '',
+    google: {
+      clientId: process.env.GOOGLE_CLIENT_ID || '',
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+      redirectUri:
+        process.env.GOOGLE_REDIRECT_URI ||
+        `http://localhost:${num(process.env.PORT, 5002)}/api/integrations/google/callback`,
+    },
+  },
+  email: {
+    resendApiKey: process.env.RESEND_API_KEY || '',
+    from: process.env.EMAIL_FROM || 'AI Tools <noreply@example.com>',
+  },
+  /** Shared secret for n8n / internal due-boards webhook. */
+  internalApiSecret: process.env.INTERNAL_API_SECRET || '',
+
   // ─── Vector search (Qdrant) ──────────────────────────────────
   // Optional — same pattern as the AI provider chain: absent config means the
   // feature is cleanly disabled (pure-BM25 retrieval, no semantic memory),
@@ -240,8 +259,21 @@ if (isProd) {
     console.error('✖ JWT_SECRET must be at least 32 characters in production.');
     process.exit(1);
   }
-  if (!config.ai.apiKey) {
-    console.warn('⚠ AI_API_KEY is not set — AI chat and workflow features will be disabled.');
+  if (!config.ai.providers?.length) {
+    console.warn('⚠ No AI providers configured — AI chat and workflow features will be disabled.');
+  }
+  if (!process.env.REDIS_URL) {
+    console.warn(
+      '⚠ REDIS_URL is unset in production — reminder jobs run in-process per replica and may duplicate emails. Add the Railway Redis plugin.'
+    );
+  }
+  if (!config.integrations.encryptionKey) {
+    console.warn(
+      '⚠ INTEGRATION_ENCRYPTION_KEY is unset — OAuth tokens and ICS feeds fall back to JWT_SECRET. Generate with: openssl rand -hex 32'
+    );
+  }
+  if (!config.internalApiSecret) {
+    console.warn('⚠ INTERNAL_API_SECRET is unset — /api/internal/due-boards will return 503.');
   }
 }
 

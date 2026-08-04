@@ -1,0 +1,92 @@
+{
+  "name": "AI Tools — due-board reminder runner",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 1 }]
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Every hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.AITOOLS_API_URL }}/api/internal/due-boards",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.AITOOLS_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Fetch due boards",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [280, 0]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "data.boards",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Split boards",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [520, 0]
+    },
+    {
+      "parameters": {
+        "content": "## AI Tools reminder runner\n\n1. Set env `AITOOLS_API_URL` (e.g. https://aitools-backend-production.up.railway.app)\n2. Set env `AITOOLS_INTERNAL_SECRET` to match backend `INTERNAL_API_SECRET`\n3. Wire the Email / WhatsApp node after Split boards\n\nEach item is `{ boardId, title, userEmail, nextTask, isBehind, percent }`.",
+        "height": 340,
+        "width": 380,
+        "color": 5
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Setup notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-420, -40]
+    },
+    {
+      "parameters": {},
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "Send channel (replace me)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [760, 0]
+    }
+  ],
+  "connections": {
+    "Every hour": {
+      "main": [[{ "node": "Fetch due boards", "type": "main", "index": 0 }]]
+    },
+    "Fetch due boards": {
+      "main": [[{ "node": "Split boards", "type": "main", "index": 0 }]]
+    },
+    "Split boards": {
+      "main": [[{ "node": "Send channel (replace me)", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "aiToolsExport": {
+      "kind": "reminder-runner",
+      "exportedAt": "2026-08-04"
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
