@@ -89,11 +89,11 @@ function resolveQdrantUrl() {
 
       if (vectordbPublic && host === vectordbPublic) {
         console.error(
-          `✖ QDRANT_URL points at public vectordb host (${host}). Set QDRANT_URL=http://${{vectordb.RAILWAY_PRIVATE_DOMAIN}}:6333 on the backend service to avoid egress billing.`
+          `✖ QDRANT_URL points at public vectordb host (${host}). Set QDRANT_URL=http://\${{vectordb.RAILWAY_PRIVATE_DOMAIN}}:6333 on the backend service to avoid egress billing.`
         );
       } else {
         console.warn(
-          `⚠ QDRANT_URL uses public Railway host ${host} — set QDRANT_PRIVATE_DOMAIN=${{vectordb.RAILWAY_PRIVATE_DOMAIN}} or use a private URL to avoid egress charges`
+          `⚠ QDRANT_URL uses public Railway host ${host} — set QDRANT_PRIVATE_DOMAIN=\${{vectordb.RAILWAY_PRIVATE_DOMAIN}} or use a private URL to avoid egress charges`
         );
       }
     }
