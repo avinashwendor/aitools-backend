@@ -13,6 +13,7 @@ import adminRoutes from './adminRoutes.js';
 import chatRoutes from './chatRoutes.js';
 import categoryRoutes from './categoryRoutes.js';
 import taskRoutes from './taskRoutes.js';
+import billingRoutes from './billingRoutes.js';
 
 const router = Router();
 
@@ -90,6 +91,7 @@ router.use('/admin', adminRoutes);
 router.use('/chat', chatRoutes);
 router.use('/categories', categoryRoutes);
 router.use('/tasks', taskRoutes);
+router.use('/billing', billingRoutes);
 
 export default router;
 

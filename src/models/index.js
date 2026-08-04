@@ -7,5 +7,19 @@ import UserProfile from './UserProfile.js';
 import TaskBoard from './TaskBoard.js';
 import SuggestedTool from './SuggestedTool.js';
 import MessageFeedback from './MessageFeedback.js';
+import UsageLedger from './UsageLedger.js';
+import UpgradeRequest from './UpgradeRequest.js';
 
-export { User, Tool, Comment, Category, Conversation, UserProfile, TaskBoard, SuggestedTool, MessageFeedback };
+export {
+  User,
+  Tool,
+  Comment,
+  Category,
+  Conversation,
+  UserProfile,
+  TaskBoard,
+  SuggestedTool,
+  MessageFeedback,
+  UsageLedger,
+  UpgradeRequest,
+};

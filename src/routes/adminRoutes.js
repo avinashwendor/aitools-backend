@@ -24,6 +24,19 @@ import {
     updateCategory,
     deleteCategory,
 } from '../controllers/categoryController.js';
+import {
+    getOverview,
+    getTimeseries,
+    getUserUsage,
+    getActionBreakdown,
+    getModelBreakdown,
+    getUpgradeRequests,
+    approveUpgradeRequest,
+    rejectUpgradeRequest,
+    assignPlan,
+    grantCredits,
+    getPlanCatalog,
+} from '../controllers/adminBillingController.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 
@@ -124,6 +137,33 @@ router.put('/tools/:id/feature', toggleFeatured);
 // Users management
 router.get('/users', getAllUsers);
 router.put('/users/:id/role', updateUserRole);
+
+// ── Billing, credits and provider cost ────────────────────────
+// Read endpoints are analytics over the usage ledger; the write endpoints are
+// the only way a plan changes, since there is no payment gateway in front.
+router.get('/billing/overview', getOverview);
+router.get('/billing/timeseries', getTimeseries);
+router.get('/billing/users', getUserUsage);
+router.get('/billing/actions', getActionBreakdown);
+router.get('/billing/models', getModelBreakdown);
+router.get('/billing/plans', getPlanCatalog);
+
+router.get('/billing/requests', getUpgradeRequests);
+router.post('/billing/requests/:id/approve', approveUpgradeRequest);
+router.post('/billing/requests/:id/reject', rejectUpgradeRequest);
+
+router.put(
+    '/billing/users/:id/plan',
+    [body('plan').isString().notEmpty().withMessage('Plan is required')],
+    validate,
+    assignPlan
+);
+router.post(
+    '/billing/users/:id/credits',
+    [body('credits').isInt({ min: 1, max: 1000000 }).withMessage('Credits must be a positive number')],
+    validate,
+    grantCredits
+);
 
 // Web-discovered tool suggestions — reviewed here before ever touching the live catalog
 router.get('/suggested-tools', getSuggestedTools);

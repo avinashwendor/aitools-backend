@@ -18,6 +18,7 @@
 import config from '../../config/index.js';
 import cache from '../cache.js';
 import { getRedis } from '../../utils/redis.js';
+import { recordSearchUsage } from '../../billing/meterContext.js';
 import { createLogger } from '../../utils/logger.js';
 
 const log = createLogger('ai:websearch');
@@ -86,6 +87,11 @@ export async function webSearch(query, { maxResults = 5 } = {}) {
 
     await spendCredit();
 
+    // The global monthly counter above protects the Tavily budget; this
+    // attributes the same call to the user action that triggered it, which is
+    // what lets the admin view separate search spend from token spend.
+    recordSearchUsage({ credits: 1 });
+
     if (!response.ok) {
       log.warn('Tavily request failed', { status: response.status });
       return null;
@@ -109,4 +115,35 @@ export async function webSearch(query, { maxResults = 5 } = {}) {
   }
 }
 
-export default { webSearch, isWebSearchConfigured };
+/**
+ * This month's search budget, for the admin cost dashboard.
+ *
+ * Reads the same Redis counter the budget guard uses, so the number shown is
+ * the number actually enforced — a separately-derived figure (say, summing
+ * ledger rows) would drift the moment a search happened outside a metered
+ * request, and would quietly disagree with the cap doing the blocking.
+ */
+export async function getSearchBudget() {
+  const configured = isWebSearchConfigured();
+  let used = 0;
+
+  if (configured) {
+    try {
+      used = Number(await getRedis().get(monthKey())) || 0;
+    } catch (err) {
+      log.warn('Could not read search budget counter', { error: err.message });
+    }
+  }
+
+  const cap = config.search.monthlyCreditCap;
+  return {
+    configured,
+    used,
+    cap,
+    remaining: Math.max(0, cap - used),
+    percentUsed: cap ? Math.min(100, Math.round((used / cap) * 100)) : 0,
+    month: monthKey().split(':').pop(),
+  };
+}
+
+export default { webSearch, isWebSearchConfigured, getSearchBudget };

@@ -36,6 +36,11 @@ export const signup = async (req, res, next) => {
           email: user.email,
           role: user.role,
           avatar: user.avatar,
+          // Carried so the client can render the plan and credit balance on
+          // the first paint after auth, instead of flashing a default state
+          // until a follow-up /billing/me lands.
+          subscription: user.subscription,
+          credits: user.credits,
         },
         token,
       },
@@ -88,6 +93,11 @@ export const signin = async (req, res, next) => {
           email: user.email,
           role: user.role,
           avatar: user.avatar,
+          // Carried so the client can render the plan and credit balance on
+          // the first paint after auth, instead of flashing a default state
+          // until a follow-up /billing/me lands.
+          subscription: user.subscription,
+          credits: user.credits,
         },
         token,
       },

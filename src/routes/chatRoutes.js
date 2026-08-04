@@ -21,8 +21,11 @@ import {
 } from '../controllers/preferencesController.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
-import { rateLimit } from '../middleware/rateLimit.js';
-import config from '../config/index.js';
+import {
+  withCurrentPeriod,
+  requireCredits,
+  planRateLimit,
+} from '../middleware/entitlements.js';
 
 const router = Router();
 
@@ -44,21 +47,43 @@ const messageValidation = [
     .withMessage('Too many intake answers'),
 ];
 
-/** AI calls cost money and time — cap them per user, not per IP. */
-const aiLimiter = rateLimit({
-  windowMs: config.ai.rateLimitWindowMs,
-  max: config.ai.rateLimitMax,
-  message: "You're sending requests faster than the assistant can think. Give it a few seconds.",
-});
+/**
+ * AI calls cost money and time — cap them per user, not per IP, at the rate
+ * their plan pays for.
+ */
+const aiLimiter = planRateLimit();
 
 router.use(authenticate);
+// Every route below reads or spends the allowance, so the period has to be
+// current before any of them run — including the read-only ones.
+router.use(withCurrentPeriod);
 
-router.post('/', aiLimiter, messageValidation, validate, sendMessage);
-router.post('/stream', aiLimiter, messageValidation, validate, streamMessage);
+/**
+ * A chat turn's real price isn't known until the router has classified the
+ * message, so the gate only checks the account isn't empty; the controller
+ * charges the true amount once the work is done.
+ */
+router.post(
+  '/',
+  aiLimiter,
+  requireCredits('chat.message', { estimate: 'minimum' }),
+  messageValidation,
+  validate,
+  sendMessage
+);
+router.post(
+  '/stream',
+  aiLimiter,
+  requireCredits('chat.message', { estimate: 'minimum' }),
+  messageValidation,
+  validate,
+  streamMessage
+);
 
 router.post(
   '/deep-dive',
   aiLimiter,
+  requireCredits('workflow.deepdive'),
   [body('stageId').trim().notEmpty().withMessage('stageId is required')],
   validate,
   regenerateStage

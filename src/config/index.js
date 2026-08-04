@@ -155,6 +155,41 @@ const config = {
     verbose: bool(process.env.AI_VERBOSE, !isProd),
   },
 
+  // ─── Billing / credits ───────────────────────────────────────
+  // The subscription layer is plan-and-credit based with no payment gateway
+  // wired up yet: plans are assigned from the admin panel, and the pricing
+  // page collects upgrade intent. Everything below is about *measuring* cost,
+  // which has to be right regardless of how the money eventually arrives.
+  billing: {
+    /**
+     * Fixed conversion for turning published USD token prices into the rupee
+     * figures the admin dashboard reports. Deliberately not a live FX lookup —
+     * historical cost rows must not move under you when the rupee does.
+     * Ledger rows store the rupees computed at write time.
+     */
+    usdToInr: num(process.env.BILLING_USD_TO_INR, 88),
+
+    /** Tavily list price per search credit, in USD. */
+    searchCreditUsd: num(process.env.BILLING_SEARCH_CREDIT_USD, 0.008),
+
+    /**
+     * Days of ledger history kept. Aggregates for the admin charts are read
+     * from this collection, so it needs to outlive the reporting window
+     * comfortably — 400 days covers a full year plus comparison headroom.
+     */
+    ledgerRetentionDays: num(process.env.BILLING_LEDGER_RETENTION_DAYS, 400),
+
+    /**
+     * When true, a user who runs out of credits is warned but not blocked.
+     * Useful for a launch period where you'd rather eat the cost than have
+     * the product hard-stop on someone mid-evaluation.
+     */
+    softLimits: bool(process.env.BILLING_SOFT_LIMITS, false),
+
+    /** Where "Talk to us" enquiries from the pricing page should land. */
+    salesEmail: process.env.BILLING_SALES_EMAIL || 'sales@example.com',
+  },
+
   // ─── Vector search (Qdrant) ──────────────────────────────────
   // Optional — same pattern as the AI provider chain: absent config means the
   // feature is cleanly disabled (pure-BM25 retrieval, no semantic memory),

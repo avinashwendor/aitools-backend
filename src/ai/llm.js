@@ -10,6 +10,7 @@ import OpenAI from 'openai';
 import config from '../config/index.js';
 import { createLogger } from '../utils/logger.js';
 import { recordCall } from './telemetry.js';
+import { recordLlmUsage } from '../billing/meterContext.js';
 
 const log = createLogger('ai:llm');
 
@@ -253,6 +254,15 @@ export async function complete({
             ok: true,
           });
 
+          // Attribute the spend to whichever user action is in flight. A no-op
+          // outside a metered request (background jobs, the seeder, tests), so
+          // no branch is needed here.
+          recordLlmUsage({
+            model: `${provider.name}/${candidateModel}`,
+            promptTokens: response.usage?.prompt_tokens ?? 0,
+            completionTokens: response.usage?.completion_tokens ?? 0,
+          });
+
           if (tried.length) {
             log.warn('Served after failover', {
               task,
@@ -270,6 +280,19 @@ export async function complete({
           };
         } catch (err) {
           lastError = err;
+
+          // Some providers bill (and report usage on) a request that then
+          // failed downstream — a content filter, a length stop, a 5xx after
+          // generation. Those tokens are real money, so record them when they
+          // are reported rather than letting failed calls look free.
+          const failedUsage = err?.error?.usage || err?.response?.data?.usage;
+          if (failedUsage?.prompt_tokens || failedUsage?.completion_tokens) {
+            recordLlmUsage({
+              model: `${provider.name}/${candidateModel}`,
+              promptTokens: failedUsage.prompt_tokens ?? 0,
+              completionTokens: failedUsage.completion_tokens ?? 0,
+            });
+          }
 
           if (signal?.aborted) {
             throw new LLMError('Request cancelled.', { code: 'ABORTED', status: 499 });

@@ -14,6 +14,8 @@ import UserProfile from '../models/UserProfile.js';
 import { loadConversation } from '../ai/memory.js';
 import { applySchedule, scheduleTasks, computeEstimateBias } from '../tasks/schedule.js';
 import { ApiError } from '../middleware/errorHandler.js';
+import { checkLimit } from '../billing/credits.js';
+import { getPlan, nextPlanUp } from '../billing/plans.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('tasks');
@@ -121,6 +123,35 @@ export const createBoard = async (req, res, next) => {
     }
 
     const existing = await TaskBoard.findOne({ user: userId, sourceSessionId: sessionId });
+
+    // Re-committing a session updates the board it already owns, so the cap
+    // only applies to genuinely new boards. Counting active boards rather than
+    // all of them means archiving finished work frees a slot, which is the
+    // behaviour that makes a small free-tier cap livable instead of a wall.
+    if (!existing) {
+      const activeBoards = await TaskBoard.countDocuments({ user: userId, status: 'active' });
+      const limit = checkLimit(req.user, 'taskBoards', activeBoards);
+
+      if (!limit.allowed) {
+        const plan = getPlan(req.user.subscription?.plan);
+        const next = nextPlanUp(plan.id);
+        return res.status(403).json({
+          success: false,
+          code: 'BOARD_LIMIT_REACHED',
+          message:
+            `The ${plan.name} plan keeps ${limit.limit} task boards active at a time. ` +
+            `Archive one you've finished, or upgrade for more room.`,
+          data: {
+            limit: limit.limit,
+            used: limit.used,
+            currentPlan: plan.id,
+            upgrade: next
+              ? { planId: next.id, planName: next.name, limit: next.limits.taskBoards || 'Unlimited' }
+              : null,
+          },
+        });
+      }
+    }
 
     const tasks = mergeProgress(tasksFromWorkflow(workflow), existing?.tasks);
 
