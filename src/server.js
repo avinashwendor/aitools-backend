@@ -143,19 +143,6 @@ async function start() {
       tools: catalog.tools.length,
       categories: catalog.categories.length,
     });
-
-    const vector = await warmVectorIndex();
-    if (vector.configured === false) {
-      log.info('Vector search unavailable', { reason: vector.reason });
-    } else if (vector.ok === false) {
-      log.error('Vector store not populated — semantic search will use BM25 only', vector);
-    } else {
-      log.info('Vector store ready', {
-        succeeded: vector.succeeded,
-        attempted: vector.attempted,
-        ms: vector.ms,
-      });
-    }
   } catch (err) {
     log.warn('Could not warm retrieval index', { error: err.message });
   }
@@ -164,6 +151,26 @@ async function start() {
     log.info(`Server listening on :${config.port}`, { env: config.nodeEnv });
     startJobWorkers();
     startAgentWorkers();
+
+    // ONNX embedding load is deferred until after HTTP is up — avoids blocking
+    // the healthcheck and skips re-embed when Qdrant already has the catalog.
+    warmVectorIndex()
+      .then(vector => {
+        if (vector.configured === false) {
+          log.info('Vector search unavailable', { reason: vector.reason });
+        } else if (vector.skipped) {
+          log.info('Vector store ready (boot sync skipped)', { toolPoints: vector.toolPoints });
+        } else if (vector.ok === false) {
+          log.error('Vector store not populated — semantic search will use BM25 only', vector);
+        } else {
+          log.info('Vector store ready', {
+            succeeded: vector.succeeded,
+            attempted: vector.attempted,
+            ms: vector.ms,
+          });
+        }
+      })
+      .catch(err => log.warn('Vector store warmup failed', { error: err.message }));
   });
 }
 

@@ -108,7 +108,16 @@ const agentRunSchema = new mongoose.Schema(
 
     browser: {
       used: { type: Boolean, default: false },
+      /** 'browserbase' | 'cdp' — which provider served this run. */
+      provider: { type: String, default: null },
       sessionId: { type: String, default: null },
+      /**
+       * Embeddable URL showing the session as it happens. Only the hosted
+       * provider offers one, and only while the session is open — it is stored
+       * rather than fetched on demand because by the time anyone opens an old
+       * run, the URL is dead and refetching it would just fail slowly.
+       */
+      liveViewUrl: { type: String, default: null },
       /** Seconds the Chrome session was held open, the billable quantity. */
       seconds: { type: Number, default: 0 },
       /** Screenshots captured during the run, newest last. */
@@ -152,6 +161,9 @@ agentRunSchema.methods.toJSONSafe = function toJSONSafe() {
     credits: this.credits,
     browser: {
       used: this.browser?.used,
+      provider: this.browser?.provider,
+      sessionId: this.browser?.sessionId,
+      liveViewUrl: this.browser?.liveViewUrl,
       seconds: this.browser?.seconds,
       screenshots: this.browser?.screenshots || [],
     },

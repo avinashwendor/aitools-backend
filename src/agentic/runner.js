@@ -27,7 +27,6 @@
  *    record instead of nothing at all.
  */
 
-import config from '../config/index.js';
 import { AgentRun, AgentWorkflow } from '../models/index.js';
 import { topoSort } from './graph.js';
 import { getNodeDef, nodeCredits } from './registry.js';
@@ -42,6 +41,8 @@ import { BROWSER_MINUTE_COST, creditCost } from '../billing/plans.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('agentic:runner');
+
+const MAX_BROWSER_SCREENSHOTS = 5;
 
 /** Runs currently executing in this process, so a cancel can reach them. */
 const inFlight = new Map();
@@ -165,14 +166,23 @@ async function runInner({ run, workflow, user, controller, usage }) {
     if (session) return session;
     if (!isBrowserConfigured()) {
       throw new Error(
-        'This step needs a browser, but no browser service is configured. Set AGENT_BROWSER_WS.'
+        'This step needs a browser, but no browser service is configured. Set BROWSERBASE_API_KEY (hosted) or AGENT_BROWSER_WS (self-hosted).'
       );
     }
     addLog(run, { level: 'info', message: 'Opening browser session…' });
     session = await openSession({ onLog: entry => addLog(run, entry) });
     run.browser.used = true;
+    run.browser.provider = session.provider;
     run.browser.sessionId = session.sessionId;
-    emit(run, 'run.browser', { sessionId: session.sessionId });
+    run.browser.liveViewUrl = session.liveViewUrl;
+    // Published the moment it exists rather than at the end: the live view is
+    // only useful *during* the run, and a URL that arrives with the final
+    // result is a URL nobody can act on.
+    emit(run, 'run.browser', {
+      provider: session.provider,
+      sessionId: session.sessionId,
+      liveViewUrl: session.liveViewUrl,
+    });
     return session;
   };
 
@@ -238,6 +248,9 @@ async function runInner({ run, workflow, user, controller, usage }) {
         },
         onScreenshot: dataUrl => {
           run.browser.screenshots.push(dataUrl);
+          if (run.browser.screenshots.length > MAX_BROWSER_SCREENSHOTS) {
+            run.browser.screenshots = run.browser.screenshots.slice(-MAX_BROWSER_SCREENSHOTS);
+          }
           emit(run, 'run.screenshot', { nodeId: node.id, dataUrl });
         },
       });
@@ -411,7 +424,9 @@ async function finish({
         logs: run.logs,
         browser: {
           used: run.browser.used,
+          provider: run.browser.provider,
           sessionId: run.browser.sessionId,
+          liveViewUrl: run.browser.liveViewUrl,
           seconds: run.browser.seconds,
           screenshots: run.browser.screenshots,
         },
@@ -440,6 +455,13 @@ async function finish({
     credits: run.credits,
     output: run.output,
     durationMs: Date.now() - startedAt,
+    browser: {
+      used: run.browser.used,
+      provider: run.browser.provider,
+      sessionId: run.browser.sessionId,
+      liveViewUrl: run.browser.liveViewUrl,
+      seconds: run.browser.seconds,
+    },
   });
 
   log.info('Agentic run finished', {

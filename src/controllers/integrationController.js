@@ -32,7 +32,7 @@ export const startConnect = async (req, res, next) => {
     if (!provider) {
       return res.status(404).json({ success: false, message: 'Unknown provider' });
     }
-    const { url } = provider.connect({ userId: req.user._id });
+    const { url } = await provider.connect({ userId: req.user._id });
     res.json({ success: true, data: { url } });
   } catch (err) {
     if (err.status) {

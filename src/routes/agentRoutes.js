@@ -32,6 +32,7 @@ import {
   getRun,
   streamRun,
   cancelRunHandler,
+  getSessionReplay,
   webhookTrigger,
   listCredentials,
   createCredential,
@@ -96,6 +97,12 @@ router.delete('/credentials/:credentialId', [param('credentialId').isMongoId()],
 router.get('/runs/:runId', [param('runId').isMongoId()], validate, getRun);
 router.get('/runs/:runId/stream', [param('runId').isMongoId()], validate, streamRun);
 router.post('/runs/:runId/cancel', [param('runId').isMongoId()], validate, cancelRunHandler);
+router.get(
+  '/replays/:sessionId',
+  [param('sessionId').isString().isLength({ min: 8, max: 120 })],
+  validate,
+  getSessionReplay
+);
 
 // ─── Workflows ──────────────────────────────────────────────
 router.get('/', listWorkflows);

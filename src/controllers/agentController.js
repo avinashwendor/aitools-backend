@@ -30,7 +30,11 @@ import { validateGraph, suggestNodeId } from '../agentic/graph.js';
 import { compose } from '../agentic/composer.js';
 import { enqueueRun, computeNextRun } from '../agentic/queue.js';
 import { cancelRun, activeRunCount } from '../agentic/runner.js';
-import { isBrowserConfigured } from '../agentic/browser/session.js';
+import {
+  isBrowserConfigured,
+  browserCapabilities,
+  getReplayPlaylist,
+} from '../agentic/browser/session.js';
 import { subscribe } from '../agentic/events.js';
 import { planAllows, planLimit, BROWSER_MINUTE_COST, creditCost } from '../billing/plans.js';
 import { checkLimit, isUnmetered } from '../billing/credits.js';
@@ -61,6 +65,7 @@ async function ownedWorkflow(req, res) {
 
 export const getRegistry = asyncHandler(async (req, res) => {
   const plan = req.user?.subscription?.plan;
+  const browser = browserCapabilities();
   res.json({
     success: true,
     data: {
@@ -72,7 +77,10 @@ export const getRegistry = asyncHandler(async (req, res) => {
        * its first run.
        */
       capabilities: {
-        browser: isBrowserConfigured(),
+        browser: browser.configured,
+        browserProvider: browser.provider,
+        browserLiveView: browser.liveView,
+        browserReplay: browser.replay,
         agentic: config.agentic.enabled,
         plan: {
           agenticWorkflows: planAllows(plan, 'agenticWorkflows'),
@@ -447,6 +455,46 @@ export const cancelRunHandler = asyncHandler(async (req, res) => {
 });
 
 /**
+ * Proxy a Browserbase session replay as HLS.
+ *
+ * The playlist needs the secret API key, so it is fetched server-side. Returns
+ * 202 while Browserbase is still processing the recording after session close.
+ */
+export const getSessionReplay = asyncHandler(async (req, res) => {
+  const sessionId = String(req.params.sessionId || '').trim();
+  if (!sessionId || sessionId.length > 120) {
+    return res.status(400).json({ success: false, message: 'Invalid session id.' });
+  }
+
+  const plan = req.user?.subscription?.plan;
+  if (!planAllows(plan, 'browserAgents') && !isUnmetered(req.user)) {
+    return res.status(403).json({
+      success: false,
+      code: 'FEATURE_NOT_IN_PLAN',
+      message: 'Session replay isn’t included in your plan.',
+    });
+  }
+
+  const caps = browserCapabilities();
+  if (!caps.replay) {
+    return res.status(503).json({
+      success: false,
+      code: 'BROWSER_NOT_CONFIGURED',
+      message: 'Session replay requires Browserbase (BROWSERBASE_API_KEY).',
+    });
+  }
+
+  const playlist = await getReplayPlaylist(sessionId);
+  if (!playlist) {
+    return res.status(202).end();
+  }
+
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(playlist);
+});
+
+/**
  * Live run feed.
  *
  * Sends the current state first, then streams changes. A client that connects
@@ -629,6 +677,7 @@ export default {
   getRun,
   streamRun,
   cancelRunHandler,
+  getSessionReplay,
   webhookTrigger,
   listCredentials,
   createCredential,

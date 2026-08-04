@@ -139,13 +139,35 @@ async function syncVectorStore(oldTools, newTools) {
  * Awaited on server boot — populates Qdrant after catalog load with a timeout.
  * @param {{ timeoutMs?: number }} [opts]
  */
-export async function warmVectorIndex({ timeoutMs = 180_000 } = {}) {
+export async function warmVectorIndex({ timeoutMs = 180_000, force = false } = {}) {
   if (!isVectorStoreConfigured()) {
     log.info('Vector store disabled — set QDRANT_URL on the backend to enable semantic search');
     return { configured: false, reason: 'QDRANT_URL not set' };
   }
 
   const catalog = await getCatalog();
+
+  if (!force && catalog.tools.length > 0) {
+    const health = await getVectorStoreHealth();
+    const toolPoints = health.collections?.tools?.points ?? 0;
+    if (toolPoints >= catalog.tools.length) {
+      needsVectorSync = false;
+      log.info('Vector store already populated — skipping boot sync', {
+        toolPoints,
+        tools: catalog.tools.length,
+        url: health.url,
+      });
+      return {
+        configured: true,
+        ok: true,
+        skipped: true,
+        toolPoints,
+        attempted: catalog.tools.length,
+        succeeded: toolPoints,
+      };
+    }
+  }
+
   needsVectorSync = true;
 
   const syncPromise = (async () => {

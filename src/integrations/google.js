@@ -2,13 +2,22 @@
  * Google Calendar + Gmail OAuth adapter.
  */
 
-import { google as googleApis } from 'googleapis';
 import config from '../config/index.js';
 import Integration from '../models/Integration.js';
 import { encryptSecret, decryptSecret, signOAuthState } from './crypto.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('integrations:google');
+
+let googleApisPromise = null;
+
+/** Deferred — googleapis is ~200MB on disk and unused when Google OAuth is off. */
+async function loadGoogleApis() {
+  if (!googleApisPromise) {
+    googleApisPromise = import('googleapis').then(mod => mod.google);
+  }
+  return googleApisPromise;
+}
 
 export const id = 'google';
 export const label = 'Google Calendar & Gmail';
@@ -26,18 +35,19 @@ export function isConfigured() {
   return Boolean(config.integrations?.google?.clientId && config.integrations?.google?.clientSecret);
 }
 
-function oauthClient(redirectUri) {
+async function oauthClient(redirectUri) {
+  const googleApis = await loadGoogleApis();
   const { clientId, clientSecret, redirectUri: defaultRedirect } = config.integrations.google;
   return new googleApis.auth.OAuth2(clientId, clientSecret, redirectUri || defaultRedirect);
 }
 
-export function connect({ userId }) {
+export async function connect({ userId }) {
   if (!isConfigured()) {
     const err = new Error('Google OAuth is not configured on this server');
     err.status = 503;
     throw err;
   }
-  const client = oauthClient();
+  const client = await oauthClient();
   const url = client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
@@ -48,10 +58,11 @@ export function connect({ userId }) {
 }
 
 export async function handleCallback({ code, userId }) {
-  const client = oauthClient();
+  const client = await oauthClient();
   const { tokens } = await client.getToken(code);
   client.setCredentials(tokens);
 
+  const googleApis = await loadGoogleApis();
   const oauth2 = googleApis.oauth2({ version: 'v2', auth: client });
   const me = await oauth2.userinfo.get();
 
@@ -102,7 +113,7 @@ async function getAuthedClient(userId) {
     throw err;
   }
 
-  const client = oauthClient();
+  const client = await oauthClient();
   client.setCredentials({
     access_token: decryptSecret(integration.accessTokenEnc),
     refresh_token: integration.refreshTokenEnc
@@ -132,6 +143,7 @@ async function getAuthedClient(userId) {
  * @param {Record<string,string>} [existingEventIds] taskId → Google event id
  */
 export async function push(board, existingEventIds = {}) {
+  const googleApis = await loadGoogleApis();
   const { client } = await getAuthedClient(board.user);
   const calendar = googleApis.calendar({ version: 'v3', auth: client });
   const results = [];
@@ -198,6 +210,7 @@ export async function pull() {
  * Send a plain-text email via the user's Gmail (for due nudges).
  */
 export async function sendMail({ userId, to, subject, body }) {
+  const googleApis = await loadGoogleApis();
   const { client, integration } = await getAuthedClient(userId);
   const gmail = googleApis.gmail({ version: 'v1', auth: client });
   const from = integration.email || to;

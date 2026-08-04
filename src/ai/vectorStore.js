@@ -29,8 +29,23 @@ const MEMORY_COLLECTION = 'memory_facts';
 
 /** Parallel upserts × ONNX inference can OOM small Railway instances. */
 const UPSERT_CONCURRENCY = 3;
+const QDRANT_CONNECT_RETRIES = 5;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export const isVectorStoreConfigured = () => Boolean(config.vector.url);
+
+/** Whether the configured endpoint is on Railway private networking (no egress). */
+export function isPrivateQdrantUrl(url = config.vector.url) {
+  if (!url) return false;
+  try {
+    return new URL(url).hostname.toLowerCase().endsWith('.railway.internal');
+  } catch {
+    return false;
+  }
+}
 
 let client = null;
 /** null = never tried, Promise<true> = ok, rejected = last attempt failed */
@@ -93,6 +108,28 @@ async function ensureCollectionsOnce() {
   return true;
 }
 
+async function ensureCollectionsOnceWithRetry() {
+  let lastErr;
+  for (let attempt = 1; attempt <= QDRANT_CONNECT_RETRIES; attempt++) {
+    try {
+      return await ensureCollectionsOnce();
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= QDRANT_CONNECT_RETRIES) break;
+      const delayMs = Math.min(2000 * attempt, 10_000);
+      client = null;
+      log.warn('Qdrant not ready — retrying', {
+        attempt,
+        delayMs,
+        url: redactQdrantUrl(),
+        error: err.message,
+      });
+      await sleep(delayMs);
+    }
+  }
+  throw lastErr;
+}
+
 async function ensureCollections() {
   if (!isVectorStoreConfigured()) return false;
 
@@ -106,7 +143,7 @@ async function ensureCollections() {
 
   ensurePromise = (async () => {
     try {
-      await ensureCollectionsOnce();
+      await ensureCollectionsOnceWithRetry();
       lastEnsureError = null;
       return true;
     } catch (err) {
@@ -114,8 +151,11 @@ async function ensureCollections() {
       ensurePromise = null;
       log.error('Qdrant connection failed — check QDRANT_URL and QDRANT_API_KEY on the backend service', {
         url: redactQdrantUrl(),
+        privateNetworking: isPrivateQdrantUrl(),
         error: err.message,
-        hint: 'Use http://qdrant.railway.internal:6333 (private), not the public HTTPS URL',
+        hint: isPrivateQdrantUrl()
+          ? 'Vectordb may still be starting — redeploy backend after vectordb is online'
+          : 'Use http://${{vectordb.RAILWAY_PRIVATE_DOMAIN}}:6333 (private), not the public HTTPS URL',
       });
       throw err;
     }
@@ -287,6 +327,7 @@ export async function getVectorStoreHealth() {
   const health = {
     configured: true,
     url: redactQdrantUrl(),
+    privateNetworking: isPrivateQdrantUrl(),
     hasApiKey: Boolean(config.vector.apiKey),
     embeddingModel: embeddingModelLabel(),
     dimensions: config.vector.dimensions,
@@ -402,6 +443,7 @@ export async function searchMemoryFacts(query, userId, { limit = 3, excludeSessi
 
 export default {
   isVectorStoreConfigured,
+  isPrivateQdrantUrl,
   redactQdrantUrl,
   upsertTool,
   deleteTool,

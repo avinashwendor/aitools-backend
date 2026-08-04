@@ -60,6 +60,40 @@ function sanitizeProviders(raw) {
   return JSON.stringify(cleaned);
 }
 
+function isRailwayPublicQdrantUrl(url) {
+  if (!url) return false;
+  try {
+    return new URL(url).hostname.toLowerCase().endsWith('.up.railway.app');
+  } catch {
+    return false;
+  }
+}
+
+function resolveQdrantUrlForRailway(env) {
+  const privateUrl = (env.QDRANT_PRIVATE_URL || '').trim();
+  if (privateUrl) return privateUrl;
+
+  const raw = (env.QDRANT_URL || '').trim();
+  if (!raw) return '';
+
+  if (isRailwayPublicQdrantUrl(raw)) {
+    const privateDomain = (env.QDRANT_PRIVATE_DOMAIN || '').trim();
+    if (privateDomain) {
+      console.warn(
+        `⚠ QDRANT_URL in .env is public (${raw}) — syncing private http://${privateDomain}:6333 instead`
+      );
+      return `http://${privateDomain}:6333`;
+    }
+    console.warn(
+      '⚠ QDRANT_URL in .env is a public Railway host — skipping sync to avoid egress billing. ' +
+      'Set QDRANT_URL=http://${{vectordb.RAILWAY_PRIVATE_DOMAIN}}:6333 in Railway dashboard instead.'
+    );
+    return '';
+  }
+
+  return raw;
+}
+
 function railway(args) {
   const res = spawnSync('npx', ['--yes', '@railway/cli', ...args], {
     cwd: root,
@@ -139,7 +173,8 @@ const pairs = [
 if (env.TAVILY_API_KEY) pairs.push(['TAVILY_API_KEY', env.TAVILY_API_KEY]);
 if (env.TAVILY_MONTHLY_CREDIT_CAP) pairs.push(['TAVILY_MONTHLY_CREDIT_CAP', env.TAVILY_MONTHLY_CREDIT_CAP]);
 if (env.REDIS_URL) pairs.push(['REDIS_URL', env.REDIS_URL]);
-if (env.QDRANT_URL) pairs.push(['QDRANT_URL', env.QDRANT_URL]);
+const qdrantUrl = resolveQdrantUrlForRailway(env);
+if (qdrantUrl) pairs.push(['QDRANT_URL', qdrantUrl]);
 if (env.QDRANT_API_KEY) pairs.push(['QDRANT_API_KEY', env.QDRANT_API_KEY]);
 if (env.GOOGLE_CLIENT_ID) pairs.push(['GOOGLE_CLIENT_ID', env.GOOGLE_CLIENT_ID]);
 if (env.GOOGLE_CLIENT_SECRET) pairs.push(['GOOGLE_CLIENT_SECRET', env.GOOGLE_CLIENT_SECRET]);

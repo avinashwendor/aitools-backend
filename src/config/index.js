@@ -33,6 +33,85 @@ function resolveMongoUri() {
   );
 }
 
+/** Railway public service hostname — traffic here is billed as egress from other services. */
+function isRailwayPublicHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  return h.endsWith('.up.railway.app');
+}
+
+/** Normalize Qdrant REST URL (private Railway hosts always use HTTP on port 6333). */
+function finalizeQdrantUrl(url) {
+  try {
+    const u = new URL(url.includes('://') ? url : `http://${url}`);
+    if (u.hostname.endsWith('.railway.internal')) {
+      u.protocol = 'http:';
+      if (!u.port) u.port = '6333';
+    }
+    return u.toString().replace(/\/$/, '');
+  } catch {
+    return String(url).trim();
+  }
+}
+
+/**
+ * Resolve Qdrant URL preferring Railway private networking.
+ *
+ * Railway bills egress when the backend calls Qdrant over *.up.railway.app.
+ * In production set:
+ *   QDRANT_URL=http://${{vectordb.RAILWAY_PRIVATE_DOMAIN}}:6333
+ * or set QDRANT_PRIVATE_URL / QDRANT_PRIVATE_DOMAIN explicitly.
+ */
+function resolveQdrantUrl() {
+  const privateUrl = (process.env.QDRANT_PRIVATE_URL || '').trim();
+  const rawUrl = (process.env.QDRANT_URL || '').trim();
+  if (!privateUrl && !rawUrl) return '';
+
+  if (privateUrl) return finalizeQdrantUrl(privateUrl);
+
+  try {
+    const u = new URL(rawUrl.includes('://') ? rawUrl : `http://${rawUrl}`);
+    const host = u.hostname.toLowerCase();
+
+    if (host.endsWith('.railway.internal')) {
+      return finalizeQdrantUrl(rawUrl);
+    }
+
+    if ((isRailway || isProd) && isRailwayPublicHost(host)) {
+      const privateDomain = (process.env.QDRANT_PRIVATE_DOMAIN || '').trim();
+      const vectordbPublic = (process.env.RAILWAY_SERVICE_VECTORDB_URL || '').trim().toLowerCase();
+
+      if (privateDomain) {
+        console.warn(
+          `⚠ QDRANT_URL uses public host ${host} — using private http://${privateDomain}:6333 to avoid egress charges`
+        );
+        return finalizeQdrantUrl(`http://${privateDomain}:6333`);
+      }
+
+      if (vectordbPublic && host === vectordbPublic) {
+        console.error(
+          `✖ QDRANT_URL points at public vectordb host (${host}). Set QDRANT_URL=http://${{vectordb.RAILWAY_PRIVATE_DOMAIN}}:6333 on the backend service to avoid egress billing.`
+        );
+      } else {
+        console.warn(
+          `⚠ QDRANT_URL uses public Railway host ${host} — set QDRANT_PRIVATE_DOMAIN=${{vectordb.RAILWAY_PRIVATE_DOMAIN}} or use a private URL to avoid egress charges`
+        );
+      }
+    }
+
+    return finalizeQdrantUrl(rawUrl);
+  } catch {
+    return rawUrl;
+  }
+}
+
+function resolveQdrantApiKey() {
+  return (
+    process.env.QDRANT_API_KEY ||
+    process.env.QDRANT__SERVICE__API_KEY ||
+    ''
+  ).trim();
+}
+
 /**
  * Builds the ordered AI provider chain.
  *
@@ -211,27 +290,64 @@ const config = {
      */
     enabled: bool(process.env.AGENTIC_ENABLED, true),
 
+    /**
+     * Where the browser comes from.
+     *
+     * Two providers, and the default is deliberate.
+     *
+     * **browserbase** (default) — a hosted browser API. You pay per
+     * session-minute actually used and nothing when idle. It also hands back a
+     * live view URL and a recording of every session, which are the two things
+     * that make a failed browser run debuggable rather than mysterious.
+     *
+     * **cdp** — a Chrome you host yourself (Browserless or Steel on Railway,
+     * or a local Chrome with --remote-debugging-port). Cheaper at sustained
+     * volume because you're paying for a container rather than per minute, but
+     * it bills whether or not anyone runs anything, and there is no recording.
+     *
+     * The economics decide it for most people: an idle container costs money
+     * every hour of every day, and browser workflows are bursty. Self-hosting
+     * only wins once you're running enough sessions to keep it busy.
+     *
+     * Resolution is automatic — whichever is configured — so neither has to be
+     * declared explicitly. `AGENT_BROWSER_PROVIDER` forces one when both are.
+     */
     browser: {
+      provider: (process.env.AGENT_BROWSER_PROVIDER || '').trim().toLowerCase(),
+
       /**
-       * CDP endpoint of the browser service.
+       * Browserbase. `BROWSERBASE_PROJECT_ID` is required alongside the key —
+       * the API accepts a session create without it but bills it to no project,
+       * which shows up as sessions you can't find in the dashboard.
+       */
+      browserbase: {
+        apiKey: process.env.BROWSERBASE_API_KEY || '',
+        projectId: process.env.BROWSERBASE_PROJECT_ID || '',
+        /** us-west-2 | us-east-1 | eu-central-1 | ap-southeast-1 */
+        region: process.env.BROWSERBASE_REGION || 'us-west-2',
+        /** Ad blocking cuts page weight, which cuts both latency and cost. */
+        blockAds: bool(process.env.BROWSERBASE_BLOCK_ADS, true),
+        /** Stealth mode. Off by default: it costs more and most pages don't need it. */
+        stealth: bool(process.env.BROWSERBASE_STEALTH, false),
+      },
+
+      /**
+       * Self-hosted CDP endpoint, used when `provider` resolves to `cdp`.
        *
-       * On Railway this is the Browserless v2 or Steel Browser template
-       * deployed as a private service, referenced over the internal network:
+       * On Railway that means the Browserless v2 or Steel Browser template
+       * deployed as a **private** service:
        *
-       *   AGENT_BROWSER_WS=ws://browserless.railway.internal:3000?token=${{Browserless.TOKEN}}
+       *   AGENT_BROWSER_WS=ws://browserless.railway.internal:3000?token=${{browserless.TOKEN}}
        *
-       * Private networking means the browser is never publicly reachable, which
-       * matters more here than usual: a CDP endpoint on the open internet is a
-       * remote-code-execution surface, not merely an unauthenticated API.
-       *
-       * Unset disables browser nodes cleanly — the same pattern the Qdrant and
-       * Tavily integrations use — rather than failing mid-run.
+       * Two things bite here. The service must bind to `::` (Railway's private
+       * network is IPv6), and it must never be publicly exposed — an open CDP
+       * socket is remote code execution, not merely an unauthenticated API.
        */
       wsEndpoint: process.env.AGENT_BROWSER_WS || process.env.BROWSER_WS_ENDPOINT || '',
       /**
-       * Some images (Steel) want a session created over REST before a CDP
-       * socket is handed out. Set this to that base URL to use the session API;
-       * leave empty to connect straight to `wsEndpoint`.
+       * Some images (Steel) mint a session over REST before handing out a CDP
+       * socket. Set this to that base URL; leave empty to connect straight to
+       * `wsEndpoint`.
        */
       apiUrl: process.env.AGENT_BROWSER_API_URL || '',
       apiToken: process.env.AGENT_BROWSER_TOKEN || '',
@@ -293,10 +409,10 @@ const config = {
   // ─── Vector search (Qdrant) ──────────────────────────────────
   // Optional — same pattern as the AI provider chain: absent config means the
   // feature is cleanly disabled (pure-BM25 retrieval, no semantic memory),
-  // not a crash. Point QDRANT_URL at Railway's Qdrant template in production.
+  // not a crash. On Railway use private networking (see resolveQdrantUrl).
   vector: {
-    url: process.env.QDRANT_URL || '',
-    apiKey: process.env.QDRANT_API_KEY || '',
+    url: resolveQdrantUrl(),
+    apiKey: resolveQdrantApiKey(),
     embeddingModel: process.env.EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2',
     dimensions: num(process.env.EMBEDDING_DIMENSIONS, 384),
   },
@@ -355,6 +471,19 @@ if (isProd) {
   }
   if (!config.internalApiSecret) {
     console.warn('⚠ INTERNAL_API_SECRET is unset — /api/internal/due-boards will return 503.');
+  }
+  if (config.vector.url) {
+    try {
+      const host = new URL(config.vector.url).hostname.toLowerCase();
+      if (isRailwayPublicHost(host)) {
+        console.error(
+          '✖ QDRANT_URL still points at a public Railway host — vector search will bill egress. ' +
+          'Set QDRANT_URL=http://${{vectordb.RAILWAY_PRIVATE_DOMAIN}}:6333 on the backend service.'
+        );
+      }
+    } catch {
+      /* invalid URL logged elsewhere */
+    }
   }
 }
 
