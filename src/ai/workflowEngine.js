@@ -24,6 +24,7 @@ import {
   clearClarificationState,
 } from './memory.js';
 import cache from './cache.js';
+import { planAllows } from '../billing/plans.js';
 import {
   profileFingerprint,
   retrievalSignals,
@@ -750,6 +751,7 @@ export async function handleMessage({
   message,
   conversation,
   userId = null,
+  planId = null,
   allowExternalTools = false,
   intakeAnswers = null,
   onProgress = noop,
@@ -774,11 +776,19 @@ export async function handleMessage({
     });
   }
 
+  const canRecall = Boolean(planId && planAllows(planId, 'memoryRecall'));
+
   // ── Long-term memory: structured profile + semantic cross-session recall ──
   const [profile, recalled] = userId
     ? await Promise.all([
         loadProfile(userId).catch(() => null),
-        recallRelatedSessions({ userId, sessionId: conversation.sessionId, goal: message }).catch(() => []),
+        canRecall
+          ? recallRelatedSessions({
+              userId,
+              sessionId: conversation.sessionId,
+              goal: message,
+            }).catch(() => [])
+          : Promise.resolve([]),
       ])
     : [null, []];
 

@@ -35,7 +35,7 @@ function createServerForUser(user) {
         pricing: z.enum(['free', 'freemium', 'paid', 'any']).optional(),
       },
     },
-    async args => tools.searchTools(args)
+    async args => tools.searchTools({ user, ...args })
   );
 
   server.registerTool(
@@ -47,7 +47,7 @@ function createServerForUser(user) {
         query: z.string().optional(),
       },
     },
-    async args => tools.compareTools(args)
+    async args => tools.compareTools({ user, ...args })
   );
 
   server.registerTool(

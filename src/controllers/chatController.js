@@ -213,7 +213,12 @@ export const sendMessage = async (req, res) => {
       let turn;
       try {
         turn = await handleMessage({
-          message, conversation, userId, allowExternalTools: resolvedExternal, intakeAnswers,
+          message,
+          conversation,
+          userId,
+          planId: req.user.subscription?.plan,
+          allowExternalTools: resolvedExternal,
+          intakeAnswers,
         });
       } catch (err) {
         // Failed work is free for the user but not for us — keep the spend visible.
@@ -302,6 +307,7 @@ export const streamMessage = async (req, res) => {
           message,
           conversation,
           userId,
+          planId: req.user.subscription?.plan,
           allowExternalTools: resolvedExternal,
           intakeAnswers,
           // Progress events carrying real workflow data go out as `partial` so a

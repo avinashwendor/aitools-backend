@@ -70,10 +70,11 @@ const conversationSchema = new mongoose.Schema(
 
 conversationSchema.index({ user: 1, sessionId: 1 }, { unique: true });
 
-// TTL index — Mongo reaps abandoned conversations automatically.
+// Safety-net TTL (≈400 days). Plan-aware pruning in memory.js enforces
+// Hobby (7d) / Pro (365d) / unlimited (Studio+) — this only catches abandoned accounts.
 conversationSchema.index(
   { lastActivity: 1 },
-  { expireAfterSeconds: 60 * 60 * 24 * 30 }
+  { expireAfterSeconds: 60 * 60 * 24 * 400 }
 );
 
 const Conversation = mongoose.model('Conversation', conversationSchema);

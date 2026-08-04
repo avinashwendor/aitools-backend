@@ -9,8 +9,23 @@ import {
 } from '../controllers/authController.js';
 import { authenticate } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
+import { rateLimit } from '../middleware/rateLimit.js';
 
 const router = Router();
+
+const authIpLimit = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  keyGenerator: req => req.ip,
+  message: 'Too many auth attempts from this network. Try again in an hour.',
+});
+
+const signupLimit = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 8,
+  keyGenerator: req => req.ip,
+  message: 'Too many signups from this network. Try again later.',
+});
 
 // Validation rules
 const signupValidation = [
@@ -30,8 +45,8 @@ const signupValidation = [
   body('password')
     .notEmpty()
     .withMessage('Password is required')
-    .isLength({ min: 6 })
-    .withMessage('Password must be at least 6 characters'),
+    .isLength({ min: 8 })
+    .withMessage('Password must be at least 8 characters'),
 ];
 
 const signinValidation = [
@@ -70,13 +85,13 @@ const changePasswordValidation = [
   body('newPassword')
     .notEmpty()
     .withMessage('New password is required')
-    .isLength({ min: 6 })
-    .withMessage('New password must be at least 6 characters'),
+    .isLength({ min: 8 })
+    .withMessage('New password must be at least 8 characters'),
 ];
 
 // Public routes
-router.post('/signup', signupValidation, validate, signup);
-router.post('/signin', signinValidation, validate, signin);
+router.post('/signup', signupLimit, signupValidation, validate, signup);
+router.post('/signin', authIpLimit, signinValidation, validate, signin);
 
 // Protected routes
 router.get('/me', authenticate, getMe);
@@ -84,4 +99,3 @@ router.put('/me', authenticate, updateProfileValidation, validate, updateMe);
 router.put('/password', authenticate, changePasswordValidation, validate, changePassword);
 
 export default router;
-

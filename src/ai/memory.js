@@ -7,10 +7,12 @@
  */
 
 import Conversation from '../models/Conversation.js';
+import User from '../models/User.js';
 import UserProfile from '../models/UserProfile.js';
 import config from '../config/index.js';
 import { complete } from './llm.js';
 import { upsertMemoryFact, searchMemoryFacts } from './vectorStore.js';
+import { planAllows, planLimit, DEFAULT_PLAN_ID } from '../billing/plans.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ai:memory');
@@ -171,9 +173,13 @@ async function compact(key, convo) {
     },
   });
 
-  // Fire-and-forget: lets a brand-new session semantically recall this one later.
-  upsertMemoryFact({ userId: key.user, sessionId: key.sessionId, summary: finalSummary })
-    .catch(err => log.warn('Failed to upsert memory fact after compaction', { error: err.message }));
+  // Cross-session memory facts are a Pro+ feature — skip writes on Hobby.
+  const owner = await User.findById(key.user).select('subscription.plan').lean();
+  const planId = owner?.subscription?.plan || DEFAULT_PLAN_ID;
+  if (planAllows(planId, 'memoryRecall')) {
+    upsertMemoryFact({ userId: key.user, sessionId: key.sessionId, summary: finalSummary })
+      .catch(err => log.warn('Failed to upsert memory fact after compaction', { error: err.message }));
+  }
 
   log.debug('Conversation compacted', { kept: WINDOW, folded: overflow.length });
 }
@@ -196,7 +202,49 @@ export async function clearConversation(userId, sessionId) {
   await Conversation.deleteOne({ user: userId, sessionId: sessionId || 'default' });
 }
 
+/**
+ * Delete conversations older than the plan's sessionRetentionDays.
+ * A limit of 0 means unlimited (no prune for that user).
+ * @returns {Promise<number>} deleted count
+ */
+export async function pruneExpiredSessionsForUser(userId, planId) {
+  const days = planLimit(planId, 'sessionRetentionDays');
+  if (!days || days <= 0) return 0;
+  const cutoff = new Date(Date.now() - days * 86_400_000);
+  const result = await Conversation.deleteMany({
+    user: userId,
+    lastActivity: { $lt: cutoff },
+  });
+  return result.deletedCount || 0;
+}
+
+/**
+ * Nightly / hourly sweep across all users with finite retention.
+ * @returns {Promise<number>} total deleted
+ */
+export async function pruneAllExpiredSessions() {
+  const users = await User.find({
+    'subscription.plan': { $exists: true },
+  })
+    .select('_id subscription.plan')
+    .lean();
+
+  let total = 0;
+  for (const u of users) {
+    const planId = u.subscription?.plan || DEFAULT_PLAN_ID;
+    if (planLimit(planId, 'sessionRetentionDays') <= 0) continue;
+    total += await pruneExpiredSessionsForUser(u._id, planId);
+  }
+  return total;
+}
+
 export async function listConversations(userId, limit = 30) {
+  const user = await User.findById(userId).select('subscription.plan').lean();
+  const planId = user?.subscription?.plan || DEFAULT_PLAN_ID;
+  await pruneExpiredSessionsForUser(userId, planId).catch(err =>
+    log.warn('Session prune on list failed', { error: err.message })
+  );
+
   return Conversation.find({ user: userId })
     .select('sessionId title goal turnCount lastActivity updatedAt lastWorkflow')
     .sort({ lastActivity: -1 })
@@ -304,6 +352,8 @@ export default {
   updateLastWorkflow,
   clearConversation,
   listConversations,
+  pruneExpiredSessionsForUser,
+  pruneAllExpiredSessions,
   loadProfile,
   updateProfileFacts,
   recordIntakeAsk,

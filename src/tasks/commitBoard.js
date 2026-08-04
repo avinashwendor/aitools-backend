@@ -7,8 +7,8 @@ import TaskBoard from '../models/TaskBoard.js';
 import UserProfile from '../models/UserProfile.js';
 import { loadConversation } from '../ai/memory.js';
 import { applySchedule, computeEstimateBias } from '../tasks/schedule.js';
-import { checkLimit } from '../billing/credits.js';
-import { getPlan, nextPlanUp } from '../billing/plans.js';
+import { checkLimit, spend, canAfford, isUnmetered } from '../billing/credits.js';
+import { getPlan, nextPlanUp, creditCost } from '../billing/plans.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('tasks:service');
@@ -99,6 +99,15 @@ export async function commitWorkflowToBoard({ user, sessionId, targetDate, weekl
       };
       throw err;
     }
+
+    const boardCost = creditCost('taskboard.create');
+    if (!isUnmetered(user) && !canAfford(user, boardCost)) {
+      const err = new Error('Not enough credits to create a task board.');
+      err.status = 402;
+      err.code = 'INSUFFICIENT_CREDITS';
+      err.data = { required: boardCost, action: 'taskboard.create' };
+      throw err;
+    }
   }
 
   const tasks = mergeProgress(tasksFromWorkflow(workflow), existing?.tasks);
@@ -120,11 +129,29 @@ export async function commitWorkflowToBoard({ user, sessionId, targetDate, weekl
   applySchedule(board, { estimateBias: await getEstimateBias(userId) });
   await board.save();
 
+  const created = !existing;
+  if (created) {
+    const outcome = await spend({
+      user,
+      action: 'taskboard.create',
+      cost: creditCost('taskboard.create'),
+      sessionId,
+      meta: { boardId: String(board._id) },
+    });
+    if (!outcome.ok) {
+      await TaskBoard.deleteOne({ _id: board._id }).catch(() => {});
+      const err = new Error('Not enough credits to create a task board.');
+      err.status = 402;
+      err.code = 'INSUFFICIENT_CREDITS';
+      throw err;
+    }
+  }
+
   log.info('Task board committed', {
     userId: String(userId),
     tasks: board.tasks.length,
     reused: Boolean(existing),
   });
 
-  return { board, created: !existing };
+  return { board, created };
 }

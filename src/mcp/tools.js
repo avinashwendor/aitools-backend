@@ -29,12 +29,22 @@ function errorResult(message) {
   };
 }
 
-export async function searchTools({ query, limit = 8, pricing = 'any' }) {
+export async function searchTools({ user, query, limit = 8, pricing = 'any' }) {
   const { candidates, cards } = await retrieve({
     queries: [query],
     pricing,
     limit: Math.min(Number(limit) || 8, 24),
   });
+
+  if (user) {
+    await spend({
+      user,
+      action: 'catalog.search',
+      cost: creditCost('catalog.search'),
+      meta: { surface: 'mcp', query: String(query || '').slice(0, 120) },
+    }).catch(err => log.warn('catalog.search spend failed', { error: err.message }));
+  }
+
   return textResult({
     count: candidates.length,
     tools: cards.length
@@ -50,7 +60,7 @@ export async function searchTools({ query, limit = 8, pricing = 'any' }) {
   });
 }
 
-export async function compareTools({ slugs = [], query }) {
+export async function compareTools({ user, slugs = [], query }) {
   let tools = [];
   if (Array.isArray(slugs) && slugs.length) {
     const { candidates } = await retrieve({
@@ -72,6 +82,15 @@ export async function compareTools({ slugs = [], query }) {
   } else if (query) {
     const { candidates } = await retrieve({ queries: [query], limit: 6 });
     tools = candidates;
+  }
+
+  if (user) {
+    await spend({
+      user,
+      action: 'catalog.search',
+      cost: creditCost('catalog.search'),
+      meta: { surface: 'mcp', compare: true },
+    }).catch(err => log.warn('catalog.search spend failed', { error: err.message }));
   }
 
   return textResult({
@@ -119,6 +138,7 @@ export async function planWorkflow({ user, message, sessionId = 'mcp-default' })
         message: message.trim(),
         conversation,
         userId: user._id,
+        planId: user.subscription?.plan,
       });
 
       const { action, cost } = priceTurn(out, usage);

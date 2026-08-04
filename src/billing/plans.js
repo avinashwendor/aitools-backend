@@ -68,6 +68,8 @@ export const CREDIT_COSTS = {
   'search.web': 7,
   /** Committing a workflow to a task board — scheduling is deterministic, no LLM. */
   'taskboard.create': 2,
+  /** Lightweight catalog search via MCP / API — retrieval only. */
+  'catalog.search': 1,
 };
 
 /**
@@ -322,6 +324,7 @@ export const ACTION_LABELS = {
   'workflow.cached': 'Instant (cached) workflows',
   'search.web': 'Web searches',
   'taskboard.create': 'Task boards created',
+  'catalog.search': 'Catalog searches',
 };
 
 /**

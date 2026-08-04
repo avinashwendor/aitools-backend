@@ -264,7 +264,7 @@ if (isProd) {
   }
   if (!process.env.REDIS_URL) {
     console.warn(
-      '⚠ REDIS_URL is unset in production — reminder jobs run in-process per replica and may duplicate emails. Add the Railway Redis plugin.'
+      '⚠ REDIS_URL is unset in production — reminders use a Mongo advisory lock (safe across replicas); rate limits stay per-instance. Add Railway Redis when you can.'
     );
   }
   if (!config.integrations.encryptionKey) {

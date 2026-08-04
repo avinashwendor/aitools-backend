@@ -16,6 +16,9 @@ import { randomBytes } from 'node:crypto';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const envPath = join(root, '.env');
 
+const PROD_FRONTEND = 'https://aitools-frontned-production.up.railway.app';
+const PROD_BACKEND = 'https://aitools-backend-production.up.railway.app';
+
 function parseEnv(text) {
   const out = {};
   for (const line of text.split('\n')) {
@@ -90,6 +93,27 @@ const jwtSecret =
     ? env.JWT_SECRET
     : randomBytes(48).toString('base64');
 
+const encryptionKey =
+  env.INTEGRATION_ENCRYPTION_KEY && env.INTEGRATION_ENCRYPTION_KEY.length >= 32
+    ? env.INTEGRATION_ENCRYPTION_KEY
+    : randomBytes(32).toString('hex');
+
+const internalSecret =
+  env.INTERNAL_API_SECRET && env.INTERNAL_API_SECRET.length >= 24
+    ? env.INTERNAL_API_SECRET
+    : randomBytes(32).toString('hex');
+
+const corsOrigins = env.CORS_ORIGINS
+  ? env.CORS_ORIGINS
+  : `${PROD_FRONTEND},http://localhost:5173,http://localhost:4173`;
+
+const googleRedirect =
+  env.GOOGLE_REDIRECT_URI && !env.GOOGLE_REDIRECT_URI.includes('localhost')
+    ? env.GOOGLE_REDIRECT_URI
+    : env.GOOGLE_CLIENT_ID
+      ? `${PROD_BACKEND}/api/integrations/google/callback`
+      : env.GOOGLE_REDIRECT_URI || '';
+
 const aiProviders = sanitizeProviders(env.AI_PROVIDERS);
 if (!aiProviders || aiProviders === '[]') {
   console.error('✖ No valid AI providers in AI_PROVIDERS');
@@ -107,6 +131,9 @@ const pairs = [
   ['AI_TIMEOUT_MS', env.AI_TIMEOUT_MS || '45000'],
   ['AI_RATE_LIMIT_WINDOW_MS', env.AI_RATE_LIMIT_WINDOW_MS || '60000'],
   ['AI_RATE_LIMIT_MAX', env.AI_RATE_LIMIT_MAX || '20'],
+  ['CORS_ORIGINS', corsOrigins],
+  ['INTEGRATION_ENCRYPTION_KEY', encryptionKey],
+  ['INTERNAL_API_SECRET', internalSecret],
 ];
 
 if (env.TAVILY_API_KEY) pairs.push(['TAVILY_API_KEY', env.TAVILY_API_KEY]);
@@ -114,15 +141,24 @@ if (env.TAVILY_MONTHLY_CREDIT_CAP) pairs.push(['TAVILY_MONTHLY_CREDIT_CAP', env.
 if (env.REDIS_URL) pairs.push(['REDIS_URL', env.REDIS_URL]);
 if (env.QDRANT_URL) pairs.push(['QDRANT_URL', env.QDRANT_URL]);
 if (env.QDRANT_API_KEY) pairs.push(['QDRANT_API_KEY', env.QDRANT_API_KEY]);
-if (env.CORS_ORIGINS) pairs.push(['CORS_ORIGINS', env.CORS_ORIGINS]);
-if (env.INTEGRATION_ENCRYPTION_KEY) pairs.push(['INTEGRATION_ENCRYPTION_KEY', env.INTEGRATION_ENCRYPTION_KEY]);
 if (env.GOOGLE_CLIENT_ID) pairs.push(['GOOGLE_CLIENT_ID', env.GOOGLE_CLIENT_ID]);
 if (env.GOOGLE_CLIENT_SECRET) pairs.push(['GOOGLE_CLIENT_SECRET', env.GOOGLE_CLIENT_SECRET]);
-if (env.GOOGLE_REDIRECT_URI) pairs.push(['GOOGLE_REDIRECT_URI', env.GOOGLE_REDIRECT_URI]);
+if (googleRedirect) pairs.push(['GOOGLE_REDIRECT_URI', googleRedirect]);
 if (env.RESEND_API_KEY) pairs.push(['RESEND_API_KEY', env.RESEND_API_KEY]);
 if (env.EMAIL_FROM) pairs.push(['EMAIL_FROM', env.EMAIL_FROM]);
-if (env.INTERNAL_API_SECRET) pairs.push(['INTERNAL_API_SECRET', env.INTERNAL_API_SECRET]);
 if (env.BILLING_SALES_EMAIL) pairs.push(['BILLING_SALES_EMAIL', env.BILLING_SALES_EMAIL]);
+
+if (!env.INTEGRATION_ENCRYPTION_KEY) {
+  console.log('Generated INTEGRATION_ENCRYPTION_KEY (save to .env to keep stable across syncs)');
+}
+if (!env.INTERNAL_API_SECRET) {
+  console.log('Generated INTERNAL_API_SECRET (save to .env to keep stable across syncs)');
+}
+if (!env.REDIS_URL) {
+  console.warn(
+    '⚠ REDIS_URL unset — reminders use Mongo lock across replicas. Add Railway Redis for shared rate limits.'
+  );
+}
 
 console.log('Checking Railway auth…');
 railway(['whoami']);
@@ -136,3 +172,7 @@ console.log(`Setting ${pairs.length} variables on the linked Railway service…`
 railway(args);
 
 console.log('✓ Railway variables synced. Redeploy if the service is still crash-looping.');
+console.log(
+  `  Reminder cron (optional with Redis): POST ${PROD_BACKEND}/api/internal/reminders/run`
+);
+console.log('  Header: x-internal-secret: <INTERNAL_API_SECRET>');

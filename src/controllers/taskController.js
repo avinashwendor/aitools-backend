@@ -87,6 +87,14 @@ export const createBoard = async (req, res, next) => {
     });
     res.status(created ? 201 : 200).json({ success: true, data: { board } });
   } catch (error) {
+    if (error.status === 402) {
+      return res.status(402).json({
+        success: false,
+        code: error.code || 'INSUFFICIENT_CREDITS',
+        message: error.message,
+        data: error.data,
+      });
+    }
     if (error.status === 403 && error.code === 'BOARD_LIMIT_REACHED') {
       return res.status(403).json({
         success: false,
