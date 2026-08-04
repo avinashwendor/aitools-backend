@@ -434,11 +434,28 @@ export async function getUsageSummary(user) {
 
 /**
  * Whether a countable resource is still under its plan cap.
+ *
+ * Three limit values, and the encoding is load-bearing:
+ *
+ *   0   unlimited (the long-standing convention — Studio task boards, etc.)
+ *  -1   none at all, for a resource the tier doesn't have
+ *   n   a cap of n
+ *
+ * `-1` exists because `0` already means unlimited, and a plan that grants zero
+ * agentic workflows written as `0` would silently grant infinite ones. The
+ * feature flag is the real gate in that case; this is the belt to its braces.
+ *
  * @returns {{allowed:boolean, limit:number, used:number, unlimited:boolean}}
  */
 export function checkLimit(user, key, currentCount) {
   const limit = planLimit(user.subscription?.plan, key);
-  const unlimited = limit === 0 || isUnmetered(user);
+  if (isUnmetered(user)) {
+    return { allowed: true, limit, used: currentCount, unlimited: true };
+  }
+  if (limit < 0) {
+    return { allowed: false, limit: 0, used: currentCount, unlimited: false };
+  }
+  const unlimited = limit === 0;
   return {
     allowed: unlimited || currentCount < limit,
     limit,

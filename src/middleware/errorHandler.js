@@ -23,6 +23,18 @@ export const notFound = (req, res, next) => {
   next(new ApiError(404, `Route ${req.originalUrl} not found`));
 };
 
+/**
+ * Forward a rejected async handler to the error middleware.
+ *
+ * Express 4 does not await route handlers, so a rejected promise inside one
+ * becomes an unhandled rejection and the request simply hangs until the client
+ * gives up — no log line tying it to a route, no 500, nothing. The usual fix is
+ * a try/catch in every handler; this is the same thing written once.
+ */
+export const asyncHandler = fn => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
 export const errorHandler = (err, req, res, _next) => {
   let statusCode = err.statusCode || err.status || 500;
   let message = err.message || 'Internal Server Error';

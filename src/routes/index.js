@@ -19,6 +19,7 @@ import createMcpRouter from '../mcp/index.js';
 import shareRoutes from './shareRoutes.js';
 import integrationRoutes from './integrationRoutes.js';
 import internalRoutes from './internalRoutes.js';
+import agentRoutes from './agentRoutes.js';
 
 const router = Router();
 
@@ -102,6 +103,7 @@ router.use('/mcp', createMcpRouter());
 router.use(shareRoutes);
 router.use('/integrations', integrationRoutes);
 router.use('/internal', internalRoutes);
+router.use('/agents', agentRoutes);
 
 export default router;
 

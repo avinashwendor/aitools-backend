@@ -70,7 +70,48 @@ export const CREDIT_COSTS = {
   'taskboard.create': 2,
   /** Lightweight catalog search via MCP / API — retrieval only. */
   'catalog.search': 1,
+
+  /**
+   * Agentic runs are metered differently from everything above, and the
+   * difference is worth stating plainly.
+   *
+   * Every action above is one bounded burst of inference: we know within a
+   * factor of two what it will cost before it starts. An agentic run is a
+   * *program someone else wrote*. It can be four free template nodes, or it can
+   * be an autonomous browser agent grinding through forty model calls against a
+   * Chrome process we're paying to keep alive. A flat price is either extortion
+   * for the first or a subsidy for the second.
+   *
+   * So the charge is assembled from three parts, settled after the run:
+   *
+   *   base      this entry — covers the queue slot, the run document, the
+   *             orchestration, and the runs that fail before doing any work.
+   *   nodes     each node's own price, from the registry (`nodeCredits`).
+   *             Deterministic nodes are free; LLM and browser nodes are not.
+   *   browser   BROWSER_MINUTE_COST per started minute of session wall-clock.
+   *
+   * The browser term is the one that stops a runaway from being free to the
+   * user and expensive to us. A page that hangs for eight minutes burns eight
+   * minutes of a container whether or not a single token is spent, and a
+   * per-node price cannot see that at all.
+   */
+  'agent.run': 15,
 };
+
+/**
+ * Credits per started minute of browser session wall-clock.
+ *
+ * Anchored on what a Chrome session actually costs on Railway: a browser
+ * service sized for ~4 concurrent sessions runs about ₹1,800/month, so a
+ * session-minute is roughly ₹0.10 at a realistic 40% utilisation, plus the
+ * headroom to absorb a bad month. At the standard 1 credit ≈ ₹0.10 anchor that
+ * is 1 credit — priced at 4 to hold the same ~75% margin as everything else and
+ * to make an abandoned tab visibly expensive rather than silently so.
+ *
+ * Rounded *up* per started minute. A 10-second run pays for a minute because a
+ * container cold-start costs us most of one either way.
+ */
+export const BROWSER_MINUTE_COST = 4;
 
 /**
  * Intents that are never charged.
@@ -143,6 +184,14 @@ export const PLANS = {
       /** Concurrent in-flight AI requests per user. */
       concurrentRequests: 1,
       seats: 1,
+      /** Saved executable workflows. Zero, because the tier can't run them. */
+      agentWorkflows: -1,
+      /** Runs per billing period, on top of the credit charge. */
+      agentRunsPerMonth: -1,
+      /** Browser session minutes per period — the hard cost ceiling. */
+      browserMinutesPerMonth: -1,
+      /** Runs allowed in flight at once. */
+      agentConcurrency: -1,
     },
     features: {
       workflowStudio: true,
@@ -155,6 +204,22 @@ export const PLANS = {
       exportWorkflow: false,
       prioritySupport: false,
       apiAccess: false,
+      /**
+       * Executable workflows — the node canvas and browser agents.
+       *
+       * Off here, and it is the one feature that genuinely cannot be sampled on
+       * a free tier. Everything else the free plan includes costs us a bounded
+       * burst of inference; an agentic run holds a real browser open and is
+       * schedulable, which means one free account with a five-minute cron can
+       * cost more in a week than the entire free tier is budgeted for in a
+       * month. The credit allowance alone doesn't stop that, because the
+       * expensive resource is wall-clock, not tokens.
+       */
+      agenticWorkflows: false,
+      /** Webhook and cron triggers — unattended execution. */
+      agentTriggers: false,
+      /** Browser-automation nodes specifically, the priciest class. */
+      browserAgents: false,
     },
     /**
      * Plain-English equivalents shown on the pricing page. Derived from
@@ -167,7 +232,7 @@ export const PLANS = {
   pro: {
     id: 'pro',
     name: 'Pro',
-    tagline: 'For the person who ships. Unmetered thinking, real research, full history.',
+    tagline: 'For the person who ships. Agentic workflows, real research, full history.',
     priceMonthly: 999,
     priceYearly: 9990,
     currency: 'INR',
@@ -181,6 +246,16 @@ export const PLANS = {
       requestsPerMinute: 20,
       concurrentRequests: 3,
       seats: 1,
+      agentWorkflows: 10,
+      /**
+       * A run cap on top of the credit charge, because credits alone don't
+       * bound concurrency or wall-clock — and a cron firing every fifteen
+       * minutes would exhaust an allowance in a day and generate 2,880 Chrome
+       * sessions doing it.
+       */
+      agentRunsPerMonth: 400,
+      browserMinutesPerMonth: 200,
+      agentConcurrency: 2,
     },
     features: {
       workflowStudio: true,
@@ -191,8 +266,11 @@ export const PLANS = {
       exportWorkflow: true,
       prioritySupport: false,
       apiAccess: false,
+      agenticWorkflows: true,
+      agentTriggers: true,
+      browserAgents: true,
     },
-    headline: ['workflow.generate', 'chat.message'],
+    headline: ['workflow.generate', 'agent.run', 'chat.message'],
   },
 
   studio: {
@@ -212,6 +290,10 @@ export const PLANS = {
       requestsPerMinute: 60,
       concurrentRequests: 8,
       seats: 5,
+      agentWorkflows: 100,
+      agentRunsPerMonth: 3000,
+      browserMinutesPerMonth: 1500,
+      agentConcurrency: 6,
     },
     features: {
       workflowStudio: true,
@@ -222,8 +304,11 @@ export const PLANS = {
       exportWorkflow: true,
       prioritySupport: true,
       apiAccess: false,
+      agenticWorkflows: true,
+      agentTriggers: true,
+      browserAgents: true,
     },
-    headline: ['workflow.generate', 'chat.message'],
+    headline: ['workflow.generate', 'agent.run', 'chat.message'],
   },
 
   enterprise: {
@@ -242,6 +327,10 @@ export const PLANS = {
       requestsPerMinute: 120,
       concurrentRequests: 20,
       seats: 0,
+      agentWorkflows: 0,
+      agentRunsPerMonth: 0,
+      browserMinutesPerMonth: 0,
+      agentConcurrency: 20,
     },
     features: {
       workflowStudio: true,
@@ -252,6 +341,9 @@ export const PLANS = {
       exportWorkflow: true,
       prioritySupport: true,
       apiAccess: true,
+      agenticWorkflows: true,
+      agentTriggers: true,
+      browserAgents: true,
     },
     headline: [],
   },
@@ -325,6 +417,20 @@ export const ACTION_LABELS = {
   'search.web': 'Web searches',
   'taskboard.create': 'Task boards created',
   'catalog.search': 'Catalog searches',
+  'agent.run': 'Agentic runs',
+};
+
+/**
+ * Human labels for plan limits, so a 429/403 can name what ran out without
+ * every call site inventing its own phrasing.
+ */
+export const LIMIT_LABELS = {
+  taskBoards: 'task boards',
+  seats: 'seats',
+  agentWorkflows: 'saved agentic workflows',
+  agentRunsPerMonth: 'agentic runs this period',
+  browserMinutesPerMonth: 'browser minutes this period',
+  agentConcurrency: 'agentic runs at once',
 };
 
 /**
@@ -357,7 +463,9 @@ export default {
   PLANS,
   PLAN_IDS,
   CREDIT_COSTS,
+  BROWSER_MINUTE_COST,
   ACTION_LABELS,
+  LIMIT_LABELS,
   DEFAULT_PLAN_ID,
   MIN_ACTION_COST,
   MAX_OVERDRAFT_CREDITS,

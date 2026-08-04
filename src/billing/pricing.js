@@ -116,6 +116,25 @@ export function searchCostPaise(credits = 1) {
   return Math.round(Number(credits) * config.billing.searchCreditUsd * config.billing.usdToInr * 100);
 }
 
+/**
+ * Cost of holding a browser session open, in paise per second.
+ *
+ * Unlike tokens, this isn't a published per-unit price — it's our own infra
+ * amortised. A Railway browser service sized for the concurrency the plans
+ * allow costs a fixed monthly figure; divided by the session-seconds it can
+ * actually serve at a realistic utilisation, that lands near ₹0.10/minute.
+ * `BILLING_BROWSER_PAISE_PER_MINUTE` makes it tunable without a deploy, because
+ * the right number only becomes knowable once real runs are on the graph.
+ *
+ * Recorded on the ledger exactly like token cost so `/api/admin/billing/actions`
+ * reports agentic margin on the same footing as chat margin. Without it, browser
+ * runs would look like pure profit — the one place cost is *not* tokens.
+ */
+export function browserCostPaise(seconds = 0) {
+  const perMinute = config.billing.browserPaisePerMinute;
+  return Math.round((Number(seconds) / 60) * perMinute);
+}
+
 /** Format paise for display: 12345 → "₹123.45". */
 export function formatPaise(paise) {
   const rupees = Number(paise || 0) / 100;
@@ -128,5 +147,6 @@ export default {
   priceForModel,
   llmCostPaise,
   searchCostPaise,
+  browserCostPaise,
   formatPaise,
 };

@@ -12,6 +12,9 @@ import UpgradeRequest from './UpgradeRequest.js';
 import ApiKey from './ApiKey.js';
 import SharedWorkflow from './SharedWorkflow.js';
 import Integration from './Integration.js';
+import AgentWorkflow from './AgentWorkflow.js';
+import AgentRun from './AgentRun.js';
+import AgentCredential from './AgentCredential.js';
 
 export {
   User,
@@ -28,4 +31,7 @@ export {
   ApiKey,
   SharedWorkflow,
   Integration,
+  AgentWorkflow,
+  AgentRun,
+  AgentCredential,
 };

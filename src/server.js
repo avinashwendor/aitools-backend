@@ -13,6 +13,8 @@ import { rateLimit } from './middleware/rateLimit.js';
 import { getCatalog, warmVectorIndex } from './ai/catalog.js';
 import { createLogger } from './utils/logger.js';
 import { startJobWorkers, stopJobWorkers } from './jobs/index.js';
+import { startAgentWorkers, stopAgentWorkers } from './agentic/queue.js';
+import { closeEventBus } from './agentic/events.js';
 
 const log = createLogger('server');
 const app = express();
@@ -161,6 +163,7 @@ async function start() {
   server = app.listen(config.port, () => {
     log.info(`Server listening on :${config.port}`, { env: config.nodeEnv });
     startJobWorkers();
+    startAgentWorkers();
   });
 }
 
@@ -176,6 +179,11 @@ async function shutdown(signal) {
 
   try {
     await stopJobWorkers().catch(() => {});
+    // Stop taking new runs before closing the HTTP server, so a run that is
+    // mid-flight gets the remaining shutdown window to finish and write its
+    // terminal state rather than being cut off at `running`.
+    await stopAgentWorkers().catch(() => {});
+    await closeEventBus().catch(() => {});
     await new Promise(resolve => (server ? server.close(resolve) : resolve()));
     await mongoose.connection.close(false);
     log.info('Shutdown complete');

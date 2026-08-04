@@ -17,8 +17,22 @@
  * explanation instead of a generic error toast.
  */
 
-import { getPlan, planAllows, nextPlanUp, creditCost, MIN_ACTION_COST } from '../billing/plans.js';
-import { ensureCurrentPeriod, canAfford, balanceOf, allowanceOf, isUnmetered } from '../billing/credits.js';
+import {
+  getPlan,
+  planAllows,
+  nextPlanUp,
+  creditCost,
+  MIN_ACTION_COST,
+  LIMIT_LABELS,
+} from '../billing/plans.js';
+import {
+  ensureCurrentPeriod,
+  canAfford,
+  balanceOf,
+  allowanceOf,
+  isUnmetered,
+  checkLimit,
+} from '../billing/credits.js';
 import { rateLimit } from './rateLimit.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -165,8 +179,64 @@ export function planRateLimit() {
   };
 }
 
+/**
+ * Refuse when a countable plan cap is already reached.
+ *
+ * Separate from `requireCredits` because they answer different questions and
+ * the client says different things about them. Credits are fungible and the
+ * user can buy more of the same thing by upgrading; a cap ("10 saved
+ * workflows") is structural — you delete one or you move tiers, and no amount
+ * of credit balance changes the answer.
+ *
+ * `count` is async because every one of these is a database count the request
+ * would otherwise do twice.
+ *
+ * @param {string} key    a key from a plan's `limits` block
+ * @param {(req) => Promise<number>} count  current usage
+ */
+export function requireLimit(key, count) {
+  return async (req, res, next) => {
+    if (!req.user) return next();
+
+    let used;
+    try {
+      used = await count(req);
+    } catch (err) {
+      // A failed count must not become a false denial — that turns a database
+      // blip into "your plan says no", which is the worst possible error to
+      // show someone who is paying.
+      log.warn('Limit count failed — allowing request', { key, error: err.message });
+      return next();
+    }
+
+    const check = checkLimit(req.user, key, used);
+    if (check.allowed) return next();
+
+    const plan = getPlan(req.user.subscription?.plan);
+    const label = LIMIT_LABELS[key] || key;
+
+    return res.status(403).json({
+      success: false,
+      code: 'PLAN_LIMIT_REACHED',
+      message: check.limit === 0
+        ? `The ${plan.name} plan doesn't include ${label}.`
+        : `You've reached the ${plan.name} plan's limit of ${check.limit} ${label}.`,
+      data: {
+        limit: key,
+        max: check.limit,
+        used: check.used,
+        currentPlan: plan.id,
+        upgrade: upgradeHint(req.user),
+      },
+    });
+  };
+}
+
 const FEATURE_LABELS = {
   webSearch: 'Searching the web beyond our catalog',
+  agenticWorkflows: 'Agentic workflows',
+  agentTriggers: 'Scheduled and webhook triggers',
+  browserAgents: 'Browser agents',
   memoryRecall: 'Cross-project memory',
   exportWorkflow: 'Exporting workflows',
   deepDive: 'Stage deep dives',
@@ -184,4 +254,10 @@ function formatDate(date) {
   });
 }
 
-export default { withCurrentPeriod, requireFeature, requireCredits, planRateLimit };
+export default {
+  withCurrentPeriod,
+  requireFeature,
+  requireCredits,
+  requireLimit,
+  planRateLimit,
+};

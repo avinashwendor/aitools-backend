@@ -54,6 +54,12 @@ const usageLedgerSchema = new mongoose.Schema(
     cost: {
       llmPaise: { type: Number, default: 0, min: 0 },
       searchPaise: { type: Number, default: 0, min: 0 },
+      /**
+       * Amortised browser-session infra for agentic runs. Zero on every other
+       * action, and the only cost column that isn't a per-call provider price —
+       * see `pricing.browserCostPaise` for how it's derived.
+       */
+      browserPaise: { type: Number, default: 0, min: 0 },
       totalPaise: { type: Number, default: 0, min: 0, index: true },
     },
 

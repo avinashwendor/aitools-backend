@@ -186,8 +186,89 @@ const config = {
      */
     softLimits: bool(process.env.BILLING_SOFT_LIMITS, false),
 
+    /**
+     * Amortised cost of one minute of browser session, in paise.
+     *
+     * Not a published price — it's our Railway browser service's monthly cost
+     * divided by the session-minutes it can realistically serve. Env-tunable
+     * because the honest number only appears once real runs are on the graph,
+     * and re-deploying to correct an accounting constant is the wrong shape of
+     * fix. Read by `pricing.browserCostPaise`.
+     */
+    browserPaisePerMinute: num(process.env.BILLING_BROWSER_PAISE_PER_MINUTE, 10),
+
     /** Where "Talk to us" enquiries from the pricing page should land. */
     salesEmail: process.env.BILLING_SALES_EMAIL || 'sales@example.com',
+  },
+
+  // ─── Agentic workflows ───────────────────────────────────────
+  // Executable workflows: the node canvas and browser agents. The browser half
+  // needs a Chrome that speaks CDP; everything else runs in-process.
+  agentic: {
+    /**
+     * Whether runs execute at all. Off by default in development so a checkout
+     * without a browser service doesn't queue runs that can never finish.
+     */
+    enabled: bool(process.env.AGENTIC_ENABLED, true),
+
+    browser: {
+      /**
+       * CDP endpoint of the browser service.
+       *
+       * On Railway this is the Browserless v2 or Steel Browser template
+       * deployed as a private service, referenced over the internal network:
+       *
+       *   AGENT_BROWSER_WS=ws://browserless.railway.internal:3000?token=${{Browserless.TOKEN}}
+       *
+       * Private networking means the browser is never publicly reachable, which
+       * matters more here than usual: a CDP endpoint on the open internet is a
+       * remote-code-execution surface, not merely an unauthenticated API.
+       *
+       * Unset disables browser nodes cleanly — the same pattern the Qdrant and
+       * Tavily integrations use — rather than failing mid-run.
+       */
+      wsEndpoint: process.env.AGENT_BROWSER_WS || process.env.BROWSER_WS_ENDPOINT || '',
+      /**
+       * Some images (Steel) want a session created over REST before a CDP
+       * socket is handed out. Set this to that base URL to use the session API;
+       * leave empty to connect straight to `wsEndpoint`.
+       */
+      apiUrl: process.env.AGENT_BROWSER_API_URL || '',
+      apiToken: process.env.AGENT_BROWSER_TOKEN || '',
+      /** Hard ceiling on a single session's life. Stops a hung page billing forever. */
+      maxSessionMs: num(process.env.AGENT_BROWSER_MAX_SESSION_MS, 5 * 60 * 1000),
+      /** Per-navigation and per-action timeout. */
+      timeoutMs: num(process.env.AGENT_BROWSER_TIMEOUT_MS, 30_000),
+      viewport: {
+        width: num(process.env.AGENT_BROWSER_WIDTH, 1280),
+        height: num(process.env.AGENT_BROWSER_HEIGHT, 800),
+      },
+    },
+
+    /** Ceiling on a whole run, browser or not. */
+    maxRunMs: num(process.env.AGENT_MAX_RUN_MS, 10 * 60 * 1000),
+    /** Nodes a single graph may contain. Bounds worst-case run cost. */
+    maxNodes: num(process.env.AGENT_MAX_NODES, 60),
+    /**
+     * Bytes of a single node's output kept on the run document. Beyond this the
+     * value is truncated with a marker — a 16MB Mongo document limit hit
+     * mid-run loses the whole execution history, including the error you needed.
+     */
+    maxOutputBytes: num(process.env.AGENT_MAX_OUTPUT_BYTES, 24_000),
+    /**
+     * Hosts a workflow may never reach. Blocks the classic SSRF targets: cloud
+     * metadata services and our own private network. Enforced by the HTTP node
+     * and by every browser navigation.
+     */
+    blockedHosts: list(process.env.AGENT_BLOCKED_HOSTS, [
+      '169.254.169.254',
+      'metadata.google.internal',
+      'localhost',
+      '127.0.0.1',
+      '::1',
+    ]),
+    /** Allow requests to private IP ranges. Off outside development. */
+    allowPrivateNetwork: bool(process.env.AGENT_ALLOW_PRIVATE_NETWORK, !isProd),
   },
 
   // ─── Integrations & email ──────────────────────────────────
