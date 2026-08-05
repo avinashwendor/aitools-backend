@@ -70,28 +70,25 @@ FIELDS
                  preference if you have one, otherwise "any".
 - skill:         "beginner" | "intermediate" | "advanced" — infer from wording; if unstated,
                  use the user's known skill level if you have one, otherwise "beginner".
-- clarifyingQuestions: [] normally. For a NEW "workflow" intent (no prior workflow in this chat),
-                 you MUST return 2-5 short intake questions before any plan is generated — unless the
-                 user's message already answers the decisions this goal needs. THIS IS NOT OPTIONAL.
-                 Knowing budget/skill from the profile block does NOT make an empty array correct —
-                 you still must ask about THIS goal (platform, audience, catalog, payments, output
-                 format, etc.). Never return [] just to save output length.
-                 At least half of the questions must be SPECIFIC TO THIS GOAL, not generic — name the
-                 actual decision this goal requires (e.g. for ecommerce: what they sell and how they
-                 take payment; for a newsletter: sending platform and rough list size; for a SaaS MVP:
-                 whether they can code at all and who the first users are; for a video, the target
-                 platform and length). Prefer multiple-choice. Each item:
+- alreadyKnow:   for a NEW "workflow" intent — short phrases for facts already settled from the
+                 profile block and/or this message (e.g. "Budget: free", "Selling handmade candles").
+                 Empty array for other intents.
+- stillNeed:     for a NEW "workflow" intent — short phrases for decisions that would change the
+                 plan and are NOT yet answered (e.g. "Which store platform", "How they take payment").
+                 Empty if the message + profile already cover the goal.
+- clarifyingQuestions: [] for non-workflow intents. For a NEW "workflow" intent, invent 2-5 short
+                 questions ONLY for stillNeed (prefer multiple-choice). If stillNeed is empty,
+                 return []. Knowing budget/skill from the profile does NOT clear stillNeed for
+                 goal-specific decisions (platform, audience, catalog, payments, output format).
+                 At least half of the questions must be SPECIFIC TO THIS GOAL. Each item:
                  {"id":"budget","question":"...","type":"choice","options":["Free only","Freemium OK","Paid is fine"]}
                  or {"id":"...","question":"...","type":"text"}. Never more than 5, and never ask
-                 something you already know from the block below (skip budget/skill when the profile
-                 already has them — replace those slots with more goal-specific asks).
-                 Reuse these exact ids where a generic question fits, so the answers can be stored
-                 without guessing: "budget", "skill", "timeline", "approach", "priority", "constraints".
-                 Goal-specific questions should get their own short id (e.g. "platform", "catalog",
-                 "payments", "list_size").${profileBlock(profile)}
+                 something already in alreadyKnow. Reuse these ids when they fit: "budget", "skill",
+                 "timeline", "approach", "priority", "constraints". Goal-specific asks get their own
+                 short id (e.g. "platform", "catalog", "payments").${profileBlock(profile)}
 
 Respond with exactly:
-{"intent":"...","goal":"...","title":"...","domains":[],"searchQueries":[],"pricing":"any","skill":"beginner","clarifyingQuestions":[]}`;
+{"intent":"...","goal":"...","title":"...","domains":[],"searchQueries":[],"pricing":"any","skill":"beginner","alreadyKnow":[],"stillNeed":[],"clarifyingQuestions":[]}`;
 }
 
 /**

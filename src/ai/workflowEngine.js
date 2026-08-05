@@ -115,8 +115,8 @@ function dedupeQuestions(questions) {
 }
 
 /**
- * Last-resort generic intake when every LLM pass failed.
- * Not goal-aware — prefer `inventIntakeQuestions` whenever possible.
+ * Last-resort generic intake when the router omitted clarifying questions.
+ * Not goal-aware — the router prompt is what invents goal-specific asks.
  */
 function buildDefaultIntakeQuestions(profile) {
   const questions = [];
@@ -184,108 +184,55 @@ function sanitizeBriefingLines(raw) {
 }
 
 /**
- * Ask the model: what do I already know, what do I still need, then invent
- * questions only for the gaps. Not a static questionnaire.
- */
-async function inventIntakeQuestions({ goal, message, profile }) {
-  const { data } = await completeJson({
-    task: 'route:intake',
-    role: 'fast',
-    temperature: 0.2,
-    maxTokens: 2500,
-    messages: [
-      { role: 'system', content: prompts.intakeQuestionsSystem(profile) },
-      {
-        role: 'user',
-        content:
-          `Goal: ${String(goal || message).slice(0, 500)}\n` +
-          `User message: ${fence(String(message || '').slice(0, 800))}\n\n` +
-          'List alreadyKnow and stillNeed, then invent clarifyingQuestions only for stillNeed. ' +
-          'If stillNeed is empty, return clarifyingQuestions: [].',
-      },
-    ],
-    validate: v => {
-      if (!v || typeof v !== 'object') return 'Response must be a JSON object.';
-      if (!Array.isArray(v.clarifyingQuestions)) {
-        return '"clarifyingQuestions" must be an array (empty if nothing left to ask).';
-      }
-      if (v.clarifyingQuestions.length > 0 && v.clarifyingQuestions.length < 2) {
-        return 'Ask at least 2 clarifyingQuestions, or return an empty array.';
-      }
-      return null;
-    },
-  });
-
-  return {
-    questions: sanitizeClarifyingQuestions(data.clarifyingQuestions),
-    alreadyKnow: sanitizeBriefingLines(data.alreadyKnow),
-    stillNeed: sanitizeBriefingLines(data.stillNeed),
-  };
-}
-
-/**
- * Resolve intake for a new workflow.
+ * Resolve intake for a new workflow from the router briefing.
  *
- * Always runs an invent pass so the model explicitly separates already-known
- * facts from still-needed decisions — even when the router already proposed
- * questions. Returns `{ questions, alreadyKnow, stillNeed }`.
+ * One LLM round (the router) owns alreadyKnow / stillNeed / clarifyingQuestions.
+ * A second invent call used to leave the studio stuck on "Working out what to
+ * ask…" for 90s+ — if the router omitted questions we pad with defaults.
  */
-async function resolveIntakeQuestions({ routed, profile, message }) {
+async function resolveIntakeQuestions({ routed, profile }) {
   const fromRouter = stripKnownProfileQuestions(
     routed.clarifyingQuestions?.length ? routed.clarifyingQuestions : [],
     profile
   );
   const knownFromProfile = profileKnownLines(profile);
+  const alreadyKnow = (routed.alreadyKnow?.length ? routed.alreadyKnow : knownFromProfile);
 
-  try {
-    const invented = await inventIntakeQuestions({
-      goal: routed.goal,
-      message,
-      profile,
-    });
-    let questions = stripKnownProfileQuestions(invented.questions, profile);
-
-    // Prefer invent (it reasoned about gaps). Fall back to router questions if
-    // invent returned nothing usable but the router had asks.
-    if (questions.length < 2 && fromRouter.length >= 2) {
-      questions = fromRouter;
-    }
-    if (!questions.length && !invented.stillNeed.length) {
-      // Model says nothing left to ask — that is valid; approval still required.
-      return {
-        questions: [],
-        alreadyKnow: invented.alreadyKnow.length ? invented.alreadyKnow : knownFromProfile,
-        stillNeed: [],
-      };
-    }
-    if (questions.length < 2) {
-      questions = dedupeQuestions(buildDefaultIntakeQuestions(profile));
-    }
-
-    log.info('Intake briefing ready', {
-      questions: questions.length,
-      alreadyKnow: (invented.alreadyKnow.length ? invented.alreadyKnow : knownFromProfile).length,
-      stillNeed: invented.stillNeed.length,
-    });
-
+  // Router said nothing left to ask (explicit empty stillNeed + no questions).
+  if (
+    !fromRouter.length &&
+    Array.isArray(routed.stillNeed) &&
+    routed.stillNeed.length === 0
+  ) {
     return {
-      questions: dedupeQuestions(questions),
-      alreadyKnow: invented.alreadyKnow.length ? invented.alreadyKnow : knownFromProfile,
-      stillNeed: invented.stillNeed.length
-        ? invented.stillNeed
-        : questions.map(q => q.question),
-    };
-  } catch (err) {
-    log.warn('Intake invent pass failed — using router/generic questions', { error: err.message });
-    const questions = dedupeQuestions(
-      fromRouter.length >= 2 ? fromRouter : buildDefaultIntakeQuestions(profile)
-    );
-    return {
-      questions,
-      alreadyKnow: knownFromProfile,
-      stillNeed: questions.map(q => q.question),
+      questions: [],
+      alreadyKnow,
+      stillNeed: [],
     };
   }
+
+  let questions = fromRouter;
+  if (questions.length < 2) {
+    questions = dedupeQuestions([
+      ...fromRouter,
+      ...buildDefaultIntakeQuestions(profile),
+    ]);
+  } else {
+    questions = dedupeQuestions(questions);
+  }
+
+  const stillNeed = routed.stillNeed?.length
+    ? routed.stillNeed
+    : questions.map(q => q.question);
+
+  log.info('Intake briefing from router', {
+    questions: questions.length,
+    alreadyKnow: alreadyKnow.length,
+    stillNeed: stillNeed.length,
+    padded: fromRouter.length < 2,
+  });
+
+  return { questions, alreadyKnow, stillNeed };
 }
 
 function formatApprovalMessage({ baseGoal, preferencesText, alreadyKnow, stillNeed }) {
@@ -310,22 +257,18 @@ function formatApprovalMessage({ baseGoal, preferencesText, alreadyKnow, stillNe
 
 const EXTRA_NOTES_RE = /Additional notes from the user:\s*([\s\S]+)/i;
 
-async function route({ message, contextMessages, categories, hasPriorWorkflow, profile, requireQuestions = false }) {
+async function route({ message, contextMessages, categories, hasPriorWorkflow, profile }) {
   const { data } = await completeJson({
     task: 'route',
     role: 'fast',
     temperature: 0.1,
-    // A full route response — goal, title, domains, search queries, plus up to
-    // 5 clarifying questions each carrying options — comfortably exceeds the
-    // 700-token budget this used to run on, which meant the JSON silently
-    // truncated right where clarifyingQuestions lives (the last field) and
-    // every first-time ask fell back to the same five generic questions.
-    //
-    // Sized again for the `fast` tier being a reasoning model: it spends the
-    // allowance on hidden reasoning tokens before writing anything, so the
-    // budget has to cover the thinking as well as the answer. `completeJson`
-    // recovers when it doesn't, but that recovery costs an entire extra call.
+    // A full route response — goal, title, domains, search queries, briefing
+    // lines, plus up to 5 clarifying questions — needs room for reasoning
+    // models that spend the allowance on hidden tokens first.
     maxTokens: 3000,
+    // Hard cap so "Working out what to ask…" cannot sit forever while
+    // providers retry; heuristicRoute + default intake still unblock the UI.
+    timeoutMs: 35_000,
     messages: [
       { role: 'system', content: prompts.routerSystem(categories, profile) },
       ...contextMessages.slice(-4),
@@ -350,21 +293,9 @@ async function route({ message, contextMessages, categories, hasPriorWorkflow, p
       if (['workflow', 'refine'].includes(v.intent) && !v.goal) {
         return '"goal" is required for workflow and refine intents.';
       }
-      // A brand-new workflow ask needs real intake. Profile richness only means
-      // budget/skill can be omitted — not that the whole array may be empty.
-      // Goal-specific questions (platform, catalog, audience) must still run;
-      // otherwise a returning app-builders user never gets asked about a new
-      // ecommerce goal. The engine fills a fallback pack if the model still
-      // returns [], but forcing one repair pass keeps questions on-goal.
-      if (
-        requireQuestions &&
-        v.intent === 'workflow' &&
-        !hasPriorWorkflow &&
-        !(Array.isArray(v.clarifyingQuestions) && v.clarifyingQuestions.length >= 2)
-      ) {
-        return '"clarifyingQuestions" must contain 2-5 questions specific to this goal ' +
-          '(budget/skill may be omitted when the profile already has them).';
-      }
+      // Do not require clarifyingQuestions here. A forced repair round-trip
+      // (plus a second invent pass) left clients stuck on "Working out what
+      // to ask…" for 90s+. Missing questions are filled in resolveIntakeQuestions.
       return null;
     },
   });
@@ -386,6 +317,8 @@ async function route({ message, contextMessages, categories, hasPriorWorkflow, p
     skill: ['beginner', 'intermediate', 'advanced'].includes(data.skill)
       ? data.skill
       : (profile?.skillLevel || 'beginner'),
+    alreadyKnow: sanitizeBriefingLines(data.alreadyKnow),
+    stillNeed: sanitizeBriefingLines(data.stillNeed),
     // Whether to actually ask these is decided by the caller, which knows the
     // routed domain and so can throttle per-domain rather than globally.
     clarifyingQuestions: sanitizeClarifyingQuestions(data.clarifyingQuestions),
@@ -413,6 +346,8 @@ function heuristicRoute(message, hasPriorWorkflow, profile) {
       ? 'free'
       : /\b(paid|premium|professional|pro\b)/.test(text) ? 'paid' : (profile?.pricingPreference || 'any'),
     skill: /\b(advanced|expert|pro)\b/.test(text) ? 'advanced' : (profile?.skillLevel || 'beginner'),
+    alreadyKnow: profileKnownLines(profile),
+    stillNeed: [],
     clarifyingQuestions: [],
   };
 }
@@ -1473,18 +1408,20 @@ export async function handleMessage({
     // goal" for that whole span reads as a hang on the SSE stream.
     onProgress({ phase: 'understanding', message: 'Working out what to ask before planning' });
     try {
-      routed = await route({
-        message: sanitized,
-        contextMessages,
-        categories: catalog.categories,
-        hasPriorWorkflow: Boolean(priorWorkflow),
-        profile,
-        // clarifyingQuestions are only ever read downstream when there's a
-        // userId to store the intake state against — gate the requirement on
-        // the same condition so an anonymous/system caller never forces a
-        // repair round-trip over a field it will discard anyway.
-        requireQuestions: Boolean(userId),
-      });
+      // Absolute budget for routing+intake briefing. Provider failover inside
+      // complete() can otherwise stack timeouts and leave the SSE frozen.
+      routed = await Promise.race([
+        route({
+          message: sanitized,
+          contextMessages,
+          categories: catalog.categories,
+          hasPriorWorkflow: Boolean(priorWorkflow),
+          profile,
+        }),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('Router exceeded 40s budget')), 40_000);
+        }),
+      ]);
     } catch (err) {
       log.warn('Router failed — falling back to heuristics', { error: err.message });
       routed = heuristicRoute(sanitized, Boolean(priorWorkflow), profile);
@@ -1529,7 +1466,6 @@ export async function handleMessage({
     } = await resolveIntakeQuestions({
       routed,
       profile,
-      message: sanitized,
     });
 
     if (clarifyState?.phase === 'awaiting_approval') {
