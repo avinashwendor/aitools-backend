@@ -13,8 +13,11 @@ import {
   isVectorStoreConfigured,
   syncToolsToVectorStore,
   getVectorStoreHealth,
+  prepareVectorCollections,
+  toolEmbeddingText,
 } from './vectorStore.js';
 import { createLogger } from '../utils/logger.js';
+import { isEmbeddingConfigured } from './embeddings.js';
 
 const log = createLogger('ai:catalog');
 
@@ -98,26 +101,67 @@ const state = {
 };
 
 /**
- * Set whenever the catalog is invalidated by a real mutation, cleared once
- * the vector store has been resynced — so a routine TTL refresh with no
- * actual changes doesn't re-embed every tool for nothing.
+ * Set only when an admin mutates a tool (TOOL_CHANGED). Starts false so a
+ * routine boot / TTL refresh never re-embeds the whole catalog — Qdrant
+ * already holds the vectors across deploys.
  */
-let needsVectorSync = true;
+let needsVectorSync = false;
+
+/**
+ * After a failed empty-store fill, the in-memory catalog already matches Mongo,
+ * so a delta vs previousTools would be empty. Force a full upsert once.
+ */
+let forceFullVectorSync = false;
 
 let vectorSyncInFlight = null;
 
-/** Keeps the Qdrant `tools` collection in step with Mongo (batched upserts + logs). */
+/** Tools that are new or whose embeddable text changed vs the previous in-memory catalog. */
+function toolsNeedingEmbed(oldTools, newTools) {
+  const oldBySlug = new Map(oldTools.map(t => [t.slug, t]));
+  return newTools.filter(tool => {
+    const prev = oldBySlug.get(tool.slug);
+    if (!prev) return true;
+    return toolEmbeddingText(tool) !== toolEmbeddingText(prev);
+  });
+}
+
+/**
+ * Keeps Qdrant in step with Mongo — upserts only changed/new tools, deletes
+ * removed ones. Does not load the embedding model when there is nothing to write.
+ */
 async function syncVectorStore(oldTools, newTools) {
   if (!isVectorStoreConfigured()) return { configured: false };
 
   if (vectorSyncInFlight) return vectorSyncInFlight;
 
   vectorSyncInFlight = (async () => {
-    const oldSlugs = new Set(oldTools.map(t => t.slug));
+    const baseline = forceFullVectorSync ? [] : oldTools;
+    forceFullVectorSync = false;
+
+    const oldSlugs = new Set(baseline.map(t => t.slug));
     const newSlugs = new Set(newTools.map(t => t.slug));
     const removed = [...oldSlugs].filter(slug => !newSlugs.has(slug));
+    const changed = toolsNeedingEmbed(baseline, newTools);
 
-    const stats = await syncToolsToVectorStore(newTools);
+    if (!changed.length && !removed.length) {
+      log.info('Vector store already in sync — nothing to upsert');
+      return {
+        configured: true,
+        ok: true,
+        attempted: 0,
+        succeeded: 0,
+        removed: 0,
+        skipped: true,
+      };
+    }
+
+    log.info('Vector store delta sync', {
+      upsert: changed.length,
+      remove: removed.length,
+      catalog: newTools.length,
+    });
+
+    const stats = await syncToolsToVectorStore(changed);
 
     for (const slug of removed) {
       await deleteTool(slug);
@@ -136,13 +180,28 @@ async function syncVectorStore(oldTools, newTools) {
 }
 
 /**
- * Awaited on server boot — populates Qdrant after catalog load with a timeout.
- * @param {{ timeoutMs?: number }} [opts]
+ * Boot check only: if Qdrant is empty/underfilled, embed the catalog once.
+ * When already populated at the current embedding dimensions, skips entirely.
+ * @param {{ timeoutMs?: number, force?: boolean }} [opts]
  */
 export async function warmVectorIndex({ timeoutMs = 180_000, force = false } = {}) {
   if (!isVectorStoreConfigured()) {
     log.info('Vector store disabled — set QDRANT_URL on the backend to enable semantic search');
     return { configured: false, reason: 'QDRANT_URL not set' };
+  }
+
+  if (!isEmbeddingConfigured()) {
+    log.warn('Vector store warm skipped — GEMINI_API_KEY not set (BM25-only retrieval)');
+    return { configured: true, ok: false, reason: 'GEMINI_API_KEY not set' };
+  }
+
+  // Drop/recreate collections when dims change (e.g. MiniLM 384 → Gemini 768)
+  // before we decide whether the store is already populated.
+  try {
+    await prepareVectorCollections();
+  } catch (err) {
+    log.error('Vector store warm aborted — Qdrant unreachable', { error: err.message });
+    return { configured: true, ok: false, error: err.message };
   }
 
   const catalog = await getCatalog();
@@ -152,6 +211,7 @@ export async function warmVectorIndex({ timeoutMs = 180_000, force = false } = {
     const toolPoints = health.collections?.tools?.points ?? 0;
     if (toolPoints >= catalog.tools.length) {
       needsVectorSync = false;
+      forceFullVectorSync = false;
       log.info('Vector store already populated — skipping boot sync', {
         toolPoints,
         tools: catalog.tools.length,
@@ -162,16 +222,19 @@ export async function warmVectorIndex({ timeoutMs = 180_000, force = false } = {
         ok: true,
         skipped: true,
         toolPoints,
-        attempted: catalog.tools.length,
+        attempted: 0,
         succeeded: toolPoints,
       };
     }
+    log.info('Vector store underfilled — embedding catalog on boot', {
+      toolPoints,
+      tools: catalog.tools.length,
+    });
   }
-
-  needsVectorSync = true;
 
   const syncPromise = (async () => {
     needsVectorSync = false;
+    forceFullVectorSync = true;
     return syncVectorStore([], catalog.tools);
   })();
 
@@ -183,6 +246,7 @@ export async function warmVectorIndex({ timeoutMs = 180_000, force = false } = {
     return await Promise.race([syncPromise, timeout]);
   } catch (err) {
     needsVectorSync = true;
+    forceFullVectorSync = true;
     log.error('Vector store warmup failed', { error: err.message });
     const health = await getVectorStoreHealth();
     return { configured: true, ok: false, error: err.message, health };

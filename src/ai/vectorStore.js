@@ -8,18 +8,24 @@
  * conversation summary — works exactly as before with nothing configured.
  *
  * Two collections:
- *   `tools`         — one point per catalog tool, kept in sync with Mongo via
- *                      the same EVENTS.TOOL_CHANGED bus catalog.js uses for
- *                      its own BM25 index invalidation.
- *   `memory_facts`   — one point per (user, session): the current rolling
- *                      conversation summary, re-embedded and overwritten each
- *                      time memory.js compacts that session. Lets a *new*
- *                      session recall the gist of an old one by similarity.
+ *   `tools`         — one point per catalog tool. Boot skips re-embed when
+ *                      Qdrant already has the catalog (same embedding dims);
+ *                      admin create/update upserts only the delta. Dimension
+ *                      changes recreate collections and trigger a one-time fill.
+ *   `memory_facts`   — one point per (user, session): rolling conversation
+ *                      summary, re-embedded on compaction for cross-session recall.
  */
 
 import crypto from 'crypto';
 import config from '../config/index.js';
-import { embed, warmupEmbeddings, isEmbeddingModelReady, embeddingModelLabel } from './embeddings.js';
+import {
+  embed,
+  embedQuery,
+  warmupEmbeddings,
+  isEmbeddingConfigured,
+  isEmbeddingModelReady,
+  embeddingModelLabel,
+} from './embeddings.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ai:vectorStore');
@@ -27,8 +33,8 @@ const log = createLogger('ai:vectorStore');
 const TOOLS_COLLECTION = 'tools';
 const MEMORY_COLLECTION = 'memory_facts';
 
-/** Parallel upserts × ONNX inference can OOM small Railway instances. */
-const UPSERT_CONCURRENCY = 3;
+/** Keep low — Gemini free tier is RPM-limited, not CPU-bound. */
+const UPSERT_CONCURRENCY = 2;
 const QDRANT_CONNECT_RETRIES = 5;
 
 function sleep(ms) {
@@ -86,23 +92,49 @@ function pointId(seed) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
+function collectionVectorSize(info) {
+  const vectors = info?.config?.params?.vectors;
+  if (!vectors) return null;
+  // Single unnamed vector: { size, distance }; named: { default: { size, distance } }
+  if (typeof vectors.size === 'number') return vectors.size;
+  const first = Object.values(vectors)[0];
+  return typeof first?.size === 'number' ? first.size : null;
+}
+
 async function ensureCollectionsOnce() {
   const qdrant = await getClientAsync();
   const { collections } = await qdrant.getCollections();
   const existing = new Set(collections.map(c => c.name));
   const created = [];
+  const expected = config.vector.dimensions;
 
   for (const name of [TOOLS_COLLECTION, MEMORY_COLLECTION]) {
-    if (existing.has(name)) continue;
+    if (existing.has(name)) {
+      const info = await qdrant.getCollection(name);
+      const size = collectionVectorSize(info);
+      if (size != null && size !== expected) {
+        log.warn('Qdrant collection dimension mismatch — recreating', {
+          name,
+          had: size,
+          need: expected,
+          model: embeddingModelLabel(),
+        });
+        await qdrant.deleteCollection(name);
+        existing.delete(name);
+      } else {
+        continue;
+      }
+    }
+
     await qdrant.createCollection(name, {
-      vectors: { size: config.vector.dimensions, distance: 'Cosine' },
+      vectors: { size: expected, distance: 'Cosine' },
     });
     created.push(name);
-    log.info('Created Qdrant collection', { name, dimensions: config.vector.dimensions });
+    log.info('Created Qdrant collection', { name, dimensions: expected });
   }
 
   if (!created.length) {
-    log.debug('Qdrant collections already exist', { existing: [...existing] });
+    log.debug('Qdrant collections already exist', { existing: [...existing], dimensions: expected });
   }
 
   return true;
@@ -164,8 +196,13 @@ async function ensureCollections() {
   return ensurePromise;
 }
 
+/** Public boot helper — recreates collections when embedding dimensions change. */
+export async function prepareVectorCollections() {
+  return ensureCollections();
+}
+
 /** Text projection embedded for a tool — the fields most predictive of "what job does this do." */
-function toolText(tool) {
+export function toolEmbeddingText(tool) {
   return [tool.name, tool.tagline, tool.description, (tool.features || []).join(' '), (tool.tags || []).join(' ')]
     .filter(Boolean)
     .join('. ');
@@ -175,7 +212,7 @@ function toolText(tool) {
 export async function upsertTool(tool) {
   if (!(await ensureCollections().catch(() => false))) return false;
 
-  const vector = await embed(toolText(tool));
+  const vector = await embed(toolEmbeddingText(tool));
   if (!vector) return false;
 
   try {
@@ -206,13 +243,27 @@ export async function deleteTool(slug) {
 }
 
 /**
- * Sync the full catalog into Qdrant with bounded concurrency and a clear summary.
- * Called on boot and after admin catalog mutations.
+ * Upsert the given tools into Qdrant (not necessarily the whole catalog).
+ * Empty list = no-op — does not load the embedding model.
+ * Used for first-time empty-store fill and for admin create/update deltas.
  */
 export async function syncToolsToVectorStore(tools) {
   if (!isVectorStoreConfigured()) {
     log.info('Vector store skipped — QDRANT_URL is not set on this service');
     return { configured: false, reason: 'QDRANT_URL not set' };
+  }
+
+  if (!tools.length) {
+    return {
+      configured: true,
+      ok: true,
+      attempted: 0,
+      succeeded: 0,
+      embeddingFailed: 0,
+      qdrantFailed: 0,
+      ms: 0,
+      url: redactQdrantUrl(),
+    };
   }
 
   const started = Date.now();
@@ -223,13 +274,18 @@ export async function syncToolsToVectorStore(tools) {
     concurrency: UPSERT_CONCURRENCY,
   });
 
+  if (!isEmbeddingConfigured()) {
+    log.error('Vector store sync aborted — GEMINI_API_KEY not set');
+    return { configured: true, ok: false, reason: 'embedding_api_key_missing' };
+  }
+
   const warmup = await warmupEmbeddings();
   if (!warmup.ok) {
-    log.error('Vector store sync aborted — embedding model unavailable', warmup);
+    log.error('Vector store sync aborted — embedding API unavailable', warmup);
     return {
       configured: true,
       ok: false,
-      reason: 'embedding_model_failed',
+      reason: 'embedding_api_failed',
       ...warmup,
     };
   }
@@ -254,7 +310,7 @@ export async function syncToolsToVectorStore(tools) {
     const batch = tools.slice(i, i + UPSERT_CONCURRENCY);
     const results = await Promise.all(batch.map(async tool => {
       if (!(await ensureCollections().catch(() => false))) return 'qdrant';
-      const vector = await embed(toolText(tool));
+      const vector = await embed(toolEmbeddingText(tool));
       if (!vector) return 'embedding';
       try {
         const qdrant = await getClientAsync();
@@ -304,7 +360,7 @@ export async function syncToolsToVectorStore(tools) {
     log.error('Vector store sync incomplete', {
       ...stats,
       hint: embeddingFailed
-        ? 'Embedding model failed — check Railway memory (recommend ≥1GB) and deploy logs'
+        ? 'Gemini embed failed — check GEMINI_API_KEY and free-tier rate limits'
         : 'Qdrant write failed — verify QDRANT_API_KEY matches the Qdrant service',
     });
   }
@@ -329,6 +385,7 @@ export async function getVectorStoreHealth() {
     url: redactQdrantUrl(),
     privateNetworking: isPrivateQdrantUrl(),
     hasApiKey: Boolean(config.vector.apiKey),
+    embeddingApiConfigured: isEmbeddingConfigured(),
     embeddingModel: embeddingModelLabel(),
     dimensions: config.vector.dimensions,
     embeddingModelReady: isEmbeddingModelReady(),
@@ -375,7 +432,7 @@ export async function getVectorStoreHealth() {
 export async function searchTools(query, limit = 32) {
   if (!(await ensureCollections().catch(() => false))) return [];
 
-  const vector = await embed(query);
+  const vector = await embedQuery(query);
   if (!vector) return [];
 
   try {
@@ -420,7 +477,7 @@ export async function upsertMemoryFact({ userId, sessionId, summary }) {
 export async function searchMemoryFacts(query, userId, { limit = 3, excludeSessionId } = {}) {
   if (!(await ensureCollections().catch(() => false))) return [];
 
-  const vector = await embed(query);
+  const vector = await embedQuery(query);
   if (!vector) return [];
 
   try {
@@ -445,9 +502,11 @@ export default {
   isVectorStoreConfigured,
   isPrivateQdrantUrl,
   redactQdrantUrl,
+  toolEmbeddingText,
   upsertTool,
   deleteTool,
   syncToolsToVectorStore,
+  prepareVectorCollections,
   getVectorStoreHealth,
   searchTools,
   upsertMemoryFact,

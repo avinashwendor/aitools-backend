@@ -404,8 +404,11 @@ const config = {
   vector: {
     url: resolveQdrantUrl(),
     apiKey: resolveQdrantApiKey(),
-    embeddingModel: process.env.EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2',
-    dimensions: num(process.env.EMBEDDING_DIMENSIONS, 384),
+    /** Google AI Studio key for gemini-embedding-* (free tier). */
+    embeddingApiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_API_KEY || '',
+    embeddingModel: process.env.EMBEDDING_MODEL || 'gemini-embedding-001',
+    /** Must match outputDimensionality sent to Gemini (768 recommended). */
+    dimensions: num(process.env.EMBEDDING_DIMENSIONS, 768),
   },
 
   // ─── Web search (Tavily) ─────────────────────────────────────

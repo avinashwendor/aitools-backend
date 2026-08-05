@@ -1,18 +1,12 @@
 /**
- * Local, in-process embeddings.
+ * Google Gemini embeddings (HTTP) — no local ONNX model.
  *
- * Runs a small open-source model (default: Xenova/all-MiniLM-L6-v2, 384-dim)
- * directly in the Node process via @huggingface/transformers — no external
- * API key, no rate limit, no per-call cost. The trade-off is a larger boot
- * (model download + ONNX load, cached to disk after the first run) and a bit
- * of CPU per embed call, which is a fine trade for this app's volume
- * (catalog entries on write, compacted summaries on compaction — not
- * per-message).
+ * Used for: catalog tool vectors (admin write / empty-store fill), dense
+ * tool search queries, and cross-session memory facts. Every caller must
+ * treat failure as "semantic search unavailable" — BM25 still works.
  *
- * Embeddings are entirely optional infrastructure: every caller must treat a
- * failure here (model can't load, out of memory) as "semantic search
- * unavailable," never as a request-breaking error — BM25 retrieval works
- * fine without this.
+ * Requires GEMINI_API_KEY (Google AI Studio). Free-tier input is $0 with
+ * rate limits; see https://ai.google.dev/gemini-api/docs/pricing
  */
 
 import config from '../config/index.js';
@@ -20,84 +14,149 @@ import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ai:embeddings');
 
-let extractorPromise = null;
-let modelReady = false;
+const EMBED_URL =
+  'https://generativelanguage.googleapis.com/v1beta/models';
+
+let lastOk = false;
 
 /** Host-safe label for logs — never prints tokens or paths. */
 export function embeddingModelLabel() {
   return config.vector.embeddingModel;
 }
 
-function loadExtractor() {
-  if (!extractorPromise) {
-    const started = Date.now();
-    log.info('Loading embedding model (first run downloads ONNX weights — can take 1-2 min on Railway)', {
-      model: config.vector.embeddingModel,
-      dimensions: config.vector.dimensions,
-    });
-
-    extractorPromise = import('@huggingface/transformers')
-      .then(({ pipeline }) => pipeline('feature-extraction', config.vector.embeddingModel))
-      .then(extractor => {
-        modelReady = true;
-        log.info('Embedding model ready', {
-          model: config.vector.embeddingModel,
-          ms: Date.now() - started,
-        });
-        return extractor;
-      })
-      .catch(err => {
-        extractorPromise = null;
-        modelReady = false;
-        log.error('Embedding model failed to load — vector sync and semantic search disabled', {
-          model: config.vector.embeddingModel,
-          error: err.message,
-          ms: Date.now() - started,
-        });
-        throw err;
-      });
-  }
-  return extractorPromise;
+export function isEmbeddingModelReady() {
+  return lastOk;
 }
 
-/** Pre-load the model so the first catalog upsert doesn't fail in parallel. */
+/** Embeddings need an API key; Qdrant is checked separately by vectorStore. */
+export const isEmbeddingConfigured = () => Boolean(config.vector.embeddingApiKey);
+
+function l2Normalize(values) {
+  let sum = 0;
+  for (const v of values) sum += v * v;
+  const norm = Math.sqrt(sum) || 1;
+  return values.map(v => v / norm);
+}
+
+/**
+ * Pre-flight one embed so catalog sync fails fast if the key/model is bad.
+ */
 export async function warmupEmbeddings() {
-  if (!isEmbeddingConfigured()) return { ok: false, reason: 'QDRANT_URL not set' };
+  if (!isEmbeddingConfigured()) {
+    return { ok: false, reason: 'GEMINI_API_KEY not set' };
+  }
   try {
-    await loadExtractor();
-    await embed('warmup ping');
-    return { ok: true, model: config.vector.embeddingModel };
+    const vector = await embed('warmup ping');
+    if (!vector) return { ok: false, reason: 'embed returned null' };
+    return { ok: true, model: config.vector.embeddingModel, dimensions: vector.length };
   } catch (err) {
     return { ok: false, error: err.message };
   }
 }
 
-export function isEmbeddingModelReady() {
-  return modelReady;
-}
-
-export const isEmbeddingConfigured = () => Boolean(config.vector.url);
-
 /**
  * @param {string} text
- * @returns {Promise<number[]|null>} a unit-normalised embedding, or null if
- *   embeddings aren't usable right now (caller should fall back to BM25-only).
+ * @returns {Promise<number[]|null>} unit-normalised embedding, or null on failure
  */
 export async function embed(text) {
   const clean = String(text || '').trim();
   if (!clean) return null;
 
+  const apiKey = config.vector.embeddingApiKey;
+  if (!apiKey) {
+    log.warn('Embedding skipped — GEMINI_API_KEY not set');
+    return null;
+  }
+
+  const model = config.vector.embeddingModel;
+  const dimensions = config.vector.dimensions;
+
   try {
-    const extractor = await loadExtractor();
-    const output = await extractor(clean, { pooling: 'mean', normalize: true });
-    return Array.from(output.data);
+    const res = await fetch(`${EMBED_URL}/${encodeURIComponent(model)}:embedContent`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        model: `models/${model}`,
+        content: { parts: [{ text: clean.slice(0, 8000) }] },
+        outputDimensionality: dimensions,
+        taskType: 'RETRIEVAL_DOCUMENT',
+      }),
+    });
+
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = body?.error?.message || res.statusText || `HTTP ${res.status}`;
+      throw new Error(message);
+    }
+
+    const values = body?.embedding?.values;
+    if (!Array.isArray(values) || !values.length) {
+      throw new Error('Gemini embed response missing embedding.values');
+    }
+
+    // Required when outputDimensionality < 3072 (Google docs).
+    const vector = l2Normalize(values);
+    lastOk = true;
+    return vector;
   } catch (err) {
-    log.warn('Embedding failed — semantic search will fall back to lexical-only', { error: err.message });
+    lastOk = false;
+    log.warn('Embedding failed — semantic search will fall back to lexical-only', {
+      model,
+      error: err.message,
+    });
     return null;
   }
 }
 
-/** Embeds a batch sequentially — small volumes (catalog writes), no need for GPU batching. */
+/**
+ * Query-side embed (same model/dims; taskType differs for retrieval quality).
+ * Falls back to document embed if the API rejects the task type.
+ */
+export async function embedQuery(text) {
+  const clean = String(text || '').trim();
+  if (!clean) return null;
+
+  const apiKey = config.vector.embeddingApiKey;
+  if (!apiKey) return null;
+
+  const model = config.vector.embeddingModel;
+  const dimensions = config.vector.dimensions;
+
+  try {
+    const res = await fetch(`${EMBED_URL}/${encodeURIComponent(model)}:embedContent`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        model: `models/${model}`,
+        content: { parts: [{ text: clean.slice(0, 8000) }] },
+        outputDimensionality: dimensions,
+        taskType: 'RETRIEVAL_QUERY',
+      }),
+    });
+
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // Older keys / models may not accept taskType — fall back.
+      return embed(clean);
+    }
+
+    const values = body?.embedding?.values;
+    if (!Array.isArray(values) || !values.length) return embed(clean);
+
+    lastOk = true;
+    return l2Normalize(values);
+  } catch {
+    return embed(clean);
+  }
+}
+
+/** Embeds a batch sequentially — free-tier RPM is the limiter, not GPU. */
 export async function embedBatch(texts) {
   const results = [];
   for (const text of texts) results.push(await embed(text));
@@ -106,6 +165,7 @@ export async function embedBatch(texts) {
 
 export default {
   embed,
+  embedQuery,
   embedBatch,
   isEmbeddingConfigured,
   isEmbeddingModelReady,

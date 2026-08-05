@@ -152,8 +152,8 @@ async function start() {
     startJobWorkers();
     startAgentWorkers();
 
-    // ONNX embedding load is deferred until after HTTP is up — avoids blocking
-    // the healthcheck and skips re-embed when Qdrant already has the catalog.
+    // Check Qdrant after HTTP is up. If the tools collection is already full,
+    // this is a no-op (no ONNX load). Only an empty/underfilled store re-embeds.
     warmVectorIndex()
       .then(vector => {
         if (vector.configured === false) {
