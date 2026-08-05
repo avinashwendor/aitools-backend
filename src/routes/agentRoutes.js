@@ -45,7 +45,7 @@ import {
   createCredential,
   deleteCredential,
 } from '../controllers/agentController.js';
-import { authenticate } from '../middleware/auth.js';
+import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import {
   withCurrentPeriod,
@@ -69,6 +69,15 @@ router.all(
 
 router.use(authenticate);
 router.use(withCurrentPeriod);
+
+/**
+ * Agentic workflows are RND-only for now (task-sync + canvas-integrity issues
+ * still being worked out), so the whole feature is admin-gated at the API
+ * level too — the frontend hides every entry point, but that's UI-only, and
+ * this is the enforcement that actually matters. Drop this line when the
+ * feature is ready to ship to real users.
+ */
+router.use(requireAdmin);
 
 /**
  * The registry is readable by everyone signed in, including Hobby accounts.
