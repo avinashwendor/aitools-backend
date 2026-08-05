@@ -301,17 +301,52 @@ export const setRequirementCredential = asyncHandler(async (req, res) => {
 
 // ─── Architect ──────────────────────────────────────────────
 
+/**
+ * Messages from earlier architect sessions on this workflow.
+ *
+ * Each build is its own document, but follow-ups ("build it", "also send to
+ * Slack") should not start from zero — the prior goal, summary and turns are
+ * folded in so the model keeps what was already researched and decided.
+ */
+async function loadPriorMessages(workflowId, { excludeBuildId } = {}) {
+  const query = {
+    workflow: workflowId,
+    status: { $in: ['succeeded', 'failed', 'canceled'] },
+  };
+  if (excludeBuildId) query._id = { $ne: excludeBuildId };
+
+  const priorBuilds = await AgentBuild.find(query)
+    .sort({ createdAt: -1 })
+    .limit(4)
+    .select('messages goal summary');
+
+  const merged = [];
+  for (const prior of priorBuilds.reverse()) {
+    if (prior.messages?.length) {
+      for (const message of prior.messages) merged.push(message);
+      continue;
+    }
+    if (prior.goal) merged.push({ role: 'user', content: prior.goal });
+    if (prior.summary) merged.push({ role: 'assistant', content: prior.summary });
+  }
+
+  return merged.slice(-20);
+}
+
 /** Create the build document and hand it to a worker. Shared by three routes. */
 async function startBuildFor({ workflow, user, message, intent }) {
+  const priorMessages = await loadPriorMessages(workflow._id);
+  const messages = [
+    ...priorMessages,
+    { role: 'user', content: message.slice(0, 8000) },
+  ];
+
   const build = await AgentBuild.create({
     workflow: workflow._id,
     user: user._id,
     intent,
     goal: message.slice(0, 4000),
-    // Prior turns come from earlier builds on this workflow, so a follow-up
-    // ("also send it to Slack") knows what was already decided rather than
-    // re-deriving the whole design from the graph.
-    messages: [{ role: 'user', content: message.slice(0, 8000) }],
+    messages,
   });
 
   await enqueueBuild({ buildId: build._id, userId: user._id });
@@ -443,6 +478,61 @@ export const getBuild = asyncHandler(async (req, res) => {
   const build = await AgentBuild.findOne({ _id: req.params.buildId, user: req.user._id });
   if (!build) return res.status(404).json({ success: false, message: 'Build not found.' });
   res.json({ success: true, data: build.toJSONSafe() });
+});
+
+/**
+ * Resume a finished architect session in place.
+ *
+ * Follow-ups belong on the same timeline — opening a fresh build for "build it"
+ * after a planning pass throws away the plan the user was just watching and
+ * makes the session list look like amnesia.
+ */
+export const continueBuild = asyncHandler(async (req, res) => {
+  const build = await AgentBuild.findOne({ _id: req.params.buildId, user: req.user._id });
+  if (!build) return res.status(404).json({ success: false, message: 'Build not found.' });
+
+  if (!['succeeded', 'failed', 'canceled'].includes(build.status)) {
+    return res.status(400).json({ success: false, message: 'That session is still running.' });
+  }
+
+  if (!isLLMAvailable()) {
+    return res.status(503).json({
+      success: false,
+      code: 'AI_DISABLED',
+      message: 'The architect needs an AI provider, and none is configured on this server.',
+    });
+  }
+
+  const concurrency = config.agentic.architectConcurrency;
+  if (activeBuildCount(req.user._id) >= concurrency) {
+    return res.status(429).json({
+      success: false,
+      code: 'TOO_MANY_BUILDS',
+      message: `You already have ${concurrency} architect session${concurrency === 1 ? '' : 's'} running.`,
+    });
+  }
+
+  const message = String(req.body.message || '').trim();
+  if (!message) {
+    return res.status(400).json({ success: false, message: 'Tell the architect what to do next.' });
+  }
+
+  const workflow = await AgentWorkflow.findOne({ _id: build.workflow, user: req.user._id });
+  if (!workflow) return res.status(404).json({ success: false, message: 'Workflow not found.' });
+
+  build.messages.push({ role: 'user', content: message.slice(0, 8000), at: new Date() });
+  build.status = 'queued';
+  build.error = null;
+  build.finishedAt = null;
+  if (workflow.graph.nodes.length > 1) build.intent = 'edit';
+  await build.save();
+
+  await enqueueBuild({ buildId: build._id, userId: req.user._id });
+
+  res.status(202).json({
+    success: true,
+    data: { buildId: String(build._id), status: 'queued', continued: true },
+  });
 });
 
 export const cancelBuildHandler = asyncHandler(async (req, res) => {
@@ -829,6 +919,7 @@ export default {
   deleteWorkflow,
   setRequirementCredential,
   startBuild,
+  continueBuild,
   repairWorkflow,
   listBuilds,
   getBuild,

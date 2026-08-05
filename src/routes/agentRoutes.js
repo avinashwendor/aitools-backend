@@ -28,6 +28,7 @@ import {
   deleteWorkflow,
   setRequirementCredential,
   startBuild,
+  continueBuild,
   repairWorkflow,
   listBuilds,
   getBuild,
@@ -113,6 +114,14 @@ router.delete('/credentials/:credentialId', [param('credentialId').isMongoId()],
 router.get('/builds/:buildId', [param('buildId').isMongoId()], validate, getBuild);
 router.get('/builds/:buildId/stream', [param('buildId').isMongoId()], validate, streamBuild);
 router.post('/builds/:buildId/cancel', [param('buildId').isMongoId()], validate, cancelBuildHandler);
+router.post(
+  '/builds/:buildId/continue',
+  aiLimiter,
+  requireCredits('agent.build'),
+  [param('buildId').isMongoId(), body('message').trim().notEmpty().isLength({ max: 4000 })],
+  validate,
+  continueBuild
+);
 
 // ─── Runs (addressed by run id, not workflow id) ────────────
 router.get('/runs/:runId', [param('runId').isMongoId()], validate, getRun);

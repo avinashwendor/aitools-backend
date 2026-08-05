@@ -86,6 +86,35 @@ export function activeBuildCount(userId) {
 }
 
 /**
+ * When a build is resumed, the in-memory session flags must match what already
+ * happened on the timeline — otherwise a continued session replans from scratch
+ * or hits the research cap again despite having already read the docs.
+ */
+function restoreSessionState(state, timeline) {
+  if (!timeline?.length) return;
+
+  for (const event of timeline) {
+    if (event.type === 'plan') {
+      state.planRecorded = true;
+      if (event.meta?.plan?.length) state.plan = event.meta.plan;
+    }
+    if (event.type === 'graph') state.graphEdited = true;
+    if (event.type === 'test' && event.ok !== false && event.meta?.nodeId) {
+      if (!state.tested.includes(event.meta.nodeId)) state.tested.push(event.meta.nodeId);
+    }
+  }
+
+  if (!state.graphEdited) {
+    let research = 0;
+    for (const event of timeline) {
+      if (['search', 'read', 'catalog'].includes(event.type)) research += 1;
+      if (event.type === 'graph') break;
+    }
+    state.researchBeforeBuild = research;
+  }
+}
+
+/**
  * Run one architect session against a workflow.
  *
  * The build document is created by the caller in `queued` state, exactly like a
@@ -167,6 +196,8 @@ async function buildInner({ build, workflow, user, controller, usage }) {
      */
     refusals: 0,
   };
+
+  restoreSessionState(state, build.timeline);
 
   const emit = async event => {
     const entry = {
