@@ -390,10 +390,6 @@ async function buildInner({ build, workflow, user, controller, usage }) {
   const succeeded = Boolean(
     state.handedOver && outcome?.finished && !error && !canceled && !awaitingClarification
   );
-  const endCheck = validateGraph(state.graph, {
-    mode: 'architect',
-    requirements: [],
-  });
   // Keep any graph that gained action nodes — continue can fix validation.
   // Rolling back on step-budget / prose-exit was wiping real progress (HN fetch
   // chains) and stranding the user on a blank manual trigger.

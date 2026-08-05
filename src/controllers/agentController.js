@@ -687,8 +687,13 @@ export const cancelBuildHandler = asyncHandler(async (req, res) => {
 
   const stopped = cancelBuild(build._id);
 
-  if (!stopped && build.status === 'queued') {
+  // Always clear terminal state for queued/running — after a deploy the in-process
+  // abort map is empty, so Stop would otherwise leave the UI spinning forever.
+  if (['queued', 'running'].includes(build.status)) {
     build.status = 'canceled';
+    build.error = stopped
+      ? null
+      : 'The architect session was stopped (worker was no longer running this build).';
     build.finishedAt = new Date();
     await build.save();
   }

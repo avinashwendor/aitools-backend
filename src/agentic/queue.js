@@ -208,8 +208,12 @@ export async function sweepStaleBuilds() {
   const cutoff = new Date(Date.now() - 15 * 60_000);
   const result = await AgentBuild.updateMany(
     {
-      status: 'running',
-      startedAt: { $lt: cutoff },
+      status: { $in: ['running', 'queued'] },
+      $or: [
+        { startedAt: { $lt: cutoff } },
+        { startedAt: null, updatedAt: { $lt: cutoff } },
+        { createdAt: { $lt: cutoff }, status: 'queued' },
+      ],
     },
     {
       $set: {
