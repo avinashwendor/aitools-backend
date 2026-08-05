@@ -584,6 +584,23 @@ export const continueBuild = asyncHandler(async (req, res) => {
   const build = await AgentBuild.findOne({ _id: req.params.buildId, user: req.user._id });
   if (!build) return res.status(404).json({ success: false, message: 'Build not found.' });
 
+  // A build left `queued` with no worker pickup (e.g. duplicate BullMQ jobId
+  // before the unique-id fix) must be re-enqueued, not rejected as "still running".
+  if (build.status === 'queued') {
+    if (!isLLMAvailable()) {
+      return res.status(503).json({
+        success: false,
+        code: 'AI_DISABLED',
+        message: 'The architect needs an AI provider, and none is configured on this server.',
+      });
+    }
+    await enqueueBuild({ buildId: build._id, userId: req.user._id });
+    return res.status(202).json({
+      success: true,
+      data: { buildId: String(build._id), status: 'queued', continued: true, requeued: true },
+    });
+  }
+
   if (!['succeeded', 'failed', 'canceled', 'awaiting_clarification'].includes(build.status)) {
     return res.status(400).json({ success: false, message: 'That session is still running.' });
   }
