@@ -187,6 +187,32 @@ async function markBuildCrashed(buildId, message) {
   ).catch(() => {});
 }
 
+/**
+ * Builds left in `running` after a worker crash or deploy never finish on their
+ * own — executeBuild refuses anything that isn't queued. Fail them after 15
+ * minutes so the user can start again.
+ */
+export async function sweepStaleBuilds() {
+  const cutoff = new Date(Date.now() - 15 * 60_000);
+  const result = await AgentBuild.updateMany(
+    {
+      status: 'running',
+      startedAt: { $lt: cutoff },
+    },
+    {
+      $set: {
+        status: 'failed',
+        error: 'The architect session timed out. Ask it to continue or rebuild.',
+        finishedAt: new Date(),
+      },
+    }
+  );
+  if (result.modifiedCount) {
+    log.warn('Marked stale architect builds as failed', { count: result.modifiedCount });
+  }
+  return result.modifiedCount;
+}
+
 // ─── Scheduler ──────────────────────────────────────────────
 
 /**
@@ -240,6 +266,10 @@ export function computeNextRun(schedule, from = new Date()) {
  * exactly the conditions you'd never see in testing.
  */
 export async function sweepSchedules() {
+  await sweepStaleBuilds().catch(err =>
+    log.warn('Stale build sweep failed', { error: err.message })
+  );
+
   const now = new Date();
 
   const due = await AgentWorkflow.find({
@@ -398,6 +428,7 @@ export default {
   enqueueRun,
   enqueueBuild,
   sweepSchedules,
+  sweepStaleBuilds,
   computeNextRun,
   startAgentWorkers,
   stopAgentWorkers,

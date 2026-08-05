@@ -218,6 +218,36 @@ describe('graph validation', () => {
     assert.match(result.warnings.join(' '), /won’t run/);
   });
 
+  test('architect mode promotes orphans to errors and softens credentials', () => {
+    const orphaned = {
+      nodes: [...valid.nodes, node('lost', 'core.template', { value: 'x' })],
+      edges: valid.edges,
+    };
+    const result = validateGraph(orphaned, { mode: 'architect' });
+    assert.match(result.errors.join(' '), /won’t run/);
+
+    const requirements = [{ key: 'notion_token', label: 'Notion token', credentialId: null }];
+    const creds = validateGraph(valid, { mode: 'architect', requirements });
+    assert.deepEqual(creds.errors, []);
+    assert.match(creds.warnings.join(' '), /Notion token/);
+  });
+
+  test('architect mode allows empty userSupplied email To as a warning', () => {
+    const withEmail = {
+      nodes: [
+        node('t', 'trigger.manual'),
+        node('m', 'core.email', { subject: 'Hi', body: 'Body' }),
+      ],
+      edges: [edge('t', 'm')],
+    };
+    const runMode = validateGraph(withEmail);
+    assert.match(runMode.errors.join(' '), /missing To/i);
+
+    const arch = validateGraph(withEmail, { mode: 'architect' });
+    assert.ok(!arch.errors.some(e => /missing To/i.test(e)));
+    assert.match(arch.warnings.join(' '), /To/);
+  });
+
   /**
    * The architect declares what secrets a workflow needs; the user supplies
    * them afterwards. Until they do, pressing Run has to fail here rather than
@@ -306,6 +336,29 @@ describe('graph operations', () => {
     assert.equal(graph.nodes.length, 2);
     assert.equal(graph.edges.length, 1);
     assert.equal(graph.nodes[1].data.values.url, 'https://x.dev');
+  });
+
+  test('refuses a second trigger instead of stacking them', () => {
+    const { graph, rejected } = applyOperations(base, [
+      { op: 'addNode', id: 's1', type: 'trigger.schedule', values: { atHour: '8' } },
+    ]);
+    assert.equal(rejected.length, 1);
+    assert.match(rejected[0], /Only one trigger/);
+    assert.equal(graph.nodes.length, 1);
+  });
+
+  test('describeGraph surfaces orphan diagnostics', () => {
+    const graph = {
+      nodes: [
+        node('t', 'trigger.manual'),
+        node('h', 'core.http', { url: 'https://x.dev' }),
+        node('lost', 'core.template', { value: 'x' }),
+      ],
+      edges: [edge('t', 'h')],
+    };
+    const text = describeGraph(graph);
+    assert.match(text, /ORPHANS/);
+    assert.match(text, /lost/);
   });
 
   test('an edit preserves untouched nodes and their positions', () => {

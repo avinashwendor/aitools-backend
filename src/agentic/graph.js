@@ -103,9 +103,19 @@ export function findOrphans(nodes, edges) {
  * and failing at save time is far cheaper than failing nine steps into a run
  * that has already opened a browser and spent credits.
  */
-export function validateGraph({ nodes = [], edges = [] } = {}, { requirements = [] } = {}) {
+/**
+ * @param {object} graph
+ * @param {object} [opts]
+ * @param {Array}  [opts.requirements]
+ * @param {'run'|'architect'} [opts.mode]
+ *   `architect` — orphans are errors (handover must be clean); unfilled
+ *   credentials and `userSupplied` fields are warnings (user fills them after).
+ *   `run` — credentials / required fields block execution; orphans stay warnings.
+ */
+export function validateGraph({ nodes = [], edges = [] } = {}, { requirements = [], mode = 'run' } = {}) {
   const errors = [];
   const warnings = [];
+  const architect = mode === 'architect';
 
   if (!nodes.length) {
     return { errors: ['Add a trigger to get started.'], warnings: [] };
@@ -114,7 +124,12 @@ export function validateGraph({ nodes = [], edges = [] } = {}, { requirements = 
   const triggers = nodes.filter(n => getNodeDef(n.type)?.kind === 'trigger');
   if (triggers.length === 0) errors.push('This workflow needs a trigger.');
   if (triggers.length > 1) {
-    errors.push(`Only one trigger is allowed — found ${triggers.length}.`);
+    errors.push(
+      `Only one trigger is allowed — found ${triggers.length}` +
+        (architect
+          ? ` (${triggers.map(t => t.id).join(', ')}). Delete the extras with deleteNode.`
+          : '.')
+    );
   }
 
   const ids = new Set();
@@ -140,6 +155,12 @@ export function validateGraph({ nodes = [], edges = [] } = {}, { requirements = 
       if (!field.required) continue;
       const value = node.data?.values?.[field.key];
       if (value === undefined || value === null || String(value).trim() === '') {
+        // Delivery addresses and similar are filled by the user after the build.
+        // Blocking finish on them forces the architect to invent a fake email.
+        if (architect && field.userSupplied) {
+          warnings.push(`Before running: set ${field.label} on “${label}”.`);
+          continue;
+        }
         errors.push(`“${label}” is missing ${field.label}.`);
       }
     }
@@ -191,21 +212,23 @@ export function validateGraph({ nodes = [], edges = [] } = {}, { requirements = 
 
   const orphans = findOrphans(nodes, edges);
   if (orphans.length) {
-    warnings.push(
-      `${orphans.length} node${orphans.length === 1 ? '' : 's'} won’t run — nothing connects ${
-        orphans.length === 1 ? 'it' : 'them'
-      } to the trigger.`
-    );
+    const idsList = orphans.map(n => n.id).slice(0, 12).join(', ');
+    const more = orphans.length > 12 ? ` (+${orphans.length - 12} more)` : '';
+    const msg =
+      `${orphans.length} node${orphans.length === 1 ? '' : 's'} won’t run — nothing connects ` +
+      `${orphans.length === 1 ? 'it' : 'them'} to the trigger` +
+      (architect ? `: ${idsList}${more}. Connect them or deleteNode the orphans.` : '.');
+    if (architect) errors.push(msg);
+    else warnings.push(msg);
   }
 
-  // An unfilled credential is an error, not a warning. It is the single most
-  // common reason a freshly built workflow fails, it fails late (after other
-  // steps have already spent credits), and it fails as a 401 body that reads
-  // like data rather than as an error — so catching it here is worth the
-  // slightly aggressive gate.
+  // Credentials: required for runs, not for architect handover — the user
+  // attaches keys after the graph is built, by design.
   for (const requirement of requirements) {
     if (!requirement.credentialId) {
-      errors.push(`Add your ${requirement.label || requirement.key} before running this.`);
+      const msg = `Add your ${requirement.label || requirement.key} before running this.`;
+      if (architect) warnings.push(msg);
+      else errors.push(msg);
     }
   }
 

@@ -24,8 +24,9 @@
  */
 
 import { getNodeDef, isKnownType } from './registry.js';
-import { suggestNodeId } from './graph.js';
+import { suggestNodeId, findOrphans, validateGraph } from './graph.js';
 import { safeMessage } from './safety.js';
+import config from '../config/index.js';
 
 export const OPS = ['addNode', 'updateNode', 'deleteNode', 'connect', 'disconnect', 'rename'];
 
@@ -45,6 +46,7 @@ export function applyOperations(graph, operations = []) {
   const rejected = [];
   const applied = [];
   let name = null;
+  const maxNodes = config.agentic?.maxNodes || 60;
 
   const findNode = id => nodes.find(n => n.id === id);
 
@@ -61,7 +63,24 @@ export function applyOperations(graph, operations = []) {
             rejected.push(`"${op.type}" isn’t an available node type.`);
             break;
           }
+          if (nodes.length >= maxNodes) {
+            rejected.push(
+              `A workflow can have at most ${maxNodes} nodes. Delete orphans before adding more.`
+            );
+            break;
+          }
           const def = getNodeDef(op.type);
+
+          if (def.kind === 'trigger') {
+            const existing = nodes.find(n => getNodeDef(n.type)?.kind === 'trigger');
+            if (existing) {
+              rejected.push(
+                `Only one trigger is allowed — "${existing.id}" already exists. ` +
+                `Update or delete it instead of adding another ${op.type}.`
+              );
+              break;
+            }
+          }
 
           // Honour the model's id when it's usable, and generate one when it is
           // missing or already taken — a collision would silently shadow an
@@ -213,7 +232,34 @@ export function describeGraph(graph) {
         .join('\n')
     : '  (none)';
 
-  return `NODES:\n${nodes}\n\nCONNECTIONS:\n${edges}`;
+  const triggers = graph.nodes.filter(n => getNodeDef(n.type)?.kind === 'trigger');
+  const orphans = findOrphans(graph.nodes, graph.edges);
+  const diagnostics = [];
+  if (triggers.length !== 1) {
+    diagnostics.push(
+      `TRIGGERS: ${triggers.length} (${triggers.map(t => t.id).join(', ') || 'none'}) — must be exactly 1`
+    );
+  }
+  if (orphans.length) {
+    diagnostics.push(
+      `ORPHANS (${orphans.length}): ${orphans.map(n => n.id).slice(0, 20).join(', ')}` +
+        (orphans.length > 20 ? '…' : '') +
+        ' — connect or deleteNode'
+    );
+  }
+
+  const check = validateGraph(graph, { mode: 'architect', requirements: [] });
+  if (check.errors.length) {
+    diagnostics.push(`ERRORS:\n${check.errors.map(e => `  - ${e}`).join('\n')}`);
+  }
+  if (check.warnings.length) {
+    diagnostics.push(`WARNINGS:\n${check.warnings.map(w => `  - ${w}`).join('\n')}`);
+  }
+
+  return (
+    `NODES:\n${nodes}\n\nCONNECTIONS:\n${edges}` +
+    (diagnostics.length ? `\n\nDIAGNOSTICS:\n${diagnostics.join('\n')}` : '')
+  );
 }
 
 export default { applyOperations, describeGraph, OPS };

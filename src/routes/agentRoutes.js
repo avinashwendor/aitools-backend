@@ -26,6 +26,7 @@ import {
   getWorkflow,
   updateWorkflow,
   deleteWorkflow,
+  resetWorkflowGraph,
   setRequirementCredential,
   startBuild,
   continueBuild,
@@ -174,6 +175,7 @@ router.patch(
 );
 
 router.delete('/:id', [param('id').isMongoId()], validate, deleteWorkflow);
+router.post('/:id/reset', [param('id').isMongoId()], validate, resetWorkflowGraph);
 
 router.put(
   '/:id/requirements/:key',

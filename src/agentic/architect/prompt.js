@@ -224,9 +224,20 @@ credential rather than a bug, say so instead of editing around it.`
     : intent === 'edit'
       ? `This workflow already exists. Change what the user asked about and leave the
 rest alone. Reusing an existing node is always better than adding a second one
-that does the same thing.`
+that does the same thing.
+
+On an edit session you MUST NOT stack duplicate triggers or parallel copies of
+fetch/summarise/email steps. If the graph already has nodes, update and connect
+them — use deleteNode to remove orphans before adding replacements. Never call
+addNode for a trigger when one already exists.`
       : `This workflow is new. Build it end to end — trigger, steps, and delivery.
-You cannot finish with only a plan or research notes; edit_graph must add real nodes.`
+You cannot finish with only a plan or research notes; edit_graph must add real nodes.
+
+Build ONE linear chain. Do not add a second trigger, a second fetch, or a second
+email "just in case". If edit_graph returns DIAGNOSTICS listing orphans or extra
+triggers, deleteNode them before adding anything else. Prefer the fewest nodes
+that do the job:
+  trigger.schedule → (optional weekday skip code) → fetch → transform/llm → deliver.`
 }
 
 You must end by calling \`finish\`.`;

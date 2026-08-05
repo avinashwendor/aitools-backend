@@ -595,6 +595,7 @@ export const NODE_REGISTRY = {
     fields: [
       T.text('to', 'To', {
         required: true,
+        userSupplied: true,
         placeholder: 'you@example.com',
         help: 'Sent through the server mail integration — no API key field on this node.',
       }),

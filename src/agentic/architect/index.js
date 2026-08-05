@@ -41,7 +41,7 @@ import { webSearch, searchDocs, isWebSearchConfigured } from '../../ai/tools/web
 import { fetchPage } from '../../ai/tools/fetchPage.js';
 import { search as searchCatalog } from '../../ai/retriever.js';
 import { getNodeDef, isTestable, NODE_LIST } from '../registry.js';
-import { validateGraph } from '../graph.js';
+import { validateGraph, findOrphans } from '../graph.js';
 import { applyOperations, describeGraph } from '../operations.js';
 import { getExecutor } from '../executors.js';
 import { resolveValues } from '../interpolate.js';
@@ -129,6 +129,21 @@ function restoreSessionState(state, timeline) {
 export async function executeBuild({ buildId, user }) {
   const build = await AgentBuild.findById(buildId);
   if (!build) throw new Error(`Build ${buildId} not found`);
+
+  // Recover builds that were left `running` after a worker crash — otherwise
+  // they can never be re-queued and the workflow is stuck forever.
+  const STALE_MS = 15 * 60_000;
+  if (
+    build.status === 'running' &&
+    build.startedAt &&
+    Date.now() - new Date(build.startedAt).getTime() > STALE_MS
+  ) {
+    build.status = 'queued';
+    build.error = null;
+    await build.save();
+    log.warn('Re-queued a stale running build', { buildId });
+  }
+
   if (build.status !== 'queued') {
     log.warn('Refusing to execute a build that is not queued', { buildId, status: build.status });
     return build;
@@ -162,26 +177,47 @@ async function buildInner({ build, workflow, user, controller, usage }) {
   await build.save();
 
   /**
+   * Snapshot at session start. If the build fails or is canceled without a
+   * successful `finish`, we restore this graph so a half-built mess of duplicate
+   * triggers and orphans never becomes the lasting canvas.
+   */
+  const sessionStartGraph = {
+    nodes: workflow.graph.nodes.map(n => {
+      const plain = n.toObject?.() ?? n;
+      return {
+        ...plain,
+        data: { ...plain.data, values: { ...(plain.data?.values || {}) } },
+      };
+    }),
+    edges: workflow.graph.edges.map(e => (e.toObject?.() ?? e)),
+  };
+  const sessionStartName = workflow.name;
+  const sessionStartRequirements = (workflow.requirements || []).map(r => r.toObject?.() ?? r);
+
+  /**
    * Everything the architect is allowed to change, held in memory and flushed
    * to Mongo after each mutation. Kept as one object so a tool handler never
    * has to know whether it is looking at the saved copy or the working copy.
    */
   const state = {
     graph: {
-      nodes: workflow.graph.nodes.map(n => n.toObject?.() ?? n),
-      edges: workflow.graph.edges.map(e => e.toObject?.() ?? e),
+      nodes: sessionStartGraph.nodes.map(n => ({
+        ...n,
+        data: { ...n.data, values: { ...n.data?.values } },
+      })),
+      edges: [...sessionStartGraph.edges],
     },
-    name: workflow.name,
+    name: sessionStartName,
     plan: [],
     sources: [],
-    requirements: (workflow.requirements || []).map(r => r.toObject?.() ?? r),
+    requirements: sessionStartRequirements.map(r => ({ ...r })),
     /** Outputs of steps `test_step` has run, so a later test can reference them. */
     testScope: { trigger: {} },
     /** Node ids that were executed and worked — the build's evidence. */
     tested: [],
     /** Set after the first successful plan call — further plan calls are refused. */
     planRecorded: false,
-    /** Set after the first edit_graph call. */
+    /** Set after the first successful edit_graph application. */
     graphEdited: false,
     /** find_api_docs + search_web + read_url calls before the first edit_graph. */
     researchBeforeBuild: 0,
@@ -196,6 +232,8 @@ async function buildInner({ build, workflow, user, controller, usage }) {
      * summary and let the build through.
      */
     refusals: 0,
+    /** Set true only when finish() succeeds — controls whether we keep the graph. */
+    handedOver: false,
   };
 
   restoreSessionState(state, build.timeline);
@@ -235,12 +273,28 @@ async function buildInner({ build, workflow, user, controller, usage }) {
     workflow.version += 1;
     workflow.requirements = state.requirements;
     workflow.validation = {
-      ...validateGraph(state.graph, { requirements: state.requirements }),
+      ...validateGraph(state.graph, {
+        requirements: state.requirements,
+        mode: 'architect',
+      }),
       checkedAt: new Date(),
     };
     syncWorkflowSchedule(workflow, { enableWhenPresent: true });
     await workflow.save();
     publish(build._id, { type: 'build.graph', workflow: workflow.toEditorJSON() });
+  };
+
+  const restoreSessionStart = async () => {
+    state.graph = {
+      nodes: sessionStartGraph.nodes.map(n => ({
+        ...n,
+        data: { ...n.data, values: { ...n.data?.values } },
+      })),
+      edges: [...sessionStartGraph.edges],
+    };
+    state.name = sessionStartName;
+    state.requirements = sessionStartRequirements.map(r => ({ ...r }));
+    await flushGraph();
   };
 
   const searchable = isWebSearchConfigured();
@@ -293,6 +347,14 @@ async function buildInner({ build, workflow, user, controller, usage }) {
             `summarise, and deliver. Do not call plan or read more docs.`
           );
         }
+        const check = validateGraph(state.graph, { mode: 'architect', requirements: [] });
+        if (check.errors.length) {
+          return (
+            `[Budget: ${remaining} model call${remaining === 1 ? '' : 's'} left.] ` +
+            `The graph is still invalid (${check.errors[0]}). Fix with edit_graph — deleteNode ` +
+            `orphans and extra triggers — then finish.`
+          );
+        }
         return null;
       },
     });
@@ -301,18 +363,34 @@ async function buildInner({ build, workflow, user, controller, usage }) {
     log.error('Architect failed', { buildId: String(build._id), error: err.message });
   }
 
-  // The plan, sources and summary belong on the workflow, not just on the
-  // build: they stay true after this session is forgotten, and they are what
-  // answers "why does this call that endpoint?" six weeks from now.
-  workflow.blueprint = {
-    goal: build.goal.slice(0, 4000),
-    summary: safeMessage(outcome?.result?.summary || '', 4000),
-    plan: state.plan,
-    sources: state.sources,
-    builtAt: new Date(),
-  };
-  if (!workflow.composedFrom) workflow.composedFrom = build.goal.slice(0, 2000);
-  await flushGraph().catch(err => log.warn('Final graph flush failed', { error: err.message }));
+  const canceled = signal.aborted;
+  const succeeded = Boolean(outcome?.finished && !error && !canceled);
+  const endCheck = validateGraph(state.graph, {
+    mode: 'architect',
+    requirements: [],
+  });
+  // Keep a valid partial graph (continue can finish it). Roll back only when the
+  // session ended with structural damage — multi-trigger, orphans, etc.
+  const keepGraph =
+    succeeded ||
+    state.handedOver ||
+    (endCheck.errors.length === 0 && actionNodeCount(state.graph) > 0);
+
+  if (keepGraph) {
+    workflow.blueprint = {
+      goal: build.goal.slice(0, 4000),
+      summary: safeMessage(outcome?.result?.summary || '', 4000),
+      plan: state.plan,
+      sources: state.sources,
+      builtAt: new Date(),
+    };
+    if (!workflow.composedFrom) workflow.composedFrom = build.goal.slice(0, 2000);
+    await flushGraph().catch(err => log.warn('Final graph flush failed', { error: err.message }));
+  } else if (state.graphEdited) {
+    await restoreSessionStart().catch(err =>
+      log.warn('Could not restore pre-build graph', { error: err.message })
+    );
+  }
 
   await finishBuild({
     build,
@@ -327,7 +405,7 @@ async function buildInner({ build, workflow, user, controller, usage }) {
       (outcome && !outcome.finished
         ? 'The architect ran out of steps before it finished. Ask it to continue.'
         : null),
-    canceled: signal.aborted,
+    canceled,
   });
 
   return build;
@@ -798,12 +876,25 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     },
     required: ['operations'],
     run: async ({ operations }) => {
-      state.graphEdited = true;
+      const beforeOrphans = findOrphans(state.graph.nodes, state.graph.edges).length;
+      const beforeTriggers = state.graph.nodes.filter(
+        n => getNodeDef(n.type)?.kind === 'trigger'
+      ).length;
+
       const result = applyOperations(state.graph, operations || []);
+      if (result.applied.length) state.graphEdited = true;
       state.graph = result.graph;
       if (result.name) state.name = result.name;
 
-      const validation = validateGraph(state.graph, { requirements: state.requirements });
+      const validation = validateGraph(state.graph, {
+        requirements: state.requirements,
+        mode: 'architect',
+      });
+
+      const afterOrphans = findOrphans(state.graph.nodes, state.graph.edges).length;
+      const afterTriggers = state.graph.nodes.filter(
+        n => getNodeDef(n.type)?.kind === 'trigger'
+      ).length;
 
       await emit({
         type: 'graph',
@@ -814,11 +905,26 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
         detail: result.applied
           .map(op => (op.id ? `${op.op} ${op.id}` : `${op.op} ${op.from ?? ''}→${op.to ?? ''}`))
           .join(', '),
-        ok: result.rejected.length === 0,
+        ok: result.rejected.length === 0 && validation.errors.length === 0,
         meta: { applied: result.applied, rejected: result.rejected, errors: validation.errors },
       });
 
-      await flushGraph();
+      // Flush live so the canvas updates; terminal failure may roll back later.
+      if (result.applied.length) await flushGraph();
+
+      let hint = null;
+      if (afterTriggers > 1 || (afterTriggers > beforeTriggers && beforeTriggers >= 1)) {
+        hint =
+          'You added a second trigger. Delete every extra trigger with deleteNode — exactly one allowed.';
+      } else if (afterOrphans > beforeOrphans) {
+        hint =
+          `Orphan count rose from ${beforeOrphans} to ${afterOrphans}. ` +
+          'Connect new nodes to the existing chain or deleteNode them before adding more.';
+      } else if (validation.errors.some(error => error.includes('Only one trigger'))) {
+        hint = 'Delete every extra trigger with deleteNode before adding another. One trigger only.';
+      } else if (validation.errors.some(e => e.includes("won't run") || e.includes('won’t run'))) {
+        hint = 'Disconnected nodes remain — connect them or deleteNode the orphans before adding more.';
+      }
 
       return {
         applied: result.applied,
@@ -826,6 +932,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
         errors: validation.errors,
         warnings: validation.warnings,
         graph: describeGraph(state.graph),
+        hint,
       };
     },
   });
@@ -988,9 +1095,12 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
        * supplies those after the build, by design.
        */
 
-      // 1. Structural. Includes dead `{{ }}` references, which is what stops a
-      //    graph that runs green and delivers empty fields (see references.js).
-      const check = validateGraph(state.graph, { requirements: state.requirements });
+      // 1. Structural. Architect mode: orphans and multi-triggers block handover;
+      //    credentials and userSupplied fields (email To) are warnings only.
+      const check = validateGraph(state.graph, {
+        requirements: state.requirements,
+        mode: 'architect',
+      });
       if (check.errors.length) {
         await emit({
           type: 'test',
@@ -1002,7 +1112,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
         throw new Error(
           `The workflow is not valid yet, so it cannot be handed over:\n` +
           `${check.errors.map(problem => `- ${problem}`).join('\n')}\n\n` +
-          `Fix every one of these with edit_graph, then call finish again.`
+          `Fix every one of these with edit_graph (deleteNode orphans and extra triggers), then call finish again.`
         );
       }
 
@@ -1064,6 +1174,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
         state.name = safeMessage(name, 120);
         await flushGraph();
       }
+      state.handedOver = true;
       return {
         name: state.name,
         summary: safeMessage(summary, 4000),

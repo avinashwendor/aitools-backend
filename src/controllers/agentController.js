@@ -262,6 +262,56 @@ export const deleteWorkflow = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Workflow archived.' });
 });
 
+/**
+ * Wipe the canvas back to a single manual trigger and cancel any stuck build.
+ *
+ * Used when an architect session left a multi-trigger orphan mess that continue
+ * cannot reasonably repair — start clean, then rebuild.
+ */
+export const resetWorkflowGraph = asyncHandler(async (req, res) => {
+  const workflow = await ownedWorkflow(req, res);
+  if (!workflow) return;
+
+  const activeBuilds = await AgentBuild.find({
+    workflow: workflow._id,
+    status: { $in: ['queued', 'running'] },
+  });
+  for (const build of activeBuilds) {
+    cancelBuild(build._id);
+    build.status = 'canceled';
+    build.finishedAt = new Date();
+    build.error = 'Canceled because the workflow was reset.';
+    await build.save();
+  }
+
+  workflow.graph = {
+    nodes: [
+      {
+        id: 'manual_1',
+        type: 'trigger.manual',
+        position: { x: 280, y: 120 },
+        data: { title: 'Manual', values: {}, note: '' },
+      },
+    ],
+    edges: [],
+  };
+  workflow.version += 1;
+  workflow.schedule.enabled = false;
+  workflow.schedule.nextRunAt = null;
+  workflow.status = 'draft';
+  workflow.validation = { ...revalidate(workflow), checkedAt: new Date() };
+  workflow.blueprint = {
+    goal: '',
+    summary: '',
+    plan: [],
+    sources: [],
+    builtAt: null,
+  };
+  await workflow.save();
+
+  res.json({ success: true, data: workflow.toEditorJSON() });
+});
+
 // ─── Requirements ───────────────────────────────────────────
 
 /**
@@ -348,6 +398,19 @@ async function loadPriorMessages(workflowId, { excludeBuildId } = {}) {
 
 /** Create the build document and hand it to a worker. Shared by three routes. */
 async function startBuildFor({ workflow, user, message, intent }) {
+  const active = await AgentBuild.findOne({
+    workflow: workflow._id,
+    status: { $in: ['queued', 'running'] },
+  }).select('_id status');
+  if (active) {
+    const err = new Error(
+      'An architect session is already running on this workflow. Wait for it to finish or stop it.'
+    );
+    err.status = 409;
+    err.code = 'BUILD_IN_PROGRESS';
+    throw err;
+  }
+
   const priorMessages = await loadPriorMessages(workflow._id);
   const messages = [
     ...priorMessages,
@@ -395,7 +458,15 @@ export const startBuild = asyncHandler(async (req, res) => {
   // An existing graph with more than its seed trigger means this is an edit,
   // and the architect opens with different instructions for one.
   const intent = workflow.graph.nodes.length > 1 ? 'edit' : 'build';
-  const build = await startBuildFor({ workflow, user: req.user, message, intent });
+  let build;
+  try {
+    build = await startBuildFor({ workflow, user: req.user, message, intent });
+  } catch (err) {
+    if (err.code === 'BUILD_IN_PROGRESS') {
+      return res.status(409).json({ success: false, code: err.code, message: err.message });
+    }
+    throw err;
+  }
 
   res.status(202).json({
     success: true,
@@ -454,7 +525,16 @@ export const repairWorkflow = asyncHandler(async (req, res) => {
       .join('\n') || '  (none)') +
     `\n\nFind the real cause and fix it.`;
 
-  const build = await startBuildFor({ workflow, user: req.user, message, intent: 'repair' });
+  const build = await startBuildFor({ workflow, user: req.user, message, intent: 'repair' }).catch(
+    err => {
+      if (err.code === 'BUILD_IN_PROGRESS') {
+        res.status(409).json({ success: false, code: err.code, message: err.message });
+        return null;
+      }
+      throw err;
+    }
+  );
+  if (!build) return;
 
   res.status(202).json({ success: true, data: { buildId: String(build._id), status: 'queued' } });
 });
@@ -930,6 +1010,7 @@ export default {
   getWorkflow,
   updateWorkflow,
   deleteWorkflow,
+  resetWorkflowGraph,
   setRequirementCredential,
   startBuild,
   continueBuild,
