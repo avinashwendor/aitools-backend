@@ -70,22 +70,41 @@ function render(value) {
 /**
  * Substitute placeholders in one string.
  *
+ * `onMiss` is how a caller learns that a placeholder resolved to nothing.
+ * Rendering a miss as an empty string is still the right behaviour — a typo in
+ * one field should not kill a run that is nine steps deep and has already spent
+ * credits — but silently is the wrong way to do it. Without this, a workflow
+ * whose every reference is wrong reports a clean run and delivers blank
+ * results, which is the most expensive kind of failure because nobody looks for
+ * it. `references.js` catches these before the run; this catches the ones only
+ * the live data could reveal, like a field the API stopped returning.
+ *
+ * A placeholder that resolved to nothing but carried a `default:` filter is not
+ * a miss — supplying the fallback is the author saying they expect it empty.
+ *
  * @param {string} text
  * @param {object} scope  `{ [nodeId]: output, trigger: payload }`
+ * @param {(miss: {path: string}) => void} [onMiss]
  */
-export function interpolate(text, scope) {
+export function interpolate(text, scope, onMiss) {
   if (typeof text !== 'string' || !text.includes('{{')) return text;
 
   return text.replace(PLACEHOLDER, (_match, expression) => {
     const [pathPart, ...filterParts] = String(expression).split('|');
-    let value = getByPath(scope, pathPart.trim());
+    const path = pathPart.trim();
+    let value = getByPath(scope, path);
+    const resolvedToNothing = value === undefined || value === null || value === '';
+    let defaulted = false;
 
     for (const raw of filterParts) {
       const [name, ...argParts] = raw.trim().split(':');
       const filter = FILTERS[name.trim()];
       if (!filter) continue;
+      if (name.trim() === 'default') defaulted = true;
       value = filter(value, argParts.join(':').trim());
     }
+
+    if (resolvedToNothing && !defaulted) onMiss?.({ path });
 
     return render(value);
   });
@@ -98,12 +117,12 @@ export function interpolate(text, scope) {
  * decide which HTTP header gets set, which is a header-injection primitive
  * handed to whoever wrote the prompt.
  */
-export function interpolateDeep(value, scope) {
-  if (typeof value === 'string') return interpolate(value, scope);
-  if (Array.isArray(value)) return value.map(v => interpolateDeep(v, scope));
+export function interpolateDeep(value, scope, onMiss) {
+  if (typeof value === 'string') return interpolate(value, scope, onMiss);
+  if (Array.isArray(value)) return value.map(v => interpolateDeep(v, scope, onMiss));
   if (value && typeof value === 'object') {
     return Object.fromEntries(
-      Object.entries(value).map(([key, val]) => [key, interpolateDeep(val, scope)])
+      Object.entries(value).map(([key, val]) => [key, interpolateDeep(val, scope, onMiss)])
     );
   }
   return value;
@@ -129,13 +148,17 @@ export function referencedNodes(values = {}) {
  * works — the alternative (parse then substitute) can't produce a number or a
  * nested object from a placeholder, only a string.
  */
-export function resolveValues(values = {}, fields = [], scope = {}) {
+export function resolveValues(values = {}, fields = [], scope = {}, { onMiss } = {}) {
   const resolved = {};
   for (const field of fields) {
     const raw = values[field.key];
     if (raw === undefined) continue;
 
-    const substituted = interpolateDeep(raw, scope);
+    const substituted = interpolateDeep(
+      raw,
+      scope,
+      onMiss ? miss => onMiss({ ...miss, field: field.label || field.key }) : undefined
+    );
 
     if (field.type === 'json' && typeof substituted === 'string') {
       const text = substituted.trim();

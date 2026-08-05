@@ -168,7 +168,9 @@ export const NODE_REGISTRY = {
     group: 'Core',
     label: 'Code',
     description: 'Reshape data with JavaScript. Map, filter, pick fields, do maths.',
-    icon: 'Code2',
+    // `Code2` is lucide's deprecated alias for this; it still resolves, but
+    // aliases go away on majors and a missing icon degrades silently to a box.
+    icon: 'CodeXml',
     accent: '#0ea5e9',
     credits: 0,
     handles: { in: true, out: OUT },
@@ -225,7 +227,10 @@ export const NODE_REGISTRY = {
       ),
       T.text('right', 'Right', { placeholder: '200' }),
     ],
-    outputs: [{ path: 'result', label: 'Result (true/false)' }],
+    outputs: [
+      { path: 'result', label: 'Result (true/false)' },
+      { path: 'branch', label: 'Branch taken' },
+    ],
   },
 
   'core.delay': {
@@ -237,11 +242,155 @@ export const NODE_REGISTRY = {
     icon: 'Timer',
     accent: '#64748b',
     credits: 0,
+    testable: false,
+    /** Its whole job is to take time — the field caps it at 300s, plus slack. */
+    timeoutMs: 310_000,
     handles: { in: true, out: OUT },
     fields: [
       T.number('seconds', 'Seconds', { default: 5, required: true, max: 300 }),
     ],
     outputs: [{ path: 'waitedMs', label: 'Waited (ms)' }],
+  },
+
+  /*
+   * The pair that makes a workflow able to do a job more than once.
+   *
+   * They are two nodes rather than one because the boundary is the useful part:
+   * between them, values are per-iteration, and the only thing that leaves is
+   * what Collect gathered. Drawing that on the canvas is what stops someone
+   * wiring the fourth iteration's output into an email.
+   */
+  'core.forEach': {
+    type: 'core.forEach',
+    kind: 'action',
+    group: 'Core',
+    label: 'For Each',
+    description: 'Repeat the following steps once for every item in a list.',
+    icon: 'Repeat',
+    accent: '#f97316',
+    credits: 0,
+    /*
+     * Testable, and worth testing.
+     *
+     * Running the opener does not run the body — it resolves the list and
+     * counts it, which is exactly the question a loop gets wrong. `{{
+     * fetch.data.items }}` passes reference validation because `data` is a
+     * declared output, and then turns out to be an object, or a string, or a
+     * list nested one level deeper than assumed. That failure is invisible
+     * until a run, and free to catch here.
+     */
+    handles: { in: true, out: OUT },
+    fields: [
+      T.text('items', 'List', {
+        required: true,
+        placeholder: '{{ fetch.data.items }}',
+        help: 'A step output that is a list. Each entry becomes {{ each.item }} inside the loop.',
+      }),
+      T.number('maxItems', 'Stop after', {
+        default: 25,
+        max: 500,
+        help:
+          'Every item runs the whole loop body, and every step in it costs credits. This is ' +
+          'the ceiling that stops a feed with 4,000 entries from spending your month.',
+      }),
+      T.number('concurrency', 'At a time', {
+        default: 1,
+        max: 5,
+        help:
+          'One at a time is the safe default — most APIs rate-limit, and a loop is exactly ' +
+          'where you hit it. Raise it only for endpoints you know tolerate it.',
+      }),
+    ],
+    outputs: [
+      { path: 'item', label: 'Current item (as {{ each.item }})' },
+      { path: 'total', label: 'Items to process' },
+    ],
+  },
+
+  'core.collect': {
+    type: 'core.collect',
+    kind: 'action',
+    group: 'Core',
+    label: 'Collect',
+    description: 'End a loop and gather every iteration’s result into one list.',
+    icon: 'Layers',
+    accent: '#f97316',
+    credits: 0,
+    testable: false,
+    handles: { in: true, out: OUT },
+    fields: [
+      T.text('value', 'Keep from each pass', {
+        placeholder: '{{ summarise.text }}',
+        help:
+          'What to gather from one iteration. Leave empty to keep the whole output of the ' +
+          'step feeding this one.',
+      }),
+      T.boolean('skipEmpty', 'Drop empty results', {
+        default: true,
+        help: 'Iterations that produced nothing are left out of the list rather than padding it.',
+      }),
+    ],
+    outputs: [
+      { path: 'items', label: 'Gathered results' },
+      { path: 'count', label: 'How many' },
+      { path: 'failed', label: 'Iterations that failed' },
+    ],
+  },
+
+  /*
+   * The node that makes a schedule mean anything.
+   *
+   * A workflow that polls a source on a timer and has no memory re-delivers the
+   * same items on every tick — the same ten articles, every hour, forever.
+   * That is not a rough edge, it is the schedule trigger being useless for the
+   * thing schedules are for, and no amount of graph-building skill works around
+   * it because the missing piece is state, not structure.
+   */
+  'core.dedupe': {
+    type: 'core.dedupe',
+    kind: 'action',
+    group: 'Data',
+    label: 'Only New Items',
+    description: 'Filter a list down to the items this workflow has never seen before.',
+    icon: 'ListFilter',
+    accent: '#0ea5e9',
+    credits: 0,
+    handles: { in: true, out: OUT },
+    fields: [
+      T.text('items', 'List', {
+        required: true,
+        placeholder: '{{ rss_1.items }}',
+        help: 'The list to filter.',
+      }),
+      T.text('key', 'Identify each item by', {
+        required: true,
+        default: 'id',
+        placeholder: 'id',
+        help:
+          'A field on each item that is stable between runs — an id, a URL, a guid. Not a ' +
+          'title, which gets edited, and not a date, which is not unique.',
+      }),
+      T.select('scope', 'Remember for', ['this workflow', 'this step'], {
+        default: 'this workflow',
+        help: 'Two steps in the same workflow can share one memory, or keep their own.',
+      }),
+      T.number('rememberDays', 'Forget after (days)', {
+        default: 30,
+        max: 365,
+        help: 'An item not seen for this long counts as new again.',
+      }),
+      T.boolean('markOnly', 'Preview without remembering', {
+        default: false,
+        help:
+          'Report what is new but do not record it, so the next run sees the same items. For ' +
+          'testing a workflow without burning through the backlog.',
+      }),
+    ],
+    outputs: [
+      { path: 'items', label: 'New items only' },
+      { path: 'count', label: 'How many are new' },
+      { path: 'skipped', label: 'How many were already seen' },
+    ],
   },
 
   // ─── Intelligence ──────────────────────────────────────────
@@ -255,6 +404,12 @@ export const NODE_REGISTRY = {
     icon: 'Sparkles',
     accent: '#8b5cf6',
     credits: 4,
+    /**
+     * Above the provider's own agentic timeout, so a slow model call fails as
+     * "the model timed out" rather than as a node the runner killed first —
+     * which reads as our bug and hides theirs.
+     */
+    timeoutMs: 240_000,
     handles: { in: true, out: OUT },
     fields: [
       T.textarea('system', 'System prompt', {
@@ -276,6 +431,7 @@ export const NODE_REGISTRY = {
     outputs: [
       { path: 'text', label: 'Text' },
       { path: 'json', label: 'Parsed JSON (when enabled)' },
+      { path: 'model', label: 'Model that answered' },
     ],
   },
 
@@ -289,6 +445,14 @@ export const NODE_REGISTRY = {
     icon: 'Bot',
     accent: '#f43f5e',
     credits: 12,
+    testable: false,
+    /**
+     * A loop of up to forty model calls, each of which may read a page. No
+     * per-node ceiling that also protects an HTTP call could contain it, so
+     * this one is governed by the run's own deadline instead — and its loop
+     * already bounds itself by steps, which is the meaningful limit here.
+     */
+    timeoutMs: 0,
     handles: { in: true, out: OUT },
     fields: [
       T.textarea('goal', 'Goal', {
@@ -319,6 +483,7 @@ export const NODE_REGISTRY = {
       { path: 'data', label: 'Structured answer' },
       { path: 'steps', label: 'Steps taken' },
       { path: 'sources', label: 'URLs it used' },
+      { path: 'finishReason', label: 'Why it stopped' },
     ],
   },
 
@@ -417,6 +582,7 @@ export const NODE_REGISTRY = {
     icon: 'Mail',
     accent: '#14b8a6',
     credits: 2,
+    sideEffects: true,
     handles: { in: true, out: OUT },
     fields: [
       T.text('to', 'To', { required: true, placeholder: 'you@example.com' }),
@@ -435,6 +601,7 @@ export const NODE_REGISTRY = {
     icon: 'Hash',
     accent: '#4A154B',
     credits: 1,
+    sideEffects: true,
     handles: { in: true, out: OUT },
     fields: [
       T.text('webhookUrl', 'Webhook URL', {
@@ -460,6 +627,7 @@ export const NODE_REGISTRY = {
     icon: 'MessageSquare',
     accent: '#5865F2',
     credits: 1,
+    sideEffects: true,
     handles: { in: true, out: OUT },
     fields: [
       T.text('webhookUrl', 'Webhook URL', {
@@ -486,6 +654,7 @@ export const NODE_REGISTRY = {
     icon: 'Send',
     accent: '#229ED9',
     credits: 1,
+    sideEffects: true,
     handles: { in: true, out: OUT },
     fields: [
       T.credential('credentialId', 'Bot token', 'telegram', {
@@ -514,6 +683,7 @@ export const NODE_REGISTRY = {
     icon: 'NotebookPen',
     accent: '#0f172a',
     credits: 1,
+    sideEffects: true,
     handles: { in: true, out: OUT },
     fields: [
       T.credential('credentialId', 'Integration token', 'notion', {
@@ -548,6 +718,55 @@ export function getNodeDef(type) {
 
 export function isKnownType(type) {
   return Object.prototype.hasOwnProperty.call(NODE_REGISTRY, type);
+}
+
+/**
+ * Does running this node change the world?
+ *
+ * Declared here rather than inferred, because two separate parts of the system
+ * need the answer and getting it wrong is expensive in both. The runner asks
+ * before retrying a step that failed halfway — a retried email is a second
+ * email, which cannot be taken back. The architect asks before test-running a
+ * step while building — a build that posts to a live Slack channel to check its
+ * work is a far worse bug than an unverified node.
+ *
+ * Absent means no side effects, so a new read-only node is safe by default and
+ * a new delivering one has to say so. That is the right way round: forgetting
+ * the flag on a reader costs nothing, and the flag is the first thing anyone
+ * writes when adding an integration that sends something.
+ */
+export function hasSideEffects(type) {
+  return Boolean(getNodeDef(type)?.sideEffects);
+}
+
+/**
+ * How long one execution of this node may take.
+ *
+ * A single ceiling for every node type cannot work, because "too long" means
+ * something different per node: two minutes is patient for an HTTP call and
+ * absurd for a Wait step configured to pause for five. Declaring it here rather
+ * than in the runner keeps the answer next to the node whose behaviour decides
+ * it — the alternative is a runner that special-cases three types and silently
+ * strangles the fourth one somebody adds.
+ *
+ * @param {string} type
+ * @param {number} fallback  the deployment-wide default
+ */
+export function nodeTimeoutMs(type, fallback) {
+  return getNodeDef(type)?.timeoutMs ?? fallback;
+}
+
+/**
+ * May the architect execute this node while building?
+ *
+ * Side effects rule a node out. So does `testable: false`, which is for the
+ * nodes that are safe but not worth running — `core.agent` would spend a dozen
+ * model calls inside a build the user is already paying for, and `core.delay`
+ * would do nothing except take as long as it says.
+ */
+export function isTestable(type) {
+  const def = getNodeDef(type);
+  return Boolean(def) && !def.sideEffects && def.testable !== false;
 }
 
 /**
@@ -588,6 +807,9 @@ export default {
   FIELD_TYPES,
   getNodeDef,
   isKnownType,
+  hasSideEffects,
+  isTestable,
+  nodeTimeoutMs,
   nodeCredits,
   publicRegistry,
 };

@@ -38,9 +38,21 @@
  *    with no warning and no partial result. Past a threshold the older half of
  *    the conversation is replaced by a written brief of what happened, so the
  *    loop can run as long as the work takes.
+ *
+ * 6. **The budget is told to the model before it runs out.** A loop that simply
+ *    stops at `maxSteps` throws away a nearly-finished build: the model was two
+ *    calls from a workflow it could have handed over with caveats, and instead
+ *    the user gets "ran out of steps" and pays for all of it. Warning it while
+ *    it can still act converts a hard cut-off into a deliberate landing.
+ *
+ * 7. **A repeated identical call is answered, not re-run.** Models loop: told
+ *    an endpoint 404s, they call it again with the same arguments. Re-running
+ *    costs a round-trip and returns the same failure, which invites the same
+ *    reaction. Naming the repetition is what breaks it.
  */
 
 import { complete, LLMError } from './llm.js';
+import { withTimeout } from '../utils/deadline.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ai:agent');
@@ -63,6 +75,25 @@ const SUMMARIZE_AT_TOKENS = 24_000;
 
 /** Messages kept verbatim at the tail when summarising. */
 const KEEP_LAST_MESSAGES = 12;
+
+/**
+ * Ceiling on one tool call.
+ *
+ * Generous, because the slowest legitimate tool here renders a JavaScript
+ * documentation site through a headless browser. The point is not to be tight;
+ * it is that without any ceiling a single hung fetch holds the loop open until
+ * the whole build is abandoned, and the user watches a spinner for the entire
+ * time with no step ever completing.
+ */
+const TOOL_TIMEOUT_MS = 90_000;
+
+/**
+ * Steps left when the model is told to land.
+ *
+ * Two, not one: the warning has to arrive while there is still a call to spend
+ * on `finish` *and* a call to fix whatever `finish` refuses.
+ */
+const LANDING_WARNING_AT = 2;
 
 /** Rough token count. Four characters per token is close enough to decide with. */
 export function estimateTokens(messages) {
@@ -252,6 +283,7 @@ async function summarizeHistory({ transcript, task, signal, onEvent }) {
  * @param {number} [opts.temperature]
  * @param {number} [opts.maxResultChars]       per-tool-result ceiling
  * @param {number} [opts.summarizeAtTokens]    transcript size that triggers compaction
+ * @param {number} [opts.toolTimeoutMs]        ceiling on a single tool call
  * @param {(event:object)=>void} [opts.onEvent]
  * @param {AbortSignal} [opts.signal]
  * @param {object} [opts.context]              passed to every tool handler
@@ -267,11 +299,13 @@ export async function runAgentLoop({
   temperature = 0.2,
   maxResultChars = MAX_RESULT_CHARS,
   summarizeAtTokens = SUMMARIZE_AT_TOKENS,
+  toolTimeoutMs = TOOL_TIMEOUT_MS,
   onEvent = () => {},
   signal,
   context = {},
 }) {
   const wireTools = toWireTools(tools);
+  const terminalTool = Object.entries(tools).find(([, tool]) => tool.terminal)?.[0] || null;
   let transcript = [
     { role: 'system', content: system },
     ...messages,
@@ -296,6 +330,11 @@ export async function runAgentLoop({
    */
   const usage = { promptTokens: 0, completionTokens: 0, calls: 0, models: [] };
 
+  /** `tool(args)` signatures already run, and the round they ran in. */
+  const callHistory = new Map();
+  /** One-shot nudges, so a model that ignores one isn't told forever. */
+  const nudged = { landing: false, terminal: false };
+
   while (steps < maxSteps) {
     if (signal?.aborted) {
       finishReason = 'aborted';
@@ -308,6 +347,30 @@ export async function runAgentLoop({
     // Before the call, not after: the point is to make *this* round cheaper.
     if (estimateTokens(transcript) > summarizeAtTokens) {
       transcript = await summarizeHistory({ transcript, task, signal, onEvent });
+    }
+
+    /*
+     * Tell it the budget while it can still spend it.
+     *
+     * Without this the loop's most common bad ending is a build that was nearly
+     * done: fifteen calls of real research and graph editing, cut off one call
+     * before the summary that would have made it usable. The model has no way
+     * to see the counter, so it paces as if the budget were unlimited. Told two
+     * calls out, it wraps up — and a workflow handed over with "I could not
+     * verify the webhook" is worth incomparably more than one abandoned mid-edit
+     * that the user paid the same for.
+     */
+    if (terminalTool && !nudged.landing && maxSteps - steps <= LANDING_WARNING_AT) {
+      nudged.landing = true;
+      transcript.push({
+        role: 'user',
+        content:
+          `[Budget: ${maxSteps - steps + 1} model call${maxSteps - steps === 0 ? '' : 's'} left in this session.] ` +
+          `Stop starting new work. Finish what you have and call \`${terminalTool}\` now — ` +
+          `state plainly in the summary anything you could not verify or complete. ` +
+          `An honest partial result is useful; being cut off mid-step is not.`,
+      });
+      onEvent({ type: 'budget_warning', remaining: maxSteps - steps + 1 });
     }
 
     let response;
@@ -343,10 +406,32 @@ export async function runAgentLoop({
     }
 
     if (!response.toolCalls.length) {
-      // The model answered directly. That is a legitimate finish for a loop
-      // whose tools are all optional, and a soft failure for one that was
-      // supposed to call `finish` — the caller decides which by looking at
-      // `finishReason`.
+      /*
+       * The model answered in prose.
+       *
+       * For a loop whose tools are all optional that is a legitimate finish.
+       * For one with a terminal tool it usually is not — the model has written
+       * the summary it meant to pass to `finish` and simply not made the call,
+       * and accepting that loses the structured result and every gate that
+       * hangs off it (the architect's `finish` is what refuses an invalid
+       * graph). Asking once costs one round and recovers the whole session.
+       */
+      if (terminalTool && !nudged.terminal) {
+        nudged.terminal = true;
+        // Only if it actually said something: several providers reject an
+        // assistant turn that is empty and carries no tool calls, which would
+        // turn a recoverable session into a 400 on the very next round.
+        if (response.content) transcript.push({ role: 'assistant', content: response.content });
+        transcript.push({
+          role: 'user',
+          content:
+            `You answered without calling \`${terminalTool}\`, so nothing was handed over. ` +
+            `Make that call now with what you just wrote. If you cannot, say which step is blocking you.`,
+        });
+        onEvent({ type: 'nudge', tool: terminalTool });
+        continue;
+      }
+
       finishReason = 'answered';
       finished = true;
       break;
@@ -363,7 +448,17 @@ export async function runAgentLoop({
 
     const outcomes = await Promise.all(
       response.toolCalls.map(call =>
-        invokeTool({ call, tools, context, signal, onEvent, maxResultChars })
+        invokeTool({
+          call,
+          tools,
+          context,
+          signal,
+          onEvent,
+          maxResultChars,
+          toolTimeoutMs,
+          callHistory,
+          round: steps,
+        })
       )
     );
 
@@ -401,8 +496,35 @@ export async function runAgentLoop({
   return { finished, finishReason, result, text, steps, transcript, toolCalls, usage };
 }
 
+/**
+ * Has this exact call already been made recently enough that its result is
+ * still in front of the model?
+ *
+ * The window matters. `compact` tells the model that an old result was dropped
+ * and to call again if it still needs it, so a repeat outside the retention
+ * window is the model doing as it was told, not thrashing. Inside the window it
+ * is a loop: the result is still visible, and re-running it burns a round to
+ * produce a string the transcript already contains.
+ */
+function repeatedCall(callHistory, signature, round) {
+  const previous = callHistory.get(signature);
+  if (previous === undefined) return null;
+  if (round - previous.round >= KEEP_FULL_RESULTS_FOR_ROUNDS) return null;
+  return previous;
+}
+
 /** Call one tool, turning every failure into something the model can read. */
-async function invokeTool({ call, tools, context, signal, onEvent, maxResultChars = MAX_RESULT_CHARS }) {
+async function invokeTool({
+  call,
+  tools,
+  context,
+  signal,
+  onEvent,
+  maxResultChars = MAX_RESULT_CHARS,
+  toolTimeoutMs = TOOL_TIMEOUT_MS,
+  callHistory = new Map(),
+  round = 0,
+}) {
   const tool = tools[call.name];
   const startedAt = Date.now();
 
@@ -414,9 +536,39 @@ async function invokeTool({ call, tools, context, signal, onEvent, maxResultChar
     return { id: call.id, name: call.name, args: call.arguments, ok: false, content: message, ms: 0 };
   }
 
+  /*
+   * Answer a repeat instead of running it.
+   *
+   * The classic version of this is a model told an endpoint returned 404 that
+   * calls the same URL again, unchanged, three times — each one a full round
+   * trip that returns the identical failure and prompts the identical reaction.
+   * Naming the repetition and pointing at what it already learned is what
+   * breaks the cycle; silently re-running it is what sustains it.
+   *
+   * A terminal tool is exempt. `finish` being refused and called again with the
+   * same summary after a graph fix is the intended path out of the loop, not a
+   * mistake.
+   */
+  const signature = `${call.name}(${JSON.stringify(call.arguments ?? {})})`;
+  const repeat = tool.terminal ? null : repeatedCall(callHistory, signature, round);
+  if (repeat) {
+    const message =
+      `You already called ${call.name} with exactly these arguments ` +
+      `${round - repeat.round === 0 ? 'in this same turn' : `${round - repeat.round} step(s) ago`}, and it ` +
+      `${repeat.ok ? 'returned a result that is still above in this conversation' : `failed: ${repeat.error}`}. ` +
+      `Repeating it will not produce anything different — change the arguments or take a different approach.`;
+
+    onEvent({ type: 'tool.end', id: call.id, name: call.name, ok: false, error: 'repeated call', ms: 0 });
+    return { id: call.id, name: call.name, args: call.arguments, ok: false, content: message, ms: 0, repeated: true };
+  }
+
   try {
-    const value = await tool.run(call.arguments || {}, { ...context, signal });
+    const value = await withTimeout(
+      toolSignal => tool.run(call.arguments || {}, { ...context, signal: toolSignal }),
+      { ms: toolTimeoutMs, signal, what: `${call.name} call` }
+    );
     const ms = Date.now() - startedAt;
+    callHistory.set(signature, { round, ok: true });
     const content = truncate(stringifyResult(value), maxResultChars);
 
     onEvent({
@@ -440,6 +592,7 @@ async function invokeTool({ call, tools, context, signal, onEvent, maxResultChar
     };
   } catch (err) {
     const ms = Date.now() - startedAt;
+    callHistory.set(signature, { round, ok: false, error: err.message });
     // Phrased as an instruction, not a stack trace. "Failed: ECONNREFUSED"
     // tells the model nothing about what to do next; naming the tool and the
     // problem and inviting a different approach is what produces a retry that

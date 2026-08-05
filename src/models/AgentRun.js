@@ -36,6 +36,20 @@ const stepSchema = new mongoose.Schema(
      */
     output: { type: mongoose.Schema.Types.Mixed, default: null },
     error: { type: String, default: null },
+    /**
+     * Things that were wrong but not fatal — a `{{ }}` reference that resolved
+     * to nothing, an attempt that had to be retried. A step can be `done` and
+     * still have produced garbage, and this is the only place that says so.
+     */
+    warnings: { type: [String], default: [] },
+    /** How many times this step had to be retried before it stuck. */
+    attempts: { type: Number, default: 1 },
+    /**
+     * Passes, for a step inside a loop body. One row in the console stands for
+     * every iteration — twenty-five rows per node would bury the shape of the
+     * run under the volume of it — so this is how many are behind the row.
+     */
+    iterations: { type: Number, default: 0 },
     credits: { type: Number, default: 0 },
     /** Provider cost attributable to this step, in paise. */
     costPaise: { type: Number, default: 0 },

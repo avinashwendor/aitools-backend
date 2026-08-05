@@ -16,6 +16,7 @@ import AgentWorkflow from './AgentWorkflow.js';
 import AgentRun from './AgentRun.js';
 import AgentBuild from './AgentBuild.js';
 import AgentCredential from './AgentCredential.js';
+import AgentMemory from './AgentMemory.js';
 
 export {
   User,
@@ -36,4 +37,5 @@ export {
   AgentRun,
   AgentBuild,
   AgentCredential,
+  AgentMemory,
 };

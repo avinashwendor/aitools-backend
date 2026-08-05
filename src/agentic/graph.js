@@ -15,6 +15,8 @@
  */
 
 import { getNodeDef, isKnownType } from './registry.js';
+import { analyzeReferences } from './references.js';
+import { findRegions } from './regions.js';
 
 /**
  * Order nodes so every node follows the ones feeding it.
@@ -163,6 +165,28 @@ export function validateGraph({ nodes = [], edges = [] } = {}, { requirements = 
 
   if (nodes.length > 1 && edges.length === 0) {
     errors.push('Connect your nodes — nothing downstream of the trigger will run.');
+  }
+
+  /*
+   * References are checked last, and only against a graph whose node types are
+   * known: a reference to a node whose type is unrecognised produces a second
+   * error about an output list we can't read, which is noise on top of the
+   * error that actually needs fixing.
+   *
+   * This is the check that catches the failure nothing else can see. Every
+   * other error here describes a workflow that refuses to run; a dead reference
+   * describes one that runs, reports success, and does nothing — see
+   * `references.js`.
+   */
+  if (!errors.some(problem => problem.startsWith('Unknown node type'))) {
+    // Loop structure first: reference scoping depends on knowing which nodes
+    // are inside a loop body, and a malformed region makes that unanswerable.
+    const { regions, errors: regionErrors } = findRegions({ nodes, edges });
+    errors.push(...regionErrors);
+
+    const references = analyzeReferences({ nodes, edges }, { regions });
+    errors.push(...references.errors);
+    warnings.push(...references.warnings);
   }
 
   const orphans = findOrphans(nodes, edges);

@@ -43,6 +43,19 @@ const TIMEOUT_MS = 15_000;
 const CACHE_TTL_MS = 30 * 60 * 1000;
 
 /**
+ * Rendered pages are kept far longer than fetched ones.
+ *
+ * A plain fetch is nearly free, so a short TTL costs little and keeps a status
+ * page or a changelog current. Rendering is not free — it spends a Tavily
+ * credit out of a capped monthly pool — and the thing we render is almost
+ * always an API reference, which is stable for weeks. Expiring that after
+ * thirty minutes means two builds against the same service an hour apart each
+ * pay to render the same page, which is the single most repeated cost in the
+ * architect. Six hours matches what the search layer already keeps.
+ */
+const RENDERED_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
  * Below this many characters of extracted text, a page is treated as unread.
  *
  * Tuned to the shape of the problem rather than to a percentile: an app shell
@@ -143,7 +156,7 @@ export async function fetchPage(rawUrl, { maxChars = 8000, signal, allowRender =
     if (!canRender) throw err;
 
     const rendered = await renderPage(target, maxChars);
-    if (rendered) return cacheAndReturn(cacheKey, rendered);
+    if (rendered) return cacheAndReturn(cacheKey, rendered, RENDERED_CACHE_TTL_MS);
     throw err;
   }
 
@@ -154,15 +167,19 @@ export async function fetchPage(rawUrl, { maxChars = 8000, signal, allowRender =
     });
     const rendered = await renderPage(target, maxChars);
     if (rendered && rendered.text.length > direct.text.length) {
-      return cacheAndReturn(cacheKey, { ...rendered, title: direct.title || rendered.title });
+      return cacheAndReturn(
+        cacheKey,
+        { ...rendered, title: direct.title || rendered.title },
+        RENDERED_CACHE_TTL_MS
+      );
     }
   }
 
   return cacheAndReturn(cacheKey, shape(direct, maxChars));
 }
 
-async function cacheAndReturn(cacheKey, result) {
-  await cache.set(cacheKey, result, CACHE_TTL_MS);
+async function cacheAndReturn(cacheKey, result, ttlMs = CACHE_TTL_MS) {
+  await cache.set(cacheKey, result, ttlMs);
   return result;
 }
 

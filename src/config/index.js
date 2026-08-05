@@ -330,6 +330,31 @@ const config = {
 
     /** Ceiling on a whole run. */
     maxRunMs: num(process.env.AGENT_MAX_RUN_MS, 10 * 60 * 1000),
+
+    /**
+     * Ceiling on one node.
+     *
+     * The run ceiling alone is not a budget, it is a single point of failure:
+     * an endpoint that accepts the connection and never answers eats all ten
+     * minutes, the nine steps that would have worked never run, and the error
+     * blames the run instead of naming the step that hung. Two minutes is
+     * generous for an API call and still leaves room for four more steps.
+     */
+    nodeTimeoutMs: num(process.env.AGENT_NODE_TIMEOUT_MS, 120_000),
+
+    /** Shorter still for a plain HTTP call, which has no reason to think. */
+    httpTimeoutMs: num(process.env.AGENT_HTTP_TIMEOUT_MS, 30_000),
+
+    /**
+     * Attempts per node, including the first.
+     *
+     * Only failures that left the far end unchanged are retried — see
+     * `agentic/retry.js`. Three is the point where the marginal attempt stops
+     * paying: a rate limit or a restarting server clears inside two backoffs,
+     * and anything that survives three is a real fault that another attempt
+     * only delays discovering.
+     */
+    nodeAttempts: num(process.env.AGENT_NODE_ATTEMPTS, 3),
     /** Nodes a single graph may contain. Bounds worst-case run cost. */
     maxNodes: num(process.env.AGENT_MAX_NODES, 60),
     /**

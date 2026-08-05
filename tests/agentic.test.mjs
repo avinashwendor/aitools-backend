@@ -20,9 +20,16 @@ import {
   GROUPS,
   getNodeDef,
   nodeCredits,
+  nodeTimeoutMs,
+  hasSideEffects,
+  isTestable,
   publicRegistry,
 } from '../src/agentic/registry.js';
 import { topoSort, validateGraph, findOrphans, suggestNodeId, ancestors } from '../src/agentic/graph.js';
+import { analyzeReferences } from '../src/agentic/references.js';
+import { findRegions, coerceItems } from '../src/agentic/regions.js';
+import { classifyFailure, withRetry, parseRetryAfter, backoffMs } from '../src/agentic/retry.js';
+import { withTimeout } from '../src/utils/deadline.js';
 import { interpolate, interpolateDeep, resolveValues, getByPath } from '../src/agentic/interpolate.js';
 import { applyOperations, describeGraph } from '../src/agentic/operations.js';
 import { executorTypes } from '../src/agentic/executors.js';
@@ -552,5 +559,427 @@ describe('schedule arithmetic', () => {
     for (const every of ['15 minutes', 'hour', '6 hours', 'day', 'week']) {
       assert.ok(computeNextRun({ every, atHour: 9 }, from) > from, `${every} did not advance`);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+/**
+ * The failure these cover is the quiet one: a reference that points nowhere
+ * renders as an empty string, so the workflow runs, every step reports success,
+ * the user is charged, and the email arrives blank. Nothing throws, which is
+ * exactly why it has to be caught by derivation rather than by running it.
+ */
+describe('reference analysis', () => {
+  const wired = extra => ({
+    nodes: [
+      node('t', 'trigger.manual'),
+      node('fetch', 'core.http', { url: 'https://api.example.com/items', method: 'GET' }),
+      ...extra.nodes,
+    ],
+    edges: [edge('t', 'fetch'), ...extra.edges],
+  });
+
+  test('a reference to a declared output is fine', () => {
+    const graph = wired({
+      nodes: [node('out', 'core.template', { value: 'got {{ fetch.data.items[0].title }} ({{ fetch.status }})' })],
+      edges: [edge('fetch', 'out')],
+    });
+    assert.deepEqual(analyzeReferences(graph).errors, []);
+  });
+
+  test('a reference to a step that does not exist is an error', () => {
+    const graph = wired({
+      nodes: [node('out', 'core.template', { value: '{{ summarise.text }}' })],
+      edges: [edge('fetch', 'out')],
+    });
+    const { errors } = analyzeReferences(graph);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /no step called “summarise”/);
+  });
+
+  test('a reference to an output the node never returns is an error', () => {
+    const graph = wired({
+      nodes: [node('out', 'core.template', { value: '{{ fetch.body }}' })],
+      edges: [edge('fetch', 'out')],
+    });
+    const { errors } = analyzeReferences(graph);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /no “body” output/);
+    // The message has to name the alternatives, or the model has nothing to
+    // correct it to and guesses again.
+    assert.match(errors[0], /status, ok, data, headers/);
+  });
+
+  test('reading a step that runs later is an error, not a warning', () => {
+    const graph = {
+      nodes: [node('t', 'trigger.manual'), node('a', 'core.template', { value: '{{ b.result }}' }), node('b', 'core.code', { script: 'return 1' })],
+      edges: [edge('t', 'a'), edge('a', 'b')],
+    };
+    const { errors } = analyzeReferences(graph);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /runs after it/);
+  });
+
+  test('reading an unconnected step that happens to run first is a warning', () => {
+    const graph = {
+      nodes: [
+        node('t', 'trigger.manual'),
+        node('a', 'core.code', { script: 'return 1' }),
+        node('b', 'core.template', { value: '{{ a.result }}' }),
+      ],
+      // `a` and `b` are separate branches off the trigger: `a` runs first today,
+      // and nothing guarantees it tomorrow.
+      edges: [edge('t', 'a'), edge('t', 'b')],
+    };
+    const { errors, warnings } = analyzeReferences(graph);
+    assert.deepEqual(errors, []);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /not connected/);
+  });
+
+  test('references hidden inside a JSON field are found', () => {
+    // The case a scan of top-level strings misses, and the one that matters —
+    // a request body is where the interesting references live.
+    const graph = wired({
+      nodes: [node('post', 'core.http', { url: 'https://x.test', method: 'POST', headers: { 'X-Id': '{{ fetch.nope }}' } })],
+      edges: [edge('fetch', 'post')],
+    });
+    const { errors } = analyzeReferences(graph);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /no “nope” output/);
+  });
+
+  test('trigger payload paths are never errors — their shape is the caller’s', () => {
+    const graph = wired({
+      nodes: [node('out', 'core.template', { value: '{{ trigger.body.whatever.deep }}' })],
+      edges: [edge('fetch', 'out')],
+    });
+    assert.deepEqual(analyzeReferences(graph).errors, []);
+  });
+
+  test('one bad reference used four times is reported once', () => {
+    const graph = wired({
+      nodes: [node('out', 'core.template', { value: '{{ x.a }} {{ x.a }} {{ x.a }} {{ x.a }}' })],
+      edges: [edge('fetch', 'out')],
+    });
+    assert.equal(analyzeReferences(graph).errors.length, 1);
+  });
+
+  test('validateGraph refuses a dead reference, which is what blocks the architect', () => {
+    const graph = wired({
+      nodes: [node('out', 'core.template', { value: '{{ fetch.body }}' })],
+      edges: [edge('fetch', 'out')],
+    });
+    assert.ok(validateGraph(graph).errors.some(e => /no “body” output/.test(e)));
+  });
+
+  test('every declared output is one an executor really returns', () => {
+    // The registry is what reference validation rules against, so an output it
+    // under-declares turns a correct reference into a blocking error.
+    for (const def of NODE_LIST) {
+      assert.ok(def.outputs.length > 0, `${def.type} declares no outputs`);
+      for (const output of def.outputs) {
+        assert.equal(typeof output.path, 'string');
+        assert.ok(output.path.length, `${def.type} has an empty output path`);
+      }
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('placeholder misses', () => {
+  test('a miss still renders empty — a typo must not kill a run', () => {
+    assert.equal(interpolate('x{{ nope.here }}y', {}), 'xy');
+  });
+
+  test('but the miss is reported, so a blank result has a stated cause', () => {
+    const misses = [];
+    interpolate('{{ a.b }} and {{ c.d }}', { a: { b: 'ok' } }, m => misses.push(m.path));
+    assert.deepEqual(misses, ['c.d']);
+  });
+
+  test('a supplied default is a decision, not a miss', () => {
+    const misses = [];
+    const out = interpolate('{{ nope.here | default: n/a }}', {}, m => misses.push(m.path));
+    assert.equal(out, 'n/a');
+    assert.deepEqual(misses, []);
+  });
+
+  test('resolveValues reports the field, since that is what the user has to fix', () => {
+    const misses = [];
+    resolveValues(
+      { body: 'Hello {{ absent.name }}' },
+      [{ key: 'body', label: 'Body', type: 'text' }],
+      {},
+      { onMiss: m => misses.push(m) }
+    );
+    assert.equal(misses.length, 1);
+    assert.equal(misses[0].field, 'Body');
+    assert.equal(misses[0].path, 'absent.name');
+  });
+
+  test('misses are found inside nested field values too', () => {
+    const misses = [];
+    resolveValues(
+      { headers: { Authorization: 'Bearer {{ absent.token }}' } },
+      [{ key: 'headers', label: 'Headers', type: 'json' }],
+      {},
+      { onMiss: m => misses.push(m.path) }
+    );
+    assert.deepEqual(misses, ['absent.token']);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+/**
+ * Retrying is easy; retrying only what is safe to repeat is the whole problem.
+ * A duplicate email cannot be taken back, so these assert the *refusals* as
+ * carefully as the retries.
+ */
+describe('transient failure handling', () => {
+  const err = props => Object.assign(new Error('boom'), props);
+
+  test('rate limits and server errors are retryable, client errors are not', () => {
+    assert.equal(classifyFailure(err({ status: 429 })).retryable, true);
+    assert.equal(classifyFailure(err({ status: 503 })).retryable, true);
+    assert.equal(classifyFailure(err({ status: 404 })).retryable, false);
+    assert.equal(classifyFailure(err({ status: 401 })).retryable, false);
+  });
+
+  test('a rate limit means nothing happened, so even a POST may be repeated', () => {
+    assert.equal(classifyFailure(err({ status: 429 })).sent, false);
+    // A 500 may have acted before it failed, so it may not.
+    assert.equal(classifyFailure(err({ status: 500 })).sent, true);
+  });
+
+  test('a DNS failure proves the request never left, a reset does not', () => {
+    assert.equal(classifyFailure(err({ cause: { code: 'ENOTFOUND' } })).sent, false);
+    assert.equal(classifyFailure(err({ code: 'ECONNRESET' })).sent, true);
+  });
+
+  test('a cancelled run is never retried', () => {
+    assert.equal(classifyFailure(err({ name: 'AbortError' })).retryable, false);
+  });
+
+  test('Retry-After is honoured in both of its legal forms', () => {
+    assert.equal(parseRetryAfter('2'), 2000);
+    const at = new Date(Date.now() + 5000).toUTCString();
+    assert.ok(Math.abs(parseRetryAfter(at) - 5000) < 1500);
+    assert.equal(parseRetryAfter('nonsense'), null);
+  });
+
+  test('a step with side effects is not repeated once the request may have landed', async () => {
+    let attempts = 0;
+    await assert.rejects(
+      withRetry(async () => { attempts += 1; throw err({ code: 'ECONNRESET' }); }, { attempts: 3, idempotent: false })
+    );
+    assert.equal(attempts, 1, 'a dropped connection may have delivered the email');
+  });
+
+  test('the same failure on a read-only step is retried', async () => {
+    let attempts = 0;
+    await assert.rejects(
+      withRetry(async () => { attempts += 1; throw err({ code: 'ECONNRESET' }); }, { attempts: 3, idempotent: true })
+    );
+    assert.equal(attempts, 3);
+  });
+
+  test('a side-effecting step is repeated when the request provably never left', async () => {
+    let attempts = 0;
+    await assert.rejects(
+      withRetry(async () => { attempts += 1; throw err({ code: 'ENOTFOUND' }); }, { attempts: 3, idempotent: false })
+    );
+    assert.equal(attempts, 3);
+  });
+
+  test('a recovered attempt returns its value rather than the earlier failure', async () => {
+    let attempts = 0;
+    const out = await withRetry(
+      async () => { attempts += 1; if (attempts < 3) throw err({ status: 503 }); return 'ok'; },
+      { attempts: 3, idempotent: true }
+    );
+    assert.equal(out, 'ok');
+  });
+
+  test('backoff is jittered, so scheduled runs do not retry in lockstep', () => {
+    const delays = new Set(Array.from({ length: 20 }, () => backoffMs(3)));
+    assert.ok(delays.size > 1, 'every retry would collide on the same second');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('deadlines', () => {
+  test('work that ignores its signal is still stopped', async () => {
+    // The case a bare AbortController does not cover, and the one that hangs a
+    // build: a tool that never settles and never listens.
+    await assert.rejects(
+      withTimeout(() => new Promise(() => {}), { ms: 60 }),
+      e => e.code === 'STEP_TIMEOUT'
+    );
+  });
+
+  test('a cancel stays a cancel and is not reported as a timeout', async () => {
+    const outer = new AbortController();
+    setTimeout(() => outer.abort(), 20);
+    await assert.rejects(
+      withTimeout(
+        signal => new Promise((_resolve, reject) =>
+          signal.addEventListener('abort', () => reject(new Error('Run canceled')))
+        ),
+        { ms: 5000, signal: outer.signal }
+      ),
+      /Run canceled/
+    );
+  });
+
+  test('a value that arrives in time passes straight through', async () => {
+    assert.equal(await withTimeout(async () => 42, { ms: 1000 }), 42);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('per-node ceilings', () => {
+  test('the default applies to nodes that do not declare one', () => {
+    assert.equal(nodeTimeoutMs('core.http', 120_000), 120_000);
+    assert.equal(nodeTimeoutMs('core.code', 120_000), 120_000);
+  });
+
+  test('a Wait outlives the default, since its whole job is to take time', () => {
+    // A five-minute pause under a two-minute ceiling is a node that can never
+    // do what its own field allows.
+    const seconds = NODE_REGISTRY['core.delay'].fields.find(f => f.key === 'seconds');
+    assert.ok(nodeTimeoutMs('core.delay', 120_000) > seconds.max * 1000);
+  });
+
+  test('an AI Step outlives the provider timeout it wraps', () => {
+    assert.ok(nodeTimeoutMs('core.llm', 120_000) > 180_000, 'would fail before the model call does');
+  });
+
+  test('the agent node is bounded by steps and the run, not by a wall clock', () => {
+    assert.equal(nodeTimeoutMs('core.agent', 120_000), 0);
+  });
+
+  test('a node that can be test-run is one with no side effects', () => {
+    for (const def of NODE_LIST) {
+      if (isTestable(def.type)) {
+        assert.ok(!hasSideEffects(def.type), `${def.type} would be executed during a build`);
+      }
+    }
+    // The architect used to keep this list itself; the registry owns it now, so
+    // a new delivering node is excluded the moment it is declared.
+    for (const type of ['core.email', 'core.slack', 'core.discord', 'core.telegram', 'core.notion']) {
+      assert.equal(isTestable(type), false, `${type} must never run during a build`);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+/**
+ * Loop structure.
+ *
+ * These messages are a product surface, not diagnostics: they are what the
+ * architect reads when `finish` refuses its graph, and a model given "invalid
+ * region" fixes it by guessing. Each one therefore names the node and says what
+ * to do.
+ */
+describe('loop regions', () => {
+  const loop = (extraNodes = [], extraEdges = []) => ({
+    nodes: [
+      node('t', 'trigger.manual'),
+      node('loop', 'core.forEach', { items: '{{ trigger.list }}' }),
+      node('work', 'core.template', { value: '{{ each.item }}' }),
+      node('gather', 'core.collect', {}),
+      ...extraNodes,
+    ],
+    edges: [edge('t', 'loop'), edge('loop', 'work'), edge('work', 'gather'), ...extraEdges],
+  });
+
+  test('a well-formed loop has one region with the right body', () => {
+    const { regions, errors } = findRegions(loop());
+    assert.deepEqual(errors, []);
+    assert.equal(regions.length, 1);
+    assert.deepEqual(regions[0].body, ['work']);
+    assert.equal(regions[0].collectId, 'gather');
+  });
+
+  test('a loop with no Collect is refused, and says how to close it', () => {
+    const graph = loop();
+    graph.nodes = graph.nodes.filter(n => n.id !== 'gather');
+    graph.edges = graph.edges.filter(e => e.target !== 'gather');
+
+    const { errors } = findRegions(graph);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /never ends/);
+    assert.match(errors[0], /Add a Collect step/);
+  });
+
+  test('a Collect with no loop is refused too', () => {
+    const graph = {
+      nodes: [node('t', 'trigger.manual'), node('gather', 'core.collect', {})],
+      edges: [edge('t', 'gather')],
+    };
+    assert.match(findRegions(graph).errors[0], /nothing upstream starts a loop/);
+  });
+
+  test('an empty loop body is refused — it would repeat nothing', () => {
+    const graph = {
+      nodes: [node('t', 'trigger.manual'), node('loop', 'core.forEach', {}), node('gather', 'core.collect', {})],
+      edges: [edge('t', 'loop'), edge('loop', 'gather')],
+    };
+    assert.match(findRegions(graph).errors[0], /loops over nothing/);
+  });
+
+  /**
+   * Nesting multiplies what a run costs in a way the user cannot see coming,
+   * and the honest version of the feature needs a cost preview that does not
+   * exist. Refusing it plainly beats shipping a way to spend a month's credits
+   * on one click.
+   */
+  test('a loop inside a loop is refused with the reason', () => {
+    const graph = loop(
+      [node('inner', 'core.forEach', {}), node('innerWork', 'core.template', {}), node('innerGather', 'core.collect', {})],
+      [edge('work', 'inner'), edge('inner', 'innerWork'), edge('innerWork', 'innerGather'), edge('innerGather', 'gather')]
+    );
+    const { errors } = findRegions(graph);
+    // And it must be the *only* error. Nesting trips several later rules on its
+    // way past — the outer opener sees two Collects — and an author told "this
+    // loop has 2 Collect steps" deletes one, which is not the fix.
+    assert.equal(errors.length, 1, errors.join(' | '));
+    assert.match(errors[0], /starts a loop inside the one/);
+    assert.match(errors[0], /multiply what a run costs/);
+  });
+
+  test('an edge into the middle of a loop body is refused', () => {
+    // It would run once per pass on the strength of a value produced once.
+    const graph = loop([node('outside', 'core.template', {})], [edge('t', 'outside'), edge('outside', 'work')]);
+    assert.ok(findRegions(graph).errors.some(e => /into the middle of the loop/.test(e)));
+  });
+
+  test('an edge out of a loop body is refused, and points at Collect', () => {
+    const graph = loop([node('after', 'core.template', {})], [edge('work', 'after')]);
+    const { errors } = findRegions(graph);
+    assert.ok(errors.some(e => /connects out to/.test(e)));
+    assert.ok(errors.some(e => /gathers them/.test(e)));
+  });
+
+  test('a graph with no loops produces no regions and no complaints', () => {
+    const { regions, errors } = findRegions({
+      nodes: [node('t', 'trigger.manual'), node('a', 'core.template', {})],
+      edges: [edge('t', 'a')],
+    });
+    assert.deepEqual(regions, []);
+    assert.deepEqual(errors, []);
+  });
+
+  test('a list is recovered from the JSON text an interpolated field produces', () => {
+    assert.deepEqual(coerceItems('[{"a":1}]'), [{ a: 1 }]);
+    assert.deepEqual(coerceItems([1, 2]), [1, 2]);
+    assert.deepEqual(coerceItems(''), []);
+    assert.deepEqual(coerceItems(null), []);
+  });
+
+  test('anything that is not a list says what to point at instead', () => {
+    assert.throws(() => coerceItems('a sentence'), /must be a list/);
+    assert.throws(() => coerceItems({ not: 'a list' }), /Point this at a step output/);
   });
 });

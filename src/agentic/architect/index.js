@@ -40,7 +40,7 @@ import { runAgentLoop, defineTool } from '../../ai/agentLoop.js';
 import { webSearch, searchDocs, isWebSearchConfigured } from '../../ai/tools/webSearch.js';
 import { fetchPage } from '../../ai/tools/fetchPage.js';
 import { search as searchCatalog } from '../../ai/retriever.js';
-import { getNodeDef, NODE_LIST } from '../registry.js';
+import { getNodeDef, isTestable, NODE_LIST } from '../registry.js';
 import { validateGraph } from '../graph.js';
 import { applyOperations, describeGraph } from '../operations.js';
 import { getExecutor } from '../executors.js';
@@ -51,33 +51,21 @@ import { withMetering, summarize } from '../../billing/meterContext.js';
 import { spend, recordFailure } from '../../billing/credits.js';
 import { meteredCost } from '../../billing/plans.js';
 import { architectSystemPrompt } from './prompt.js';
+import { reviewBuild } from './review.js';
 import { createLogger } from '../../utils/logger.js';
 
 const log = createLogger('agentic:architect');
 
 /**
- * Steps `test_step` will execute.
+ * Which steps `test_step` will execute is not decided here.
  *
- * The rule is "does running this twice change the world?" — because the
- * architect will run it, and a build that quietly emails a customer or posts to
- * a live Slack channel while checking its work is a far worse bug than an
- * unverified node. Everything on this list reads or computes. Everything that
- * delivers is verified by the user pressing Run, once, deliberately.
+ * It used to be, as a list in this file, which meant the answer to "does
+ * running this change the world?" lived in two places — here and in whoever
+ * remembered when adding an integration. The registry owns it now
+ * (`sideEffects` / `testable`), so a new delivering node is excluded from
+ * test-running the moment it is declared, rather than the first time a build
+ * posts to a live channel while checking its work.
  */
-const TESTABLE_TYPES = new Set([
-  'core.http',
-  'core.code',
-  'core.template',
-  'core.condition',
-  'core.websearch',
-  'core.fetchPage',
-  'core.rss',
-  'core.catalog',
-  'core.llm',
-  'trigger.manual',
-  'trigger.webhook',
-  'trigger.schedule',
-]);
 
 /** Builds currently running in this process, so a cancel can reach them. */
 const inFlight = new Map();
@@ -159,6 +147,19 @@ async function buildInner({ build, workflow, user, controller, usage }) {
     requirements: (workflow.requirements || []).map(r => r.toObject?.() ?? r),
     /** Outputs of steps `test_step` has run, so a later test can reference them. */
     testScope: { trigger: {} },
+    /** Node ids that were executed and worked — the build's evidence. */
+    tested: [],
+    /**
+     * How many times `finish` has been refused.
+     *
+     * A gate that can refuse indefinitely is not a gate, it is a way to lose a
+     * build: the user has already paid for the work whether or not it is handed
+     * over, so a second opinion that cannot be satisfied ends with them holding
+     * nothing. Structural errors are refused every time — those are objectively
+     * broken. Judgement calls get one refusal, then say their piece in the
+     * summary and let the build through.
+     */
+    refusals: 0,
   };
 
   const emit = async event => {
@@ -204,7 +205,7 @@ async function buildInner({ build, workflow, user, controller, usage }) {
   };
 
   const searchable = isWebSearchConfigured();
-  const tools = buildTools({ state, emit, flushGraph, user, signal, searchable });
+  const tools = buildTools({ state, emit, flushGraph, user, signal, searchable, goal: build.goal });
 
   let outcome = null;
   let error = null;
@@ -385,7 +386,39 @@ async function finishBuild({ build, user, usage, startedAt, workflow, steps, sum
 
 // ─── Tools ──────────────────────────────────────────────────
 
-function buildTools({ state, emit, flushGraph, user, signal, searchable }) {
+/**
+ * Steps that were never proven to work.
+ *
+ * Restricted to the two where being wrong is both likely and invisible.
+ *
+ * A GET request, because the architect wrote it from a documentation page it
+ * may have misread, and every downstream `{{ }}` reference was then guessed
+ * against a response shape nobody has seen. Running it is free of side effects
+ * and settles both questions at once.
+ *
+ * A loop opener, because `{{ fetch.data.items }}` passes reference validation —
+ * `data` is a declared output — and then turns out to be an object, or a
+ * string, or a list nested one level deeper than assumed. A loop over a
+ * non-list fails the run; a loop over an empty one succeeds and does nothing,
+ * which is worse. Running the opener resolves and counts the list without
+ * running the body.
+ *
+ * Everything else is excluded on purpose. A node with side effects cannot be
+ * tested at all, and demanding evidence for a template or a code node produces
+ * a refusal the model satisfies by running something pointless.
+ */
+function untestedRequests(state) {
+  return state.graph.nodes
+    .filter(node => {
+      if (node.type === 'core.forEach') return true;
+      if (node.type !== 'core.http') return false;
+      return String(node.data?.values?.method || 'GET').toUpperCase() === 'GET';
+    })
+    .filter(node => !state.tested.includes(node.id))
+    .map(node => node.id);
+}
+
+function buildTools({ state, emit, flushGraph, user, signal, searchable, goal }) {
   const tools = {};
 
   tools.plan = defineTool({
@@ -720,11 +753,12 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable }) {
 
   tools.test_step = defineTool({
     description:
-      'Actually execute one step and return its real output. Use it on every HTTP request and ' +
-      'on any step whose output shape you are guessing at — then correct the {{ }} references ' +
-      'downstream to match the field names that really came back. Steps that send things ' +
-      '(email, Slack, Discord, Telegram, Notion) cannot be tested, and neither can non-GET ' +
-      'requests, because running them twice would be a real side effect.',
+      'Actually execute one step and return its real output. Use it on every GET request, on ' +
+      'every For Each opener — it resolves the list and counts it without running the body — ' +
+      'and on any step whose output shape you are guessing at. Correct downstream {{ }} ' +
+      'references to match what really came back. Steps that send things (email, Slack, ' +
+      'Discord, Telegram, Notion) cannot be tested, and neither can non-GET requests, because ' +
+      'running them twice would be a real side effect.',
     properties: {
       nodeId: { type: 'string', description: 'The id of the node to run.' },
       triggerInput: {
@@ -743,7 +777,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable }) {
       const def = getNodeDef(node.type);
       if (!def) throw new Error(`"${node.type}" is not a known node type.`);
 
-      if (!TESTABLE_TYPES.has(node.type)) {
+      if (!isTestable(node.type)) {
         throw new Error(
           `${def.label} has side effects, so it can't be test-run. Check its configuration by reading the docs instead.`
         );
@@ -782,6 +816,17 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable }) {
           nodeId: node.id,
           userId: user._id,
           user,
+          /*
+           * Deliberately null, and it must stay null.
+           *
+           * A step that remembers what it has seen — `core.dedupe` — keys that
+           * memory on the workflow. Test-running one during a build with a real
+           * workflow id would mark the entire existing backlog as already seen,
+           * so the first genuine run finds nothing new and the user's first
+           * experience of the workflow is it doing nothing. Nodes read this and
+           * pass everything through untracked when it is absent.
+           */
+          workflowId: null,
           trigger: { payload: state.testScope.trigger },
           scope: state.testScope,
           edges: state.graph.edges,
@@ -790,6 +835,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable }) {
         });
 
         state.testScope[node.id] = output;
+        if (!state.tested.includes(node.id)) state.tested.push(node.id);
         const capped = capOutput(output, 4000);
 
         await emit({
@@ -849,10 +895,14 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable }) {
        * that into another round with a specific list of what is wrong, which is
        * exactly the input the model needs and cannot produce for itself.
        *
-       * Structural errors only. Missing credentials are not a defect — the
-       * user supplies those after the build, by design — and warnings are
-       * judgement calls the author is allowed to overrule.
+       * Three checks now, in ascending order of how arguable they are, and the
+       * order is the point: the objective one refuses every time, the others
+       * refuse once. Missing credentials are still not a defect — the user
+       * supplies those after the build, by design.
        */
+
+      // 1. Structural. Includes dead `{{ }}` references, which is what stops a
+      //    graph that runs green and delivers empty fields (see references.js).
       const check = validateGraph(state.graph, { requirements: state.requirements });
       if (check.errors.length) {
         await emit({
@@ -869,11 +919,70 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable }) {
         );
       }
 
+      // 2. Evidence. A workflow nobody ran is a workflow nobody has any reason
+      //    to believe in — and running the request is also how the field names
+      //    every downstream reference depends on stop being a guess.
+      const untested = untestedRequests(state);
+      if (untested.length && state.refusals === 0) {
+        state.refusals += 1;
+        await emit({
+          type: 'test',
+          title: 'Untested steps',
+          detail: untested.join(', '),
+          ok: false,
+        });
+
+        throw new Error(
+          `These steps have never actually been run: ${untested.join(', ')}.\n\n` +
+          `Call test_step on each one. A GET proves the endpoint and auth and shows the real ` +
+          `field names. A For Each opener resolves and counts the list without running the body — ` +
+          `the difference between a loop that does nothing and one that fails halfway through. If ` +
+          `one genuinely cannot be tested — it needs a credential the user has not supplied — call ` +
+          `finish again and say so in the summary.`
+        );
+      }
+
+      // 3. Acceptance. Structurally valid and provably running is still not the
+      //    same as "what they asked for" — a second model reads the goal and
+      //    the graph cold. Advice, not law: one refusal, then it is the user's
+      //    call, which is why the objections go into the summary.
+      if (state.refusals < 2) {
+        const verdict = await reviewBuild({
+          goal,
+          graph: state.graph,
+          tested: state.tested,
+          signal,
+        });
+
+        if (!verdict.ok) {
+          state.refusals = 2;
+          await emit({
+            type: 'test',
+            title: 'Review found gaps',
+            detail: verdict.issues.join(' · '),
+            ok: false,
+          });
+
+          throw new Error(
+            `A review of the finished workflow against the original request found:\n` +
+            `${verdict.issues.map(issue => `- ${issue}`).join('\n')}\n\n` +
+            `Fix what is genuinely missing and call finish again. If you disagree with a point — ` +
+            `you built it a different way on purpose — call finish again and explain that in the ` +
+            `summary. This will not be raised a second time.`
+          );
+        }
+      }
+
       if (name) {
         state.name = safeMessage(name, 120);
         await flushGraph();
       }
-      return { name: state.name, summary: safeMessage(summary, 4000) };
+      return {
+        name: state.name,
+        summary: safeMessage(summary, 4000),
+        tested: state.tested,
+        warnings: check.warnings,
+      };
     },
   });
 

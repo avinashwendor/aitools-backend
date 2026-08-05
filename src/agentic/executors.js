@@ -15,6 +15,7 @@
  * whether the run continues — a decision no individual node should be making.
  */
 
+import crypto from 'crypto';
 import config from '../config/index.js';
 import { complete, completeJson } from '../ai/llm.js';
 import { search as searchCatalog } from '../ai/retriever.js';
@@ -22,8 +23,11 @@ import { webSearch, isWebSearchConfigured } from '../ai/tools/webSearch.js';
 import { fetchPage } from '../ai/tools/fetchPage.js';
 import { runAgentLoop, defineTool } from '../ai/agentLoop.js';
 import { sendEmail, isEmailConfigured } from '../services/email/index.js';
-import { AgentCredential } from '../models/index.js';
+import { AgentCredential, AgentMemory } from '../models/index.js';
 import { assertUrlAllowed } from './safety.js';
+import { withRetry, withTimeout, classifyFailure } from './retry.js';
+import { coerceItems } from './regions.js';
+import { getByPath } from './interpolate.js';
 import { runScript } from './sandbox.js';
 
 /** Load a credential the node referenced, scoped to the run's owner. */
@@ -71,9 +75,24 @@ const executors = {
 
   // ─── Core ────────────────────────────────────────────────
 
+  /**
+   * The one node that retries inside itself.
+   *
+   * Everywhere else, a transient failure throws and the runner's retry sees it.
+   * This node cannot work that way: a non-2xx is *returned* as data, on purpose,
+   * so that a workflow can branch on a 404. That same design hides a 429 from
+   * the runner — it looks like a perfectly successful step whose `ok` happens to
+   * be false, and the next node interpolates an error body into an email.
+   *
+   * So the retryable statuses are handled here, where the status is still
+   * visible, and everything else is left to the runner. If the attempts run out
+   * the last response is returned rather than thrown, because the contract that
+   * a status is data has to hold for 429 as much as for 404.
+   */
   'core.http': async ({ values, userId, signal }) => {
     const url = assertUrlAllowed(values.url);
     const method = (values.method || 'GET').toUpperCase();
+    const safeMethod = method === 'GET' || method === 'HEAD';
 
     let headers = { 'User-Agent': 'AIToolsWorkflow/1.0', ...(values.headers || {}) };
     let target = url.toString();
@@ -94,21 +113,55 @@ const executors = {
       }
     }
 
-    const response = await fetch(target, init);
-    const contentType = response.headers.get('content-type') || '';
-    const data = contentType.includes('json')
-      ? await response.json().catch(() => null)
-      : await response.text();
+    let last = null;
 
-    // A non-2xx is returned, not thrown. Plenty of useful workflows branch on
-    // a 404, and an executor that throws makes that unexpressible — the If node
-    // never gets to see the status.
-    return {
-      status: response.status,
-      ok: response.ok,
-      data,
-      headers: Object.fromEntries(response.headers.entries()),
+    const attempt = async () => {
+      const response = await withTimeout(
+        requestSignal => fetch(target, { ...init, signal: requestSignal }),
+        { ms: config.agentic.httpTimeoutMs, signal, what: 'request' }
+      );
+
+      const contentType = response.headers.get('content-type') || '';
+      const data = contentType.includes('json')
+        ? await response.json().catch(() => null)
+        : await response.text();
+
+      // A non-2xx is returned, not thrown. Plenty of useful workflows branch on
+      // a 404, and an executor that throws makes that unexpressible — the If
+      // node never gets to see the status.
+      last = {
+        status: response.status,
+        ok: response.ok,
+        data,
+        headers: Object.fromEntries(response.headers.entries()),
+      };
+
+      const verdict = classifyFailure({ status: response.status, retryAfter: response.headers.get('retry-after') });
+      if (verdict.retryable) {
+        // Thrown only so `withRetry` can see it. It never escapes: the catch
+        // below hands back `last`, which is the response the workflow asked for.
+        const err = new Error(`${method} ${url.host} returned ${response.status}.`);
+        err.status = response.status;
+        err.retryAfter = response.headers.get('retry-after');
+        throw err;
+      }
+
+      return last;
     };
+
+    try {
+      return await withRetry(attempt, {
+        attempts: config.agentic.nodeAttempts,
+        idempotent: safeMethod,
+        signal,
+      });
+    } catch (err) {
+      // Attempts exhausted on a retryable status — hand back the response so a
+      // downstream If can still branch on it. A genuine transport failure has
+      // no response to return and stays an error the runner can act on.
+      if (last && Number(err.status)) return last;
+      throw err;
+    }
   },
 
   'core.code': async ({ values, scope, trigger, nodeId, edges }) => {
@@ -173,6 +226,121 @@ const executors = {
       }, { once: true });
     });
     return { waitedMs: ms };
+  },
+
+  /*
+   * The loop boundaries are executors only so that the runner's walk, the
+   * console's step list and the credit meter all treat them like any other
+   * node. The repetition itself lives in the runner, which is the only place
+   * that can drive a body more than once — see `runner.js` and `regions.js`.
+   *
+   * `core.forEach` resolves and bounds the list. `core.collect` never runs
+   * through here at all: the runner writes its output directly, because what it
+   * gathers only exists inside the iteration loop.
+   */
+  'core.forEach': async ({ values }) => {
+    const items = coerceItems(values.items);
+    const cap = Math.min(Math.max(Number(values.maxItems) || 25, 1), 500);
+    return {
+      items: items.slice(0, cap),
+      total: Math.min(items.length, cap),
+      available: items.length,
+      capped: items.length > cap,
+    };
+  },
+
+  'core.collect': async ({ scope, nodeId }) => scope[nodeId] ?? { items: [], count: 0, failed: 0 },
+
+  /**
+   * Already-seen filtering.
+   *
+   * Two details are the whole value of this node. The keys are hashed, because
+   * they are other people's identifiers and nothing here ever needs to read one
+   * back. And the write is `insertMany` with `ordered: false`, so two runs
+   * overlapping — a schedule firing while a manual run is still going — race
+   * into a unique-index conflict instead of both deciding an item is new and
+   * both delivering it.
+   */
+  'core.dedupe': async ({ values, nodeId, workflowId }) => {
+    const items = coerceItems(values.items);
+    const keyPath = String(values.key || 'id').trim();
+    const scopeKey = values.scope === 'this step' ? String(nodeId) : '*';
+    const days = Math.min(Math.max(Number(values.rememberDays) || 30, 1), 365);
+
+    if (!items.length) return { items: [], count: 0, skipped: 0 };
+
+    /*
+     * No workflow means nowhere to remember, and that is the architect
+     * test-running this step while building.
+     *
+     * Recording there would be the worst possible bug in this node: it would
+     * mark the whole existing backlog as seen before the workflow had ever run,
+     * so the user's first real run finds nothing new and the thing they just
+     * paid to build appears to do nothing. Passing everything through untracked
+     * is both safe and honest — it is exactly what a genuine first run does.
+     */
+    if (!workflowId) {
+      return { items, count: items.length, skipped: 0, note: 'Not recorded — this was a test run.' };
+    }
+
+    const keyed = items.map(item => {
+      const raw = getByPath(item, keyPath);
+      return {
+        item,
+        // An item with no value at the key cannot be tracked. Falling back to
+        // the whole item keeps it de-duplicable rather than making it either
+        // permanently new (delivered every run) or permanently seen (never
+        // delivered), which are both worse than a slightly brittle key.
+        value: raw === undefined || raw === null || raw === '' ? JSON.stringify(item) : String(raw),
+      };
+    });
+
+    const hashes = keyed.map(entry =>
+      crypto.createHash('sha256').update(entry.value).digest('hex')
+    );
+
+    const known = new Set(
+      (
+        await AgentMemory.find({ workflow: workflowId, scope: scopeKey, keyHash: { $in: hashes } })
+          .select('keyHash')
+          .lean()
+      ).map(row => row.keyHash)
+    );
+
+    const fresh = [];
+    const freshHashes = new Set();
+    keyed.forEach((entry, index) => {
+      const hash = hashes[index];
+      // A list can repeat an item within itself; the second copy is not new.
+      if (known.has(hash) || freshHashes.has(hash)) return;
+      freshHashes.add(hash);
+      fresh.push(entry.item);
+    });
+
+    if (fresh.length && !values.markOnly) {
+      const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+      await AgentMemory.insertMany(
+        [...freshHashes].map(keyHash => ({
+          workflow: workflowId,
+          scope: scopeKey,
+          keyHash,
+          expiresAt,
+        })),
+        { ordered: false }
+      ).catch(err => {
+        // Duplicate-key means another run recorded it first, which is the
+        // mechanism working. Anything else and we would rather deliver an item
+        // twice than fail a run that has already done its work.
+        if (err.code !== 11000) throw err;
+      });
+    }
+
+    return {
+      items: fresh,
+      count: fresh.length,
+      skipped: items.length - fresh.length,
+      ...(values.markOnly ? { note: 'Preview only — these will be new again next run.' } : {}),
+    };
   },
 
   // ─── Intelligence ────────────────────────────────────────
