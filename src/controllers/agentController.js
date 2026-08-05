@@ -584,7 +584,7 @@ export const continueBuild = asyncHandler(async (req, res) => {
   const build = await AgentBuild.findOne({ _id: req.params.buildId, user: req.user._id });
   if (!build) return res.status(404).json({ success: false, message: 'Build not found.' });
 
-  if (!['succeeded', 'failed', 'canceled'].includes(build.status)) {
+  if (!['succeeded', 'failed', 'canceled', 'awaiting_clarification'].includes(build.status)) {
     return res.status(400).json({ success: false, message: 'That session is still running.' });
   }
 
@@ -613,18 +613,51 @@ export const continueBuild = asyncHandler(async (req, res) => {
   const workflow = await AgentWorkflow.findOne({ _id: build.workflow, user: req.user._id });
   if (!workflow) return res.status(404).json({ success: false, message: 'Workflow not found.' });
 
-  build.messages.push({ role: 'user', content: message.slice(0, 8000), at: new Date() });
+  const answeringIntake = build.status === 'awaiting_clarification';
+  const intakeAnswers = req.body.intakeAnswers && typeof req.body.intakeAnswers === 'object'
+    ? req.body.intakeAnswers
+    : null;
+
+  let content = message.slice(0, 8000);
+  if (answeringIntake) {
+    const lines = ['Here are my answers to your intake questions:'];
+    if (intakeAnswers) {
+      for (const [id, value] of Object.entries(intakeAnswers)) {
+        if (value == null || value === '') continue;
+        lines.push(`- ${id}: ${String(value).slice(0, 400)}`);
+      }
+    }
+    lines.push('', message.slice(0, 4000));
+    lines.push(
+      '',
+      'Build the workflow now using these decisions. Do not ask the same questions again ' +
+        'unless something critical is still missing.'
+    );
+    content = lines.join('\n').slice(0, 8000);
+    build.clarificationSatisfied = true;
+    build.clarifyingQuestions = [];
+    build.intent = 'build';
+    // Enrich the goal so later heuristic / prompts see the resolved design.
+    build.goal = `${build.goal}\n\nIntake answers:\n${
+      intakeAnswers
+        ? Object.entries(intakeAnswers).map(([k, v]) => `${k}: ${v}`).join('\n')
+        : message
+    }`.slice(0, 4000);
+  } else if (workflow.graph.nodes.length > 1) {
+    build.intent = 'edit';
+  }
+
+  build.messages.push({ role: 'user', content, at: new Date() });
   build.status = 'queued';
   build.error = null;
   build.finishedAt = null;
-  if (workflow.graph.nodes.length > 1) build.intent = 'edit';
   await build.save();
 
   await enqueueBuild({ buildId: build._id, userId: req.user._id });
 
   res.status(202).json({
     success: true,
-    data: { buildId: String(build._id), status: 'queued', continued: true },
+    data: { buildId: String(build._id), status: 'queued', continued: true, afterClarification: answeringIntake },
   });
 });
 
@@ -660,13 +693,14 @@ export const streamBuild = asyncHandler(async (req, res) => {
 
   send('build.snapshot', build.toJSONSafe());
 
-  if (['succeeded', 'failed', 'canceled'].includes(build.status)) {
+  if (['succeeded', 'failed', 'canceled', 'awaiting_clarification'].includes(build.status)) {
     const workflow = await AgentWorkflow.findById(build.workflow);
     send('build.finished', {
       status: build.status,
       summary: build.summary,
       error: build.error,
       credits: build.credits,
+      clarifyingQuestions: build.clarifyingQuestions || [],
       workflow: workflow ? workflow.toEditorJSON() : null,
     });
     return res.end();

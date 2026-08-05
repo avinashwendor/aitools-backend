@@ -53,6 +53,7 @@ import { spend, recordFailure } from '../../billing/credits.js';
 import { meteredCost } from '../../billing/plans.js';
 import { architectSystemPrompt } from './prompt.js';
 import { reviewBuild } from './review.js';
+import { goalNeedsClarification, normalizeClarifyingQuestions } from './clarify.js';
 import { createLogger } from '../../utils/logger.js';
 
 const log = createLogger('agentic:architect');
@@ -234,9 +235,18 @@ async function buildInner({ build, workflow, user, controller, usage }) {
     refusals: 0,
     /** Set true only when finish() succeeds — controls whether we keep the graph. */
     handedOver: false,
+    /** Set when ask_clarifying succeeds — ends the session for user answers. */
+    awaitingClarification: false,
+    clarifyingQuestions: [],
   };
 
   restoreSessionState(state, build.timeline);
+
+  const needsClarification =
+    build.intent === 'build' &&
+    !build.clarificationSatisfied &&
+    goalNeedsClarification(build.goal);
+  const clarificationSatisfied = Boolean(build.clarificationSatisfied);
 
   const emit = async event => {
     const entry = {
@@ -298,46 +308,54 @@ async function buildInner({ build, workflow, user, controller, usage }) {
   };
 
   const searchable = isWebSearchConfigured();
-  const tools = buildTools({ state, emit, flushGraph, user, signal, searchable, goal: build.goal });
+  const tools = buildTools({
+    state,
+    emit,
+    flushGraph,
+    user,
+    signal,
+    searchable,
+    goal: build.goal,
+    needsClarification,
+    clarificationSatisfied,
+  });
 
   let outcome = null;
   let error = null;
 
   try {
     outcome = await runAgentLoop({
-      system: architectSystemPrompt({ intent: build.intent, webSearchAvailable: searchable }),
+      system: architectSystemPrompt({
+        intent: build.intent,
+        webSearchAvailable: searchable,
+        needsClarification,
+        clarificationSatisfied,
+      }),
       messages: build.messages.map(message => ({
         role: message.role,
         content: message.content,
       })),
       tools,
-      maxSteps: config.agentic.architectMaxSteps,
-      // The frontier tier. This model's output is a program that will run
-      // unattended against real APIs with the user's credentials — the one
-      // place in the product where being confidently wrong is expensive after
-      // the fact rather than just annoying at the time.
+      maxSteps: needsClarification ? Math.min(6, config.agentic.architectMaxSteps) : config.agentic.architectMaxSteps,
       role: 'reasoning',
       task: 'agentic:architect',
       temperature: 0.2,
-      /*
-       * Four times the loop's default. A tool result here is a rendered
-       * documentation page, and the endpoint, its auth header and its request
-       * body are rarely in the first six thousand characters. Truncating to
-       * the chat-sized default is how the architect ends up having "read" a
-       * reference and still guessing the body. The tokens are billed, so the
-       * larger window costs the user proportionally rather than costing us.
-       */
       maxResultChars: 24_000,
       signal,
+      preferredTerminal: needsClarification ? 'ask_clarifying' : 'finish',
       onEvent: async event => {
-        // Prose between tool calls is the model narrating its own reasoning,
-        // and it is the most useful thing on the timeline — it is the part that
-        // explains *why* the next four tool calls are about to happen.
         if (event.type === 'thinking' && event.text?.trim()) {
           await emit({ type: 'thought', detail: event.text });
         }
       },
       budgetNudge: ({ remaining }) => {
+        if (needsClarification && !state.awaitingClarification) {
+          return (
+            `[Budget: ${remaining} model call${remaining === 1 ? '' : 's'} left.] ` +
+            `Call ask_clarifying NOW with 3–5 questions (delivery, source, topic, schedule, ` +
+            `paid vs free APIs). Do not call plan, research tools, or edit_graph.`
+          );
+        }
         const actions = state.graph.nodes.filter(node => !String(node.type).startsWith('trigger.'));
         if (actions.length === 0) {
           return (
@@ -364,17 +382,22 @@ async function buildInner({ build, workflow, user, controller, usage }) {
   }
 
   const canceled = signal.aborted;
-  const succeeded = Boolean(outcome?.finished && !error && !canceled);
+  const awaitingClarification = Boolean(
+    state.awaitingClarification || outcome?.result?.awaitingClarification
+  );
+  const succeeded = Boolean(outcome?.finished && !error && !canceled && !awaitingClarification);
   const endCheck = validateGraph(state.graph, {
     mode: 'architect',
     requirements: [],
   });
   // Keep a valid partial graph (continue can finish it). Roll back only when the
   // session ended with structural damage — multi-trigger, orphans, etc.
+  // Intake-only sessions must not leave half-built guesses on the canvas.
   const keepGraph =
-    succeeded ||
-    state.handedOver ||
-    (endCheck.errors.length === 0 && actionNodeCount(state.graph) > 0);
+    !awaitingClarification &&
+    (succeeded ||
+      state.handedOver ||
+      (endCheck.errors.length === 0 && actionNodeCount(state.graph) > 0));
 
   if (keepGraph) {
     workflow.blueprint = {
@@ -399,25 +422,50 @@ async function buildInner({ build, workflow, user, controller, usage }) {
     startedAt,
     workflow,
     steps: outcome?.steps || 0,
-    summary: outcome?.result?.summary || outcome?.text || '',
+    summary:
+      outcome?.result?.summary ||
+      outcome?.text ||
+      (awaitingClarification ? 'Need a few details before building.' : ''),
     error:
       error ||
-      (outcome && !outcome.finished
+      (outcome && !outcome.finished && !awaitingClarification
         ? 'The architect ran out of steps before it finished. Ask it to continue.'
         : null),
     canceled,
+    awaitingClarification,
+    clarifyingQuestions: state.clarifyingQuestions,
   });
 
   return build;
 }
 
 /** Settle the bill, write the terminal state, publish it. */
-async function finishBuild({ build, user, usage, startedAt, workflow, steps, summary, error, canceled }) {
-  build.status = canceled ? 'canceled' : error ? 'failed' : 'succeeded';
+async function finishBuild({
+  build,
+  user,
+  usage,
+  startedAt,
+  workflow,
+  steps,
+  summary,
+  error,
+  canceled,
+  awaitingClarification = false,
+  clarifyingQuestions = [],
+}) {
+  build.status = canceled
+    ? 'canceled'
+    : error
+      ? 'failed'
+      : awaitingClarification
+        ? 'awaiting_clarification'
+        : 'succeeded';
   build.summary = safeMessage(summary, 4000);
   build.error = error ? safeMessage(error, 1000) : null;
   build.steps = steps;
   build.finishedAt = new Date();
+  build.clarifyingQuestions = awaitingClarification ? clarifyingQuestions : [];
+  if (awaitingClarification) build.clarificationSatisfied = false;
 
   if (build.summary) {
     build.messages.push({ role: 'assistant', content: build.summary, at: new Date() });
@@ -434,15 +482,12 @@ async function finishBuild({ build, user, usage, startedAt, workflow, steps, sum
   /*
    * Base fee plus what the tokens actually cost.
    *
-   * Not per step, which was the previous rule and was wrong in the direction
-   * that matters: a step is a model call, and a call that read a 14,000-token
-   * rendered docs page costs twenty times one that renamed a node. Charging
-   * both the same forces a cap on how much the architect is allowed to read,
-   * and a capped architect stops halfway through the reference and invents the
-   * rest — the exact failure this rebuild exists to remove. Metering tokens is
-   * what lets the ceiling come off.
+   * Intake-only rounds still meter tokens (the model wrote the questions) but
+   * skip the flat agent.build base — the user has not received a workflow yet.
    */
-  build.credits = meteredCost('agent.build', usageSummary.cost.totalPaise);
+  build.credits = awaitingClarification
+    ? Math.max(1, Math.round(meteredCost('agent.build', usageSummary.cost.totalPaise) * 0.25))
+    : meteredCost('agent.build', usageSummary.cost.totalPaise);
 
   try {
     const charge = await spend({
@@ -457,6 +502,7 @@ async function finishBuild({ build, user, usage, startedAt, workflow, steps, sum
         intent: build.intent,
         steps,
         outcome: build.status,
+        clarifying: awaitingClarification,
       },
     });
     build.ledgerId = charge.ledgerId || null;
@@ -484,6 +530,8 @@ async function finishBuild({ build, user, usage, startedAt, workflow, steps, sum
         steps: build.steps,
         messages: build.messages,
         timeline: build.timeline,
+        clarifyingQuestions: build.clarifyingQuestions,
+        clarificationSatisfied: build.clarificationSatisfied,
         credits: build.credits,
         cost: build.cost,
         tokens: build.tokens,
@@ -500,6 +548,7 @@ async function finishBuild({ build, user, usage, startedAt, workflow, steps, sum
     error: build.error,
     credits: build.credits,
     steps: build.steps,
+    clarifyingQuestions: build.clarifyingQuestions,
     durationMs: Date.now() - startedAt,
     workflow: workflow.toEditorJSON(),
   });
@@ -510,6 +559,7 @@ async function finishBuild({ build, user, usage, startedAt, workflow, steps, sum
     steps,
     credits: build.credits,
     costPaise: build.cost.totalPaise,
+    clarifying: awaitingClarification,
   });
 }
 
@@ -552,19 +602,94 @@ function actionNodeCount(graph) {
 }
 
 /** Refuse open-ended research once the architect should be building instead. */
-function assertMayResearch(state) {
+function assertMayResearch(state, { needsClarification } = {}) {
+  if (needsClarification) {
+    throw new Error(
+      'Do not research yet. Call ask_clarifying with 3–5 structured questions about ' +
+        'delivery, source, topic, schedule, and paid vs free APIs, then stop.'
+    );
+  }
   if (state.graphEdited) return;
   if (state.researchBeforeBuild >= 3) {
     throw new Error(
       'You have already researched enough for one session. Call edit_graph now — add the ' +
-      'trigger and the first real steps. You can test_step after the graph exists.'
+        'trigger and the first real steps. You can test_step after the graph exists.'
     );
   }
   state.researchBeforeBuild += 1;
 }
 
-function buildTools({ state, emit, flushGraph, user, signal, searchable, goal }) {
+function assertMayBuild(_state, { needsClarification } = {}) {
+  if (needsClarification) {
+    throw new Error(
+      'The goal is underspecified. Call ask_clarifying first (delivery destination, news ' +
+        'source, topic/filter, schedule hour, paid vs free APIs). Do not edit the graph yet.'
+    );
+  }
+}
+
+function buildTools({
+  state,
+  emit,
+  flushGraph,
+  user,
+  signal,
+  searchable,
+  goal,
+  needsClarification = false,
+}) {
   const tools = {};
+
+  tools.ask_clarifying = defineTool({
+    description:
+      'Pause the build and ask the user 3–5 structured intake questions. Use this when ' +
+      'delivery, source, topic, schedule, or paid-API choices are missing. After this call ' +
+      'the session ends; the user answers in the UI and a follow-up session builds.',
+    properties: {
+      summary: {
+        type: 'string',
+        description: 'Short markdown explaining why you need these details before building.',
+      },
+      questions: {
+        type: 'array',
+        description: '3–5 questions. Prefer choice with concrete options; text for emails/URLs.',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Stable id: delivery, source, topic, schedule, budget…' },
+            question: { type: 'string' },
+            type: { type: 'string', enum: ['choice', 'text'] },
+            options: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['id', 'question'],
+        },
+      },
+    },
+    required: ['summary', 'questions'],
+    terminal: true,
+    run: async ({ summary, questions }) => {
+      const normalized = normalizeClarifyingQuestions(questions);
+      if (normalized.length < 2) {
+        throw new Error('ask_clarifying needs at least 2 questions (aim for 3–5).');
+      }
+
+      state.awaitingClarification = true;
+      state.clarifyingQuestions = normalized;
+
+      await emit({
+        type: 'clarify',
+        title: 'Need a few details',
+        detail: safeMessage(summary, 800),
+        meta: { questions: normalized },
+      });
+
+      return {
+        awaitingClarification: true,
+        questions: normalized,
+        summary: safeMessage(summary, 2000),
+      };
+    },
+  });
 
   tools.plan = defineTool({
     description:
@@ -587,6 +712,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     },
     required: ['steps'],
     run: async ({ steps }) => {
+      assertMayBuild(state, { needsClarification });
       if (state.planRecorded) {
         throw new Error(
           'The plan is already recorded. Do not call plan again — call edit_graph to add nodes ' +
@@ -633,7 +759,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
       },
       required: ['service'],
       run: async ({ service }) => {
-        assertMayResearch(state);
+        assertMayResearch(state, { needsClarification });
         const found = await searchDocs(String(service), { maxPages: 2 });
         if (!found) {
           throw new Error('Documentation search is unavailable right now — try search_web and read_url.');
@@ -671,7 +797,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
       },
       required: ['query'],
       run: async ({ query }) => {
-        assertMayResearch(state);
+        assertMayResearch(state, { needsClarification });
         const results = await webSearch(String(query), { maxResults: 6 });
         if (!results) throw new Error('Web search is unavailable right now — build from what you know and say so.');
         await emit({
@@ -696,7 +822,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     },
     required: ['url'],
     run: async ({ url, why }) => {
-      assertMayResearch(state);
+      assertMayResearch(state, { needsClarification });
       // `allowRender` on: a build reads a given page once, so a rendered retry
       // costs one credit to turn an empty app shell into the reference the
       // whole step was for. Workflow nodes, which fetch on every run, don't
@@ -876,6 +1002,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     },
     required: ['operations'],
     run: async ({ operations }) => {
+      assertMayBuild(state, { needsClarification });
       const beforeOrphans = findOrphans(state.graph.nodes, state.graph.edges).length;
       const beforeTriggers = state.graph.nodes.filter(
         n => getNodeDef(n.type)?.kind === 'trigger'
@@ -1071,6 +1198,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     required: ['summary'],
     terminal: true,
     run: async ({ name, summary }) => {
+      assertMayBuild(state, { needsClarification });
       if (actionNodeCount(state.graph) === 0) {
         throw new Error(
           'The graph has no action steps yet — only a trigger (or nothing) is not a workflow. ' +

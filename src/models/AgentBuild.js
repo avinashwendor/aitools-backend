@@ -42,13 +42,38 @@ const agentBuildSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ['queued', 'running', 'succeeded', 'failed', 'canceled'],
+      enum: ['queued', 'running', 'succeeded', 'failed', 'canceled', 'awaiting_clarification'],
       default: 'queued',
       index: true,
     },
 
     /** What the user asked for, verbatim. */
     goal: { type: String, default: '', maxlength: 4000 },
+
+    /**
+     * Structured intake questions when status is `awaiting_clarification`.
+     * Same shape as chat ClarifyingQuestions: { id, question, type, options? }.
+     */
+    clarifyingQuestions: {
+      type: [
+        new mongoose.Schema(
+          {
+            id: { type: String, required: true, maxlength: 40 },
+            question: { type: String, required: true, maxlength: 240 },
+            type: { type: String, enum: ['choice', 'text'], default: 'choice' },
+            options: { type: [String], default: undefined },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
+
+    /**
+     * Set when the user answered an intake round — the next session may build
+     * without calling ask_clarifying again for the same unknowns.
+     */
+    clarificationSatisfied: { type: Boolean, default: false },
 
     /**
      * Why this build ran. `build` is the first pass, `edit` is a follow-up
@@ -113,6 +138,8 @@ agentBuildSchema.methods.toJSONSafe = function toJSONSafe() {
     messages: this.messages,
     timeline: this.timeline,
     summary: this.summary,
+    clarifyingQuestions: this.clarifyingQuestions || [],
+    clarificationSatisfied: Boolean(this.clarificationSatisfied),
     error: this.error,
     steps: this.steps,
     credits: this.credits,

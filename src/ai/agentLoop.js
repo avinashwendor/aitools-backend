@@ -298,6 +298,7 @@ async function summarizeHistory({ transcript, task, signal, onEvent }) {
  * @param {object} [opts.context]              passed to every tool handler
  * @param {({remaining:number, steps:number, maxSteps:number})=>string|null} [opts.budgetNudge]
  *   replaces the default landing warning when non-null
+ * @param {string} [opts.preferredTerminal]    tool name used in landing nudges when several are terminal
  * @returns {Promise<{finished, finishReason, result, text, steps, transcript, toolCalls, usage}>}
  */
 export async function runAgentLoop({
@@ -315,9 +316,13 @@ export async function runAgentLoop({
   signal,
   context = {},
   budgetNudge = null,
+  preferredTerminal = null,
 }) {
   const wireTools = toWireTools(tools);
-  const terminalTool = Object.entries(tools).find(([, tool]) => tool.terminal)?.[0] || null;
+  const terminalTool =
+    (preferredTerminal && tools[preferredTerminal]?.terminal && preferredTerminal) ||
+    Object.entries(tools).find(([, tool]) => tool.terminal)?.[0] ||
+    null;
   let transcript = [
     { role: 'system', content: system },
     ...messages,
