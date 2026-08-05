@@ -46,7 +46,9 @@ export async function discoverAndQueueTools({ webResults, assistantReply, source
       task: 'tool-discovery:extract',
       role: 'fast',
       temperature: 0.1,
-      maxTokens: 500,
+      // Room for the `fast` tier's reasoning tokens as well as the answer —
+      // see the ceiling-retry note in `completeJson`.
+      maxTokens: 2000,
       messages: [
         { role: 'system', content: prompts.suggestedToolExtractionSystem() },
         {

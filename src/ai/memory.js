@@ -34,6 +34,7 @@ export async function loadConversation(userId, sessionId) {
       messages: [],
       summary: '',
       goal: '',
+      brief: '',
       lastWorkflow: null,
       clarificationState: null,
       turnCount: 0,
@@ -90,7 +91,9 @@ export async function appendTurn(userId, sessionId, {
   assistantMessage,
   toolSlugs = [],
   goal,
+  brief,
   workflow,
+  workflowDiff,
   title,
 }) {
   const key = { user: userId, sessionId: sessionId || 'default' };
@@ -98,7 +101,14 @@ export async function appendTurn(userId, sessionId, {
   const push = [];
   if (userMessage) push.push({ role: 'user', content: userMessage.slice(0, 8000) });
   if (assistantMessage) {
-    push.push({ role: 'assistant', content: assistantMessage.slice(0, 8000), toolSlugs });
+    push.push({
+      role: 'assistant',
+      content: assistantMessage.slice(0, 8000),
+      toolSlugs,
+      // Pinned to the turn that produced it, so the transcript and the canvas
+      // can never describe two different plans.
+      ...(workflow ? { workflow, workflowDiff: workflowDiff || undefined } : {}),
+    });
   }
 
   const update = {
@@ -116,6 +126,17 @@ export async function appendTurn(userId, sessionId, {
     new: true,
     setDefaultsOnInsert: true,
   }).lean();
+
+  // Written once, and only when empty. A later turn's routed goal must not
+  // overwrite what the user approved at intake — that erasure is the whole
+  // reason this field exists. `$setOnInsert` would not do: by the approval turn
+  // the conversation already exists, created when the questions were asked.
+  if (brief && !convo.brief) {
+    await Conversation.updateOne(
+      { ...key, $or: [{ brief: '' }, { brief: { $exists: false } }] },
+      { $set: { brief: brief.slice(0, 2000) } }
+    );
+  }
 
   if (convo.messages.length > COMPACT_AT) {
     // Fire-and-forget: compaction must never add latency to the user's turn.
@@ -139,9 +160,12 @@ async function compact(key, convo) {
   try {
     const { content } = await complete({
       task: 'memory:compact',
-      role: 'fast',
+      // Dense compression, not judgment — the cheapest tier tuned for
+      // long-context summarisation, kept separate from routing/classification
+      // so it can be swapped or billed independently of `fast`.
+      role: 'utility',
       temperature: 0.2,
-      maxTokens: 400,
+      maxTokens: 700,
       messages: [
         {
           role: 'system',
@@ -149,7 +173,8 @@ async function compact(key, convo) {
             'You compress conversation history for an AI-tool workflow assistant. ' +
             'Write at most 8 short bullet points capturing: what the user is building, ' +
             'constraints they stated (budget, skill level, platform, deadline), tools already ' +
-            'chosen or rejected, and any decisions made. Facts only, no filler.',
+            'chosen or rejected, and any decisions made. Facts only, no filler. ' +
+            'Never drop a stated constraint (platform, budget, skill, rejected tools) to save space.',
         },
         {
           role: 'user',

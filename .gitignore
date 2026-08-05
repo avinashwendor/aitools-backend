@@ -9,3 +9,6 @@ logs/
 *.log
 coverage/
 .DS_Store
+
+# e2e test output
+.e2e/

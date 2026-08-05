@@ -14,6 +14,24 @@ const messageSchema = new mongoose.Schema(
     content: { type: String, required: true, maxlength: 8000 },
     /** Slugs referenced by an assistant turn — cheap grounding for follow-ups. */
     toolSlugs: [{ type: String }],
+
+    /**
+     * The workflow this turn produced, as it was at that moment.
+     *
+     * Only `lastWorkflow` used to be kept, so a session that had been refined
+     * held the v1 reply in its transcript and only the v2 graph on the canvas.
+     * Reloading showed prose describing stages that no longer existed, and
+     * there was nothing to diff against or roll back to — the diff was computed
+     * on the way past and discarded.
+     *
+     * Stored per assistant turn rather than in a separate collection because
+     * that is the granularity the transcript is read at, and a plan is a few KB
+     * against a 16MB document limit.
+     */
+    workflow: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    /** What changed versus the previous version, for the "what moved" view. */
+    workflowDiff: { type: mongoose.Schema.Types.Mixed, default: undefined },
+
     createdAt: { type: Date, default: Date.now },
   },
   { _id: false }
@@ -36,6 +54,19 @@ const conversationSchema = new mongoose.Schema(
 
     /** The goal that produced the current workflow, used to ground refinements. */
     goal: { type: String, default: '' },
+
+    /**
+     * The enriched brief the user approved before the first plan: their goal
+     * plus every intake answer, verbatim.
+     *
+     * Distinct from `goal`, which the router rewrites on every turn from the
+     * last few messages. By the second refine the platforms, the feature list
+     * and the audience the user spelled out at intake have been compressed out
+     * of `goal` entirely, and the planner is left inferring them from the prior
+     * plan's stage titles. This is written once, at approval, and never
+     * overwritten — it is what the user actually asked for.
+     */
+    brief: { type: String, default: '' },
 
     /** Last workflow returned for this session, so "make it cheaper" has context. */
     lastWorkflow: { type: mongoose.Schema.Types.Mixed, default: null },

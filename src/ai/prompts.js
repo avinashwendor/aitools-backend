@@ -96,14 +96,51 @@ Respond with exactly:
 // ─────────────────────────────────────────────────────────────
 // 2. Planner — choose the stages and the tool for each
 // ─────────────────────────────────────────────────────────────
-export function plannerSystem({ minStages, maxStages, pricing, skill, profile = null }) {
-  return `You are ${BRAND}. You design real, executable workflows out of a fixed catalog of AI tools.
+export function plannerSystem({
+  minStages,
+  maxStages,
+  pricing,
+  skill,
+  profile = null,
+  allowExternalTools = false,
+}) {
+  return `You are ${BRAND}. You design real, executable workflows out of a catalog of AI tools.
 Think like a project architect planning one scoped build for this specific user.${plannerProfileBlock(profile)}
 
-You will receive CANDIDATE_TOOLS (JSON). It is the ONLY inventory you may use.
-Every "toolSlug" and "alternativeSlugs" value MUST be copied verbatim from a candidate's
-"slug" field. Inventing a slug, or naming a tool that is not in the list, makes the plan
-unusable — if the perfect tool is missing, pick the closest candidate and say so in "why".
+INVENTORY
+You will receive CANDIDATE_TOOLS (JSON). Every "toolSlug" and "alternativeSlugs" value MUST be
+copied verbatim from a candidate's "slug" field. Never invent a slug.
+${
+  allowExternalTools
+    ? `The user has opted in to tools BEYOND our catalog. You will also receive
+EXTERNAL_CANDIDATES — real products found by web search. When no candidate tool can genuinely
+do a stage's job, you may bind that stage to an external tool instead:
+
+    {"title":"...","externalTool":{"name":"Glide","url":"https://www.glideapps.com",
+     "pricing":"freemium"},"why":"...","input":"...","output":"...","timeMinutes":60}
+
+Set "toolSlug" to null when you do that. An external tool's "name" and "url" MUST be copied from
+EXTERNAL_CANDIDATES — never from memory, and never a URL you have not been shown. Prefer a
+catalog tool whenever one can actually do the job; an external tool is for a real capability gap,
+not a preference.`
+    : `The catalog is the ONLY inventory you may use. If no candidate can genuinely do a stage's
+job, still bind the stage to the closest candidate — and record the shortfall in "gaps" (below)
+instead of pretending the candidate is something else.`
+}
+
+THE ONE RULE THAT IS NEVER NEGOTIABLE
+A stage's "title", "why", the plan "summary", "outcome" and every "tip" may name ONLY the tool
+that stage is actually bound to. Never write a stage titled after one product while binding it to
+another — the user sees your words next to the real tool's name, logo and link, and a stage whose
+title says one tool and whose chip says a different one is worse than no plan at all. If you want
+a tool you cannot bind, do not describe it as if you had: put it in "gaps".
+
+GAPS
+"gaps": the capabilities this plan could not properly serve, if any. Each item:
+{"capability":"installable native iOS/Android app","reason":"no catalog tool builds installable
+mobile apps","closestSlug":"lovable","suggestedTool":"Glide"}. Return [] when the plan genuinely
+covers the goal. An honest gap is worth far more to the user than a stage that overstates what it
+delivers.
 
 DESIGN RULES
 1. ${minStages}-${maxStages} stages. Each stage is a distinct PHASE OF WORK, not a tool demo.
@@ -115,7 +152,9 @@ DESIGN RULES
 4. One tool per stage. Do not use the same tool for two stages unless the second use is
    genuinely a different job, and say why if so.
 5. "why" is one sentence naming the specific capability that makes this tool right here.
-   No marketing language.
+   No marketing language. "title" and "why" are shown to the user as the description of the
+   FINISHED stage — never write them as a record of what you changed ("this stage has been
+   replaced…", "swapped from X…"). The user reads a plan, not a diff.
 6. "alternativeSlugs": 1-2 real candidate slugs a user could swap in. Omit if none fit.
 7. "timeMinutes": realistic hands-on time for a ${skill} user. Be honest — most stages
    are 10-45 minutes, not 5.
@@ -140,11 +179,28 @@ Respond with JSON only:
 {"title":"...","summary":"...","outcome":"...","difficulty":"beginner|intermediate|advanced",
  "stages":[{"title":"...","toolSlug":"...","why":"...","input":"...","output":"...",
             "timeMinutes":20,"alternativeSlugs":["..."]}],
+ "gaps":[{"capability":"...","reason":"...","closestSlug":"...","suggestedTool":"..."}],
  "tips":["..."],"followUp":"..."}`;
 }
 
-export function plannerUser({ goal, candidates, priorWorkflow, adjustment }) {
+export function plannerUser({
+  goal,
+  candidates,
+  priorWorkflow,
+  adjustment,
+  externalCandidates = null,
+  brief = '',
+}) {
   const parts = [];
+
+  // What the user actually asked for, as they said it. `goal` is a one-line
+  // restatement the router rewrites every turn; by the second refine it no
+  // longer carries the platforms, the feature list or the audience they spelled
+  // out at intake. Both are supplied because they answer different questions:
+  // the brief is the contract, the goal is this turn's focus.
+  if (brief) {
+    parts.push(`THE USER'S ORIGINAL BRIEF (their stated requirements — every plan must still satisfy this):\n${brief}`);
+  }
 
   if (priorWorkflow) {
     parts.push(
@@ -163,13 +219,28 @@ export function plannerUser({ goal, candidates, priorWorkflow, adjustment }) {
       ) +
       `\n\nREQUESTED ADJUSTMENT: ${adjustment}\n` +
       `Keep everything that still works. Change only what the adjustment requires, ` +
-      `and re-chain inputs/outputs if you swap or reorder a stage.`
+      `and re-chain inputs/outputs if you swap or reorder a stage.\n` +
+      // The prior plan is context for you, not a changelog for the user. A
+      // refine that leaks "this stage has been replaced" into `why` ships a
+      // developer's note as the stage's description.
+      `Write the result as a complete, standalone plan. Every "title" and "why" must read as ` +
+      `the description of the finished stage, with no reference to the previous version, what ` +
+      `was swapped, or why you changed it.`
     );
   }
 
   parts.push(`GOAL: ${goal}`);
   parts.push(`CANDIDATE_TOOLS (${candidates.length} available — use slugs exactly as written):
 ${JSON.stringify(candidates)}`);
+
+  if (externalCandidates?.length) {
+    parts.push(
+      `EXTERNAL_CANDIDATES (${externalCandidates.length} products found by web search, NOT in our ` +
+      `catalog — bind a stage to one only when no candidate tool can do that stage's job, and ` +
+      `copy "name" and "url" exactly as written here):\n${JSON.stringify(externalCandidates)}`
+    );
+  }
+
   parts.push(`Design the workflow now. JSON only.`);
 
   return parts.join('\n\n');
@@ -319,6 +390,31 @@ RULES
 }
 
 // ─────────────────────────────────────────────────────────────
+// 4a-bis. External planner candidates — real products the catalog lacks
+// ─────────────────────────────────────────────────────────────
+export function externalCandidateSystem() {
+  return `You read web search results and pull out the actual PRODUCTS a person could sign up for
+and use, for ${BRAND}.
+
+Only extract a tool when the result identifies a real, distinct product AND you have its URL from
+the results. Never write a URL that does not appear in the results, and never extract a listicle,
+review site, blog post, subreddit or comparison page as if it were the product itself. If a result
+is "10 best app builders in 2026", the article is not a tool — skip it.
+
+Return at most 6, best fit first.
+
+Respond with JSON only:
+{"tools":[{"name":"...","url":"https://...","tagline":"one line, what it does",
+           "pricing":"free"|"freemium"|"paid"|"contact"}]}
+If nothing qualifies, return {"tools":[]}.`;
+}
+
+export function externalCandidateUser({ goal, webResults }) {
+  return `GOAL: ${goal}\n\nWEB SEARCH RESULTS:\n${JSON.stringify(webResults)}\n\n` +
+    `Extract the real products now. Copy each "url" exactly from a result. JSON only.`;
+}
+
+// ─────────────────────────────────────────────────────────────
 // 4b. Suggested-tool extraction — turns a web search hit into an admin-review candidate
 // ─────────────────────────────────────────────────────────────
 export function suggestedToolExtractionSystem() {
@@ -387,6 +483,8 @@ export default {
   playbookUser,
   answerSystem,
   workflowStepAnswerSystem,
+  externalCandidateSystem,
+  externalCandidateUser,
   suggestedToolExtractionSystem,
   suggestedToolExtractionUser,
   profileExtractionSystem,

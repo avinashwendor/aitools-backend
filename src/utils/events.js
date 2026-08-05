@@ -13,6 +13,8 @@ bus.setMaxListeners(25);
 
 export const EVENTS = {
   TOOL_CHANGED: 'tool:changed',
+  /** An admin repointed a role at a different model — routing must reload. */
+  MODEL_ROUTING_CHANGED: 'modelRouting:changed',
 };
 
 export default bus;

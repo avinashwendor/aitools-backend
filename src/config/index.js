@@ -120,7 +120,8 @@ function resolveQdrantApiKey() {
  *  1. AI_PROVIDERS — a JSON array, for multi-provider failover:
  *       [{"name":"openrouter","baseUrl":"https://openrouter.ai/api/v1",
  *         "apiKey":"sk-or-…","planner":"openai/gpt-5.6-luna",
- *         "fast":"openai/gpt-5-mini","fallbacks":["openai/gpt-5-mini"]}]
+ *         "fast":"openai/gpt-5-mini","reasoning":"openai/gpt-5.6-luna",
+ *         "utility":"qwen/qwen-3.7-plus","fallbacks":["openai/gpt-5-mini"]}]
  *
  *  2. The flat AI_BASE_URL / AI_API_KEY / AI_MODEL_* variables (single provider).
  *     GROQ_API_KEY is still honoured so older deployments keep working.
@@ -152,11 +153,18 @@ function buildProviders() {
         plannerModel: p.planner || p.plannerModel,
         fastModel: p.fast || p.fastModel || p.planner || p.plannerModel,
         /**
-         * The frontier tier, used only by the architect and the agent node.
+         * The frontier tier, used only by the architect and the agent node,
+         * plus workflow plan/refine (the stage/tool graph has to be right).
          * Falls back to the planner so a provider that doesn't name one still
          * works — it just builds workflows with a cheaper model.
          */
         reasoningModel: p.reasoning || p.reasoningModel || p.planner || p.plannerModel,
+        /**
+         * The cheapest tier: transcript/memory summarisation, where the job is
+         * dense compression rather than judgment. Falls back to fast so an
+         * unconfigured provider degrades gracefully instead of breaking.
+         */
+        utilityModel: p.utility || p.utilityModel || p.fast || p.fastModel,
         fallbackModels: Array.isArray(p.fallbacks) ? p.fallbacks : [],
         /** Providers whose models reject response_format:{type:'json_object'}. */
         noJsonMode: Boolean(p.noJsonMode),
@@ -176,6 +184,7 @@ function buildProviders() {
     plannerModel: planner,
     fastModel: process.env.AI_MODEL_FAST || planner || 'llama-3.3-70b-versatile',
     reasoningModel: process.env.AI_MODEL_REASONING || planner,
+    utilityModel: process.env.AI_MODEL_UTILITY || process.env.AI_MODEL_FAST || planner,
     fallbackModels: list(process.env.AI_MODEL_FALLBACKS, []),
     noJsonMode: false,
   }];

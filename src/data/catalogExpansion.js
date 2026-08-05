@@ -14,6 +14,7 @@
 const logo = domain => `https://www.google.com/s2/favicons?sz=128&domain_url=https://${domain}`;
 
 export const extraCategories = [
+  { name: 'App Builders', slug: 'app-builders', icon: '📱', color: '#8b5cf6', description: 'No-code and AI tools for building mobile and web applications', order: 6 },
   { name: 'Audio', slug: 'audio', icon: '🎵', color: '#10b981', description: 'AI tools for audio, music, and voice generation', order: 4 },
   { name: 'Business', slug: 'business', icon: '💼', color: '#f97316', description: 'AI tools for business operations and management', order: 10 },
   { name: 'Data & Analytics', slug: 'data', icon: '📊', color: '#0ea5e9', description: 'AI tools for data analysis, visualization, and insights', order: 12 },
@@ -672,6 +673,159 @@ export const extraTools = [
     features: ['AI detection', 'Plagiarism check', 'Readability scoring', 'Team management', 'Chrome extension'],
     tags: ['ai detection', 'plagiarism', 'content', 'editorial', 'quality'],
     views: 195000, likes: 4900, rating: 4.1, reviewCount: 830, isVerified: true,
+  },
+
+  // ─── App builders ─────────────────────────────────────────
+  // Added because "build a mobile app" had no correct answer. The catalog's
+  // only builders were Lovable, Bolt, Replit Agent and v0 — every one of them
+  // ships a website. Asked for a school app for iOS and Android, the planner
+  // did the only thing the inventory allowed: it bound the build stage to a web
+  // app builder, and then described it as if it were something else. A whole
+  // class of goal was unbuildable and the plans said otherwise.
+  {
+    name: 'Glide',
+    tagline: 'Turn a spreadsheet into an installable mobile app without code',
+    description:
+      'Glide builds mobile-first apps from Google Sheets, Excel or its own Glide Tables, with role-based access, forms and offline support. Apps install to an iOS or Android home screen as a PWA, which makes it the shortest path from a data set to something people can actually use on a phone.',
+    logo: logo('glideapps.com'),
+    websiteUrl: 'https://www.glideapps.com',
+    category: 'app-builders',
+    pricing: 'freemium',
+    pricingDetails: 'Free tier for personal apps. Maker $49/mo, Business $249/mo',
+    features: ['Spreadsheet-driven apps', 'Role-based access', 'Installable on iOS and Android', 'Forms and data entry', 'AI-generated screens'],
+    tags: ['no code', 'mobile app', 'app builder', 'pwa', 'spreadsheet', 'internal tools'],
+    views: 410000, likes: 15000, rating: 4.6, reviewCount: 2400, isFeatured: true, isVerified: true,
+  },
+  {
+    name: 'FlutterFlow',
+    tagline: 'Build real native iOS and Android apps visually, and export the code',
+    description:
+      'FlutterFlow is a visual builder on top of Flutter that produces genuine native iOS and Android binaries, with Firebase or Supabase for data, push notifications and in-app payments. It is the option to reach for when the deliverable has to be a real App Store or Play Store listing rather than a web app on a home screen.',
+    logo: logo('flutterflow.io'),
+    websiteUrl: 'https://flutterflow.io',
+    category: 'app-builders',
+    pricing: 'freemium',
+    pricingDetails: 'Free plan. Standard $30/mo, Pro $70/mo (code export on paid plans)',
+    features: ['Native iOS and Android builds', 'Visual UI editor', 'Firebase and Supabase integration', 'Push notifications', 'Flutter code export'],
+    tags: ['mobile app', 'native', 'ios', 'android', 'app builder', 'low code', 'app store'],
+    views: 520000, likes: 19000, rating: 4.5, reviewCount: 3100, isFeatured: true, isVerified: true,
+  },
+  {
+    name: 'Adalo',
+    tagline: 'Drag-and-drop native mobile apps you can publish to the app stores',
+    description:
+      'Adalo assembles mobile apps from components — lists, forms, logins, payments — and publishes them to the App Store and Play Store on paid plans. Aimed squarely at people who are not developers, with a database built in rather than bolted on.',
+    logo: logo('adalo.com'),
+    websiteUrl: 'https://www.adalo.com',
+    category: 'app-builders',
+    pricing: 'freemium',
+    pricingDetails: 'Free to build. Starter $45/mo, Professional $65/mo for store publishing',
+    features: ['Drag-and-drop mobile UI', 'Built-in database', 'App Store and Play Store publishing', 'User logins', 'Stripe payments'],
+    tags: ['no code', 'mobile app', 'app builder', 'ios', 'android', 'app store'],
+    views: 280000, likes: 8600, rating: 4.2, reviewCount: 1500, isVerified: true,
+  },
+  {
+    name: 'Bubble',
+    tagline: 'Build full web applications with complex logic and no code',
+    description:
+      'Bubble covers the cases simpler builders cannot: multi-role permissions, custom workflows, API integrations and a real database, all without code. Web-first — mobile ships as a responsive or wrapped app — so it suits an admin-heavy product more than a phone-first one.',
+    logo: logo('bubble.io'),
+    websiteUrl: 'https://bubble.io',
+    category: 'app-builders',
+    pricing: 'freemium',
+    pricingDetails: 'Free plan. Starter $32/mo, Growth $134/mo',
+    features: ['Visual workflow logic', 'Built-in database', 'API connector', 'User roles and permissions', 'Plugin ecosystem'],
+    tags: ['no code', 'web app', 'app builder', 'workflows', 'database', 'saas'],
+    views: 620000, likes: 21000, rating: 4.3, reviewCount: 4200, isVerified: true,
+  },
+  {
+    name: 'Softr',
+    tagline: 'Turn Airtable or Google Sheets into a client portal in an afternoon',
+    description:
+      'Softr builds portals, directories and internal tools on top of Airtable, Google Sheets or its own database, with membership, granular permissions and pre-built blocks. Fast for anything where the job is giving different people different views of the same data.',
+    logo: logo('softr.io'),
+    websiteUrl: 'https://www.softr.io',
+    category: 'app-builders',
+    pricing: 'freemium',
+    pricingDetails: 'Free tier. Basic $59/mo, Professional $167/mo',
+    features: ['Airtable and Sheets front end', 'Membership and permissions', 'Pre-built blocks', 'Client portals', 'Custom domains'],
+    tags: ['no code', 'portal', 'app builder', 'airtable', 'internal tools', 'membership'],
+    views: 190000, likes: 6100, rating: 4.4, reviewCount: 1100, isVerified: true,
+  },
+  {
+    name: 'Thunkable',
+    tagline: 'Build and publish cross-platform mobile apps by dragging blocks',
+    description:
+      'Thunkable produces native iOS and Android apps from a visual block editor, with device features — camera, GPS, push notifications — available without code. Widely used in education, where the block-based editor doubles as a teaching tool.',
+    logo: logo('thunkable.com'),
+    websiteUrl: 'https://thunkable.com',
+    category: 'app-builders',
+    pricing: 'freemium',
+    pricingDetails: 'Free to build and test. Starter $13/mo, Pro $38/mo for store publishing',
+    features: ['Block-based logic', 'Native iOS and Android output', 'Device APIs (camera, GPS)', 'Push notifications', 'App store publishing'],
+    tags: ['no code', 'mobile app', 'app builder', 'education', 'ios', 'android', 'blocks'],
+    views: 240000, likes: 7200, rating: 4.0, reviewCount: 980, isVerified: true,
+  },
+
+  // ─── Education ────────────────────────────────────────────
+  // The `education` category has existed since the original seed with zero
+  // tools in it, so every education goal was routed into writing or
+  // productivity and planned with tools that know nothing about a classroom.
+  {
+    name: 'Khanmigo',
+    tagline: "Khan Academy's AI tutor and teacher assistant",
+    description:
+      'Khanmigo tutors students by asking guiding questions instead of handing over answers, and gives teachers lesson planning, rubric writing and progress insight. Built by Khan Academy, and priced for schools rather than per seat.',
+    logo: logo('khanmigo.ai'),
+    websiteUrl: 'https://www.khanmigo.ai',
+    category: 'education',
+    pricing: 'freemium',
+    pricingDetails: 'Free for teachers in supported countries. $4/mo for learners',
+    features: ['Socratic AI tutoring', 'Lesson planning', 'Rubric generation', 'Student progress insight', 'District deployment'],
+    tags: ['education', 'tutoring', 'teaching', 'school', 'students', 'classroom'],
+    views: 340000, likes: 11000, rating: 4.5, reviewCount: 1800, isFeatured: true, isVerified: true,
+  },
+  {
+    name: 'MagicSchool AI',
+    tagline: 'Sixty-plus AI tools built for teachers, from lesson plans to IEPs',
+    description:
+      'MagicSchool covers the administrative half of teaching: lesson plans, differentiated materials, rubrics, report card comments, parent emails and IEP drafting, with student-facing tools that keep work inside school policy.',
+    logo: logo('magicschool.ai'),
+    websiteUrl: 'https://www.magicschool.ai',
+    category: 'education',
+    pricing: 'freemium',
+    pricingDetails: 'Free for individual educators. Plus $99/yr, school and district plans available',
+    features: ['Lesson plan generation', 'Differentiated materials', 'Rubric and assessment writing', 'Parent communication drafts', 'IEP support'],
+    tags: ['education', 'teaching', 'lesson plans', 'school', 'teachers', 'assessment'],
+    views: 410000, likes: 13000, rating: 4.7, reviewCount: 2600, isFeatured: true, isVerified: true,
+  },
+  {
+    name: 'Quizizz',
+    tagline: 'Generate quizzes and interactive lessons from any material',
+    description:
+      'Quizizz turns a document, a topic or a slide deck into a graded quiz or a paced lesson, then reports which students missed what. The AI generation is the time saver; the class-level reporting is the reason teachers keep it.',
+    logo: logo('quizizz.com'),
+    websiteUrl: 'https://quizizz.com',
+    category: 'education',
+    pricing: 'freemium',
+    pricingDetails: 'Free for teachers. Super $8.99/mo, school plans available',
+    features: ['AI quiz generation', 'Interactive lessons', 'Auto-grading', 'Per-student reports', 'LMS integration'],
+    tags: ['education', 'quiz', 'assessment', 'classroom', 'school', 'students'],
+    views: 780000, likes: 24000, rating: 4.5, reviewCount: 5400, isVerified: true,
+  },
+  {
+    name: 'Gradescope',
+    tagline: 'AI-assisted grading for handwritten, coded and typed work',
+    description:
+      'Gradescope groups similar answers so one piece of feedback applies to every student who made the same mistake, handles handwriting and code, and produces item-level analytics. Standard in universities for exactly the reason it exists: grading at scale is where teaching time goes.',
+    logo: logo('gradescope.com'),
+    websiteUrl: 'https://www.gradescope.com',
+    category: 'education',
+    pricing: 'freemium',
+    pricingDetails: 'Free basic course tier. Institutional licensing on request',
+    features: ['AI answer grouping', 'Handwriting recognition', 'Code autograding', 'Rubric-based marking', 'Item analytics'],
+    tags: ['education', 'grading', 'assessment', 'university', 'college', 'exams'],
+    views: 220000, likes: 6800, rating: 4.4, reviewCount: 1200, isVerified: true,
   },
 ];
 

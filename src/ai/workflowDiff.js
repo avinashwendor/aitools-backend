@@ -14,38 +14,38 @@
  * @param {string} [opts.adjustment] user's refinement request
  * @returns {{ workflow: object, diff: object }}
  */
-export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
-  if (!prior?.stages?.length) {
-    return {
-      workflow: { ...next, version: 1 },
-      diff: { isNew: true, changedStageIds: [], preservedStageIds: [], replacedTools: [] },
-    };
-  }
-
-  const priorStages = prior.stages || [];
-  const nextStages = next.stages || [];
+/**
+ * Align each stage of a new plan to the prior stage it continues, if any.
+ *
+ * Matching runs as ordered passes over the *whole* next-stage list, rather
+ * than resolving each next-stage greedily in isolation. A single greedy
+ * pass processes stages left to right, so when a stage is inserted midway
+ * through the plan, the inserted stage gets resolved before the real stage
+ * that used to sit at its new index does — and a same-position fallback
+ * would let the inserted stage steal that later stage's identity before
+ * the correct title match ever gets a chance to run. Doing title-matching
+ * as its own global pass first means position never gets to arbitrate a
+ * case it's wrong about.
+ *
+ * Every prior stage can be claimed by at most one next stage. Two
+ * next-stages that both moved away from the same tool (e.g. a global
+ * "replace Figma" adjustment touching several stages) must NOT both
+ * resolve to the same prior stage — a duplicate id downstream collapses
+ * two nodes onto one in the canvas graph and onto one `stageId` in the
+ * task board, which is exactly the "connections broke" / "tasks didn't
+ * update" reports.
+ *
+ * Exported because playbook reuse needs the *same* answer this does. They used
+ * to disagree: reuse matched by array index while this matched by title, so a
+ * refine that inserted or reordered a stage could copy one stage's playbook
+ * onto a stage that then took a different stage's identity.
+ *
+ * @returns {Array<object|null>} parallel to `nextStages`
+ */
+export function resolveStageMatches(priorStages = [], nextStages = [], adjustment = '') {
   const adjustmentLower = String(adjustment).toLowerCase();
   const norm = s => String(s || '').toLowerCase();
 
-  /**
-   * Matching runs as ordered passes over the *whole* next-stage list, rather
-   * than resolving each next-stage greedily in isolation. A single greedy
-   * pass processes stages left to right, so when a stage is inserted midway
-   * through the plan, the inserted stage gets resolved before the real stage
-   * that used to sit at its new index does — and a same-position fallback
-   * would let the inserted stage steal that later stage's identity before
-   * the correct title match ever gets a chance to run. Doing title-matching
-   * as its own global pass first means position never gets to arbitrate a
-   * case it's wrong about.
-   *
-   * Every prior stage can be claimed by at most one next stage. Two
-   * next-stages that both moved away from the same tool (e.g. a global
-   * "replace Figma" adjustment touching several stages) must NOT both
-   * resolve to the same prior stage — a duplicate id downstream collapses
-   * two nodes onto one in the canvas graph and onto one `stageId` in the
-   * task board, which is exactly the "connections broke" / "tasks didn't
-   * update" reports.
-   */
   const claimed = new Set();
   const matches = new Array(nextStages.length).fill(null);
   const assign = (i, priorStage) => { matches[i] = priorStage; claimed.add(priorStage.id); };
@@ -71,7 +71,8 @@ export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
     if (matches[i]) return;
     const hit = priorStages.find(ps =>
       !claimed.has(ps.id) &&
-      (adjustmentLower.includes(norm(ps.tool?.name) || ' ') || adjustmentLower.includes(ps.toolSlug.replace(/-/g, ' ')))
+      (adjustmentLower.includes(norm(ps.tool?.name) || ' ') ||
+        adjustmentLower.includes(String(ps.toolSlug || '').replace(/-/g, ' ')))
     );
     if (hit) assign(i, hit);
   });
@@ -84,7 +85,23 @@ export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
     if (atIndex && !claimed.has(atIndex.id)) assign(i, atIndex);
   });
 
-  const usedIds = new Set(claimed);
+  return matches;
+}
+
+export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
+  if (!prior?.stages?.length) {
+    return {
+      workflow: { ...next, version: 1 },
+      diff: { isNew: true, changedStageIds: [], preservedStageIds: [], replacedTools: [] },
+    };
+  }
+
+  const priorStages = prior.stages || [];
+  const nextStages = next.stages || [];
+
+  const matches = resolveStageMatches(priorStages, nextStages, adjustment);
+
+  const usedIds = new Set(matches.filter(Boolean).map(m => m.id));
   const changedStageIds = [];
   const preservedStageIds = [];
   const replacedTools = [];
@@ -106,7 +123,12 @@ export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
 
     const sameTool = priorStage.toolSlug === stage.toolSlug;
     const sameOutput = priorStage.output === stage.output;
-    const hasPlaybook = Boolean(priorStage.steps?.length);
+    // A degraded playbook is the deterministic template, not a written one.
+    // Counting it as "has a playbook" is what let a stage that failed to
+    // generate once keep that template through every subsequent refine —
+    // the one path that would have naturally retried it was the one skipping
+    // it as already done.
+    const hasPlaybook = Boolean(priorStage.steps?.length) && !priorStage.degraded;
     const unchanged = sameTool && sameOutput && hasPlaybook;
 
     if (unchanged) {
@@ -119,6 +141,7 @@ export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
         settings: priorStage.settings,
         pitfall: priorStage.pitfall,
         checkpoint: priorStage.checkpoint,
+        degraded: priorStage.degraded || false,
         // Selection highlights saved via /chat/stage-highlight point at exact
         // substrings of THIS content — carried forward only when the content
         // didn't change, same as steps/prompt above. A changed stage drops
@@ -169,4 +192,4 @@ export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
   };
 }
 
-export default { patchWorkflow };
+export default { patchWorkflow, resolveStageMatches };

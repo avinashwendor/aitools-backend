@@ -11,6 +11,7 @@ import config from '../config/index.js';
 import { createLogger } from '../utils/logger.js';
 import { recordCall } from './telemetry.js';
 import { recordLlmUsage } from '../billing/meterContext.js';
+import { overrideFor } from './modelRouting.js';
 
 const log = createLogger('ai:llm');
 
@@ -49,6 +50,7 @@ if (providers.length) {
   log.info('LLM provider chain ready', {
     chain: providers.map(p => `${p.name}(${p.plannerModel})`).join(' → '),
     reasoning: providers.map(p => `${p.name}(${p.reasoningModel})`).join(' → '),
+    utility: providers.map(p => `${p.name}(${p.utilityModel})`).join(' → '),
   });
 } else {
   log.warn('No AI provider configured — LLM calls will fail fast with AI_DISABLED');
@@ -62,27 +64,41 @@ export const isLLMAvailable = () => providers.length > 0;
 /**
  * Resolve a role to this provider's model list.
  *
- * Three tiers, and the split is by what breaks if you get it wrong rather than
+ * Four tiers, and the split is by what breaks if you get it wrong rather than
  * by cost:
  *
  *   fast       classification and routing. A wrong answer costs one bad
  *              retrieval, so the cheapest model that can read is correct.
- *   planner    chat and workflow plans. Read by a person who can tell when
- *              they're wrong.
- *   reasoning  the architect and the agent node. These write programs that
- *              then run unattended against real APIs with the user's
- *              credentials, and a plausible-but-wrong answer here is not a
- *              worse paragraph — it is a workflow that posts the wrong thing
- *              to Slack every morning until someone notices. It gets the
- *              strongest model available, and the fallback chain is skipped:
- *              silently degrading a build to a small model produces exactly
- *              the invented-endpoint graphs this system was rebuilt to stop.
+ *   utility    dense, judgment-free compression — transcript and memory
+ *              summarisation. The job is "keep every concrete fact," not
+ *              "decide anything," so the cheapest capable model is correct
+ *              here too; it's a separate tier from `fast` only so it can be
+ *              tuned (or billed) independently of routing/classification.
+ *   planner    chat, playbooks and workflow plans. Read by a person who can
+ *              tell when they're wrong.
+ *   reasoning  workflow plan/refine, the architect and the agent node. These
+ *              write programs and stage graphs that then run unattended
+ *              against real APIs with the user's credentials, and a
+ *              plausible-but-wrong answer here is not a worse paragraph — it
+ *              is a workflow that posts the wrong thing to Slack every
+ *              morning until someone notices. It gets the strongest model
+ *              available, and the fallback chain is skipped: silently
+ *              degrading a build to a small model produces exactly the
+ *              invented-endpoint graphs this system was rebuilt to stop.
  */
 function modelsFor(provider, role) {
+  // An admin repointing a role in the panel wins over the env default. The
+  // lookup is a synchronous read of an in-process snapshot — see
+  // `ai/modelRouting.js` for why it cannot touch the database here.
+  const override = overrideFor(provider.name, role);
+
   if (role === 'reasoning') {
-    return [provider.reasoningModel || provider.plannerModel].filter(Boolean);
+    return [override || provider.reasoningModel || provider.plannerModel].filter(Boolean);
   }
-  const primary = role === 'fast' ? provider.fastModel : provider.plannerModel;
+  const envPrimary = role === 'fast' ? provider.fastModel
+    : role === 'utility' ? (provider.utilityModel || provider.fastModel)
+    : provider.plannerModel;
+  const primary = override || envPrimary;
   return [primary, ...provider.fallbackModels.filter(m => m !== primary)].filter(Boolean);
 }
 
@@ -217,7 +233,7 @@ function parseToolArguments(args) {
  *
  * @param {object}  opts
  * @param {Array}   opts.messages       OpenAI-style message array
- * @param {string} [opts.role]          'fast' | 'planner' | 'reasoning'
+ * @param {string} [opts.role]          'fast' | 'utility' | 'planner' | 'reasoning'
  * @param {string} [opts.model]         primary model (defaults to the role's model)
  * @param {number} [opts.temperature]
  * @param {number} [opts.maxTokens]     0 or null sends no ceiling at all
@@ -469,6 +485,7 @@ export function getProviderStatus() {
     planner: p.plannerModel,
     fast: p.fastModel,
     reasoning: p.reasoningModel,
+    utility: p.utilityModel,
     available: p.disabledUntil <= now,
     benchedForSeconds: p.disabledUntil > now ? Math.round((p.disabledUntil - now) / 1000) : 0,
   }));
@@ -483,8 +500,36 @@ export function getProviderStatus() {
  *        return an error string to trigger the repair round-trip, or null if valid
  */
 export async function completeJson({ validate, ...opts }) {
-  const first = await complete({ ...opts, json: true });
+  let first = await complete({ ...opts, json: true });
   let parsed = extractJson(first.content);
+
+  /**
+   * The model ran out of budget before it wrote anything.
+   *
+   * Reasoning-tier models spend the completion allowance on hidden reasoning
+   * tokens first, so a ceiling sized for the visible answer can be consumed
+   * entirely before a single character of JSON is emitted — `finish_reason` is
+   * "length" and `content` is the empty string. Observed on deepseek-v4-pro at
+   * 700 tokens: 700 reasoning tokens, zero content.
+   *
+   * A repair round-trip cannot fix that. It re-sends the same request with the
+   * same ceiling plus an instruction the model never gets far enough to read,
+   * and burns a second call to fail identically. More room is the only thing
+   * that helps, so ask for it once before falling through to repair.
+   */
+  const ranOutOfRoom = !parsed && first.finishReason === 'length';
+  if (ranOutOfRoom) {
+    const ceiling = opts.maxTokens ?? config.ai.maxTokens;
+    const widened = Math.min(Math.max(ceiling * 3, 2000), 16_000);
+    log.warn('JSON completion hit the token ceiling before emitting content — retrying with more room', {
+      task: opts.task,
+      from: ceiling,
+      to: widened,
+      contentLength: (first.content || '').length,
+    });
+    first = await complete({ ...opts, json: true, maxTokens: widened });
+    parsed = extractJson(first.content);
+  }
 
   let problem = null;
   if (!parsed) problem = 'The response was not valid JSON.';
@@ -498,6 +543,9 @@ export async function completeJson({ validate, ...opts }) {
     ...opts,
     json: true,
     temperature: 0.1,
+    // Carry the widened ceiling into the repair: the correction has to fit too,
+    // and a repair that truncates is just the original failure again.
+    ...(ranOutOfRoom ? { maxTokens: Math.min(Math.max((opts.maxTokens ?? config.ai.maxTokens) * 3, 2000), 16_000) } : {}),
     messages: [
       ...opts.messages,
       { role: 'assistant', content: first.content.slice(0, 4000) },
@@ -505,6 +553,15 @@ export async function completeJson({ validate, ...opts }) {
         role: 'user',
         content:
           `Your previous response was rejected: ${problem}\n\n` +
+          // Without this line the model does the literal minimum: it edits the
+          // one field named in the error and leaves every other field still
+          // describing the value that was rejected. That produced a workflow
+          // stage bound to one tool whose title, rationale and tips all named
+          // a different one — a contradiction no downstream check caught,
+          // because each field was individually well-formed.
+          `Fix EVERY field affected by this problem, not just the one named. If a value was ` +
+          `rejected, no other field may still refer to it — titles, descriptions, rationales, ` +
+          `summaries and lists must all be consistent with the corrected value.\n\n` +
           `Return ONLY the corrected JSON object. No prose, no markdown fences.`,
       },
     ],

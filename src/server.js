@@ -11,6 +11,7 @@ import createMcpRouter from './mcp/index.js';
 import { notFound, errorHandler } from './middleware/errorHandler.js';
 import { rateLimit } from './middleware/rateLimit.js';
 import { getCatalog, warmVectorIndex } from './ai/catalog.js';
+import { initModelRouting } from './ai/modelRouting.js';
 import { createLogger } from './utils/logger.js';
 import { startJobWorkers, stopJobWorkers } from './jobs/index.js';
 import { startAgentWorkers, stopAgentWorkers } from './agentic/queue.js';
@@ -146,6 +147,13 @@ async function start() {
   } catch (err) {
     log.warn('Could not warm retrieval index', { error: err.message });
   }
+
+  // Role → model overrides set from the admin panel. Loaded before the first
+  // request so a repointed role is honoured immediately rather than on the
+  // first TTL refresh; `llm.js` resolves roles synchronously and cannot await.
+  await initModelRouting().catch(err =>
+    log.warn('Could not load model routing overrides — using env defaults', { error: err.message })
+  );
 
   server = app.listen(config.port, () => {
     log.info(`Server listening on :${config.port}`, { env: config.nodeEnv });

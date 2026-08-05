@@ -17,6 +17,7 @@ import config from '../src/config/index.js';
 import { handleMessage } from '../src/ai/workflowEngine.js';
 import { getCatalog } from '../src/ai/catalog.js';
 import { isLLMAvailable } from '../src/ai/llm.js';
+import { gradeWorkflow, setCatalogNames } from './e2e-workflow.mjs';
 
 const green = s => `\x1b[32m${s}\x1b[0m`;
 const red = s => `\x1b[31m${s}\x1b[0m`;
@@ -31,6 +32,11 @@ const DEFAULT_GOALS = [
   'Design a logo and brand kit for a new coffee shop',
   'Build and deploy a landing page for my SaaS, free tools only',
   'Turn my long podcast episodes into short clips for TikTok',
+  // Regression: this goal produced a plan whose build stage was titled after
+  // one tool and bound to another, because the catalog had no mobile app
+  // builder at all. Kept permanently — it is the shape of goal that exposes a
+  // coverage hole, and a coverage hole is what makes a plan start lying.
+  'I want to create a mobile application for schools and colleges',
 ];
 
 const goals = process.argv.slice(2).filter(a => !a.startsWith('--'));
@@ -44,6 +50,7 @@ if (!isLLMAvailable()) {
 await mongoose.connect(config.mongoUri, { serverSelectionTimeoutMS: 15_000 });
 const catalog = await getCatalog({ force: true });
 const validSlugs = new Set(catalog.tools.map(t => t.slug));
+setCatalogNames(catalog.tools.map(t => t.name));
 
 console.log(`\n${bold('Workflow quality eval')} — ${catalog.tools.length} tools indexed\n`);
 
@@ -69,8 +76,27 @@ function grade(workflow) {
   check(`has ${config.ai.minStages}-${config.ai.maxStages} stages`,
     stages.length >= config.ai.minStages && stages.length <= config.ai.maxStages);
 
-  check('every tool exists in the catalog',
-    stages.every(s => validSlugs.has(s.toolSlug)));
+  // An external stage has no slug by design — it is bound to a product outside
+  // the catalog, which is legal only when the user opted in. What must always
+  // hold is that it carries a real URL instead of a `/tool/` link to nothing.
+  check('every tool is a catalog slug or a properly-formed external tool',
+    stages.every(s =>
+      validSlugs.has(s.toolSlug) ||
+      (s.tool?.external && /^https?:\/\//.test(s.tool.websiteUrl || ''))));
+
+  /**
+   * The checks that catch a plan which is well-formed and still wrong: a stage
+   * describing a tool it is not bound to, and a stage that shipped the
+   * deterministic fallback template instead of a written playbook. Every
+   * structural check above passes on both.
+   */
+  const defects = gradeWorkflow(workflow);
+  check('no stage names a tool it is not bound to',
+    !defects.some(d => d.startsWith('FOREIGN_TOOL')));
+  check('no stage shipped the fallback playbook template',
+    !defects.some(d => d.startsWith('FALLBACK_PLAYBOOK')));
+  check('no stage rationale reads as a changelog',
+    !defects.some(d => d.startsWith('CHANGELOG_WHY')), { warn: true });
 
   check('no tool is reused across stages',
     new Set(stages.map(s => s.toolSlug)).size === stages.length, { warn: true });

@@ -37,6 +37,12 @@ import {
     grantCredits,
     getPlanCatalog,
 } from '../controllers/adminBillingController.js';
+import {
+    getRouting,
+    listModels,
+    testModels,
+    updateRouting,
+} from '../controllers/adminAiController.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 
@@ -163,6 +169,34 @@ router.post(
     [body('credits').isInt({ min: 1, max: 1000000 }).withMessage('Credits must be a positive number')],
     validate,
     grantCredits
+);
+
+// ── Model routing ─────────────────────────────────────────────
+// Which model serves each role, whether it actually responds, and repointing
+// it without a redeploy. `test` and `routing` (PUT) both send real completions,
+// so they are billable — that is the point: a model that is merely listed by a
+// gateway is not a model that works.
+router.get('/ai/routing', getRouting);
+router.get('/ai/models', listModels);
+router.post(
+    '/ai/test',
+    [
+        body('provider').optional().isString().isLength({ max: 60 }),
+        body('models').optional().isArray({ max: 12 }),
+        body('models.*').isString().isLength({ max: 120 }),
+    ],
+    validate,
+    testModels
+);
+router.put(
+    '/ai/routing',
+    [
+        body('provider').isString().notEmpty().withMessage('Provider is required'),
+        body('roles').isObject().withMessage('roles must be an object'),
+        body('skipVerification').optional().isBoolean(),
+    ],
+    validate,
+    updateRouting
 );
 
 // Web-discovered tool suggestions — reviewed here before ever touching the live catalog

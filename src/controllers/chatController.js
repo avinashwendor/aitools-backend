@@ -237,7 +237,9 @@ export const sendMessage = async (req, res) => {
         assistantMessage: turn.message,
         toolSlugs: turn.toolSlugs || [],
         goal: turn.goal,
+        brief: turn.brief,
         workflow: turn.workflow ?? undefined,
+        workflowDiff: turn.workflowDiff ?? undefined,
         title: turn.title,
         intent: turn.intent,
       }, { isFirstTurn });
@@ -356,7 +358,9 @@ export const streamMessage = async (req, res) => {
         assistantMessage: result.message,
         toolSlugs: result.toolSlugs || [],
         goal: result.goal,
+        brief: result.brief,
         workflow: result.workflow ?? undefined,
+        workflowDiff: result.workflowDiff ?? undefined,
         title: result.title,
         intent: result.intent,
       }, { isFirstTurn });

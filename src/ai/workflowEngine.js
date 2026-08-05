@@ -33,9 +33,10 @@ import {
   GENERAL_DOMAIN,
 } from './personalization.js';
 import * as prompts from './prompts.js';
-import { patchWorkflow } from './workflowDiff.js';
+import { patchWorkflow, resolveStageMatches } from './workflowDiff.js';
 import { webSearch, isWebSearchConfigured, wantsFreshInfo } from './tools/webSearch.js';
 import { discoverAndQueueTools } from './tools/toolDiscovery.js';
+import { foreignToolNames } from './toolNames.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ai:engine');
@@ -158,7 +159,12 @@ async function route({ message, contextMessages, categories, hasPriorWorkflow, p
     // 700-token budget this used to run on, which meant the JSON silently
     // truncated right where clarifyingQuestions lives (the last field) and
     // every first-time ask fell back to the same five generic questions.
-    maxTokens: 1400,
+    //
+    // Sized again for the `fast` tier being a reasoning model: it spends the
+    // allowance on hidden reasoning tokens before writing anything, so the
+    // budget has to cover the thinking as well as the answer. `completeJson`
+    // recovers when it doesn't, but that recovery costs an entire extra call.
+    maxTokens: 3000,
     messages: [
       { role: 'system', content: prompts.routerSystem(categories, profile) },
       ...contextMessages.slice(-4),
@@ -167,7 +173,11 @@ async function route({ message, contextMessages, categories, hasPriorWorkflow, p
         content:
           fence(message) +
           (hasPriorWorkflow
-            ? '\n\nNote: a workflow already exists in this conversation, so an adjustment request should be classified as "refine".'
+            ? '\n\nNote: a workflow already exists in this conversation, so a request to CHANGE the ' +
+              'plan (swap a tool, add or drop a stage, make it cheaper) is "refine". A request to ' +
+              'UNDERSTAND or CARRY OUT a stage that is already in the plan ("how do I do this step", ' +
+              '"what do I click first", "explain stage 3") is "question" — the plan itself is not ' +
+              'being changed, and rebuilding it would replace work the user did not ask you to touch.'
             : ''),
       },
     ],
@@ -257,36 +267,153 @@ function heuristicRoute(message, hasPriorWorkflow, profile) {
 // Phase 2 — planning
 // ─────────────────────────────────────────────────────────────
 
-async function plan({ goal, cards, pricing, skill, priorWorkflow, adjustment, profile }) {
+/**
+ * A stage's binding, whichever form it took.
+ * @returns {{name:string}|null} the external tool, or null for a catalog stage
+ */
+function externalBindingOf(stage) {
+  const ext = stage?.externalTool;
+  if (!ext || typeof ext !== 'object') return null;
+  if (!ext.name || !ext.url) return null;
+  return ext;
+}
+
+async function plan({
+  goal,
+  cards,
+  pricing,
+  skill,
+  priorWorkflow,
+  adjustment,
+  profile,
+  allowExternalTools = false,
+  externalCandidates = null,
+  brief = '',
+}) {
   const validSlugs = new Set(cards.map(c => c.slug));
   const { minStages, maxStages } = config.ai;
 
+  // Only URLs we actually put in front of the model may come back out of it —
+  // otherwise "external tools" becomes a licence to invent a product and a
+  // link, which is a worse failure than the catalog gap it was meant to solve.
+  const offeredExternal = new Map(
+    (externalCandidates || []).map(c => [String(c.name).toLowerCase(), c])
+  );
+
+  const catalogNames = cards.map(c => c.name);
+
+  /**
+   * The prose/binding check refuses once, then lets the plan through.
+   *
+   * Structural errors (an unknown slug, a missing output) must refuse every
+   * time — a plan that fails them is unusable. A stage whose wording drifted is
+   * a judgement call: the graph is sound and only the copy is wrong. Refusing
+   * it a second time throws away a plan the user already paid for and returns
+   * them an error, which is a worse outcome than a slightly-off sentence that
+   * `normalizePlan` then cleans up. Same principle the architect's `finish`
+   * gate uses, and for the same reason.
+   */
+  let proseCheckAttempts = 0;
+
   const { data, model } = await completeJson({
     task: 'plan',
-    role: 'planner',
+    // The stage/tool graph has to be right — a wrong tool here isn't a worse
+    // sentence, it's the harness fix this file exists for. Same tier as the
+    // architect/agent node, and for the same reason: no silent fallback to a
+    // weaker model.
+    role: 'reasoning',
     temperature: 0.4,
     // Headroom for the upper bound of stages, each carrying why/input/output
     // plus the closing tips array — a truncated plan loses whole stages.
     maxTokens: 3600,
     messages: [
-      { role: 'system', content: prompts.plannerSystem({ minStages, maxStages, pricing, skill, profile }) },
-      { role: 'user', content: prompts.plannerUser({ goal, candidates: cards, priorWorkflow, adjustment }) },
+      {
+        role: 'system',
+        content: prompts.plannerSystem({ minStages, maxStages, pricing, skill, profile, allowExternalTools }),
+      },
+      {
+        role: 'user',
+        content: prompts.plannerUser({
+          goal, candidates: cards, priorWorkflow, adjustment, externalCandidates, brief,
+        }),
+      },
     ],
     validate: v => {
       if (!v || !Array.isArray(v.stages)) return '"stages" must be an array.';
       if (v.stages.length < 2) return `Provide at least ${minStages} stages.`;
 
-      const bad = v.stages
-        .map(s => s?.toolSlug)
-        .filter(slug => !validSlugs.has(slug));
-
-      if (bad.length) {
-        return `These toolSlug values are not in CANDIDATE_TOOLS: ${[...new Set(bad)].join(', ')}. ` +
-          `Use only slugs copied exactly from the candidate list.`;
-      }
-
       const missing = v.stages.find(s => !s.title || !s.output);
       if (missing) return 'Every stage needs a non-empty "title" and "output".';
+
+      // ── Binding: a catalog slug, or an offered external tool ──
+      const badSlugs = [];
+      const badExternal = [];
+
+      for (const stage of v.stages) {
+        const ext = externalBindingOf(stage);
+        if (ext) {
+          if (!allowExternalTools) {
+            badExternal.push(`${ext.name} (external tools are not enabled for this user)`);
+          } else if (!offeredExternal.has(String(ext.name).toLowerCase())) {
+            badExternal.push(`${ext.name} (not in EXTERNAL_CANDIDATES)`);
+          }
+          continue;
+        }
+        if (!validSlugs.has(stage.toolSlug)) badSlugs.push(stage.toolSlug);
+      }
+
+      if (badSlugs.length) {
+        return `These toolSlug values are not in CANDIDATE_TOOLS: ${[...new Set(badSlugs)].join(', ')}. ` +
+          `Use only slugs copied exactly from the candidate list${
+            allowExternalTools ? ', or bind the stage to an EXTERNAL_CANDIDATES entry' : ''
+          }.`;
+      }
+      if (badExternal.length) {
+        return `These external tools cannot be used: ${[...new Set(badExternal)].join('; ')}. ` +
+          `Bind the stage to a CANDIDATE_TOOLS slug instead, and record the shortfall in "gaps".`;
+      }
+
+      // ── Prose must agree with the binding ──
+      // The failure this catches: the planner wanted a tool it could not bind,
+      // the binding was corrected, and every word describing the stage still
+      // named the tool that was rejected.
+      if (proseCheckAttempts++ >= 1) return null;
+
+      /**
+       * Every tool this plan legitimately talks about.
+       *
+       * Crucially that includes tools bound to *other* stages: the plan is a
+       * chain, and "export an app-icon-ready square for the FlutterFlow build"
+       * on a Looka stage is the handoff guidance the whole design exists to
+       * give. Only a tool bound to no stage at all is a contradiction — which
+       * is exactly the Glide case, where the named tool appeared nowhere in
+       * the plan except in the words describing a stage bound to something
+       * else.
+       */
+      const declared = [
+        ...v.stages.map(s => {
+          const ext = externalBindingOf(s);
+          return ext ? ext.name : cards.find(c => c.slug === s.toolSlug)?.name;
+        }).filter(Boolean),
+        ...(Array.isArray(v.gaps) ? v.gaps.map(g => g?.suggestedTool).filter(Boolean) : []),
+      ];
+
+      for (const [i, stage] of v.stages.entries()) {
+        const ext = externalBindingOf(stage);
+        const boundName = ext ? ext.name : (cards.find(c => c.slug === stage.toolSlug)?.name || stage.toolSlug);
+
+        const foreign = foreignToolNames(`${stage.title} — ${stage.why || ''}`, boundName, {
+          catalogNames,
+          allowed: declared,
+        });
+
+        if (foreign.length) {
+          return `Stage ${i + 1} is bound to "${boundName}" but its title or "why" describes ` +
+            `${[...new Set(foreign)].join(', ')}. A stage may only name the tool it uses — ` +
+            `either bind the stage to that tool, or rewrite the title and "why" to describe ` +
+            `"${boundName}" and move the shortfall into "gaps".`;
+        }
+      }
 
       return null;
     },
@@ -299,24 +426,72 @@ async function plan({ goal, cards, pricing, skill, priorWorkflow, adjustment, pr
  * Normalise the plan against the catalog: drop unknown slugs, collapse
  * accidental duplicates, clamp the stage count, and backfill anything thin.
  */
-function normalizePlan(raw, { bySlug, goal, title }) {
+/**
+ * A stage bound to a product that isn't in our catalog.
+ *
+ * Shaped like a catalog tool so every consumer — the canvas, the playbook
+ * writer, the exporters — keeps working without a branch. `external: true` is
+ * what stops it being linked as `/tool/<slug>`: there is no tool page to link
+ * to, and a dead link on a plan is worse than a plain name.
+ */
+function hydrateExternalTool(ext) {
+  return {
+    slug: null,
+    external: true,
+    name: String(ext.name).slice(0, 60),
+    tagline: truncate(String(ext.tagline || ext.why || ''), 140),
+    websiteUrl: String(ext.url).slice(0, 300),
+    logo: null,
+    category: 'other',
+    pricing: ['free', 'freemium', 'paid', 'contact'].includes(ext.pricing) ? ext.pricing : 'freemium',
+    features: [],
+    tags: [],
+  };
+}
+
+/**
+ * Strip a trailing parenthetical that names a tool this stage is not bound to.
+ *
+ * The last line of defence, for the case the repair round-trip did not fix.
+ * "Build the App (Glide — Mobile-First, No-Code)" on a stage bound to Lovable
+ * becomes "Build the App": less informative, but true. A title that names the
+ * wrong tool sits directly above that tool's real name, logo and link, and a
+ * visible contradiction costs more trust than a shorter title costs clarity.
+ */
+function stripForeignParenthetical(title, boundName, catalogNames) {
+  const match = String(title).match(/^(.*?)\s*[([][^)\]]*[)\]]\s*$/);
+  if (!match) return title;
+
+  const inside = String(title).slice(match[1].length);
+  const foreign = foreignToolNames(inside, boundName, { catalogNames });
+  if (!foreign.length) return title;
+
+  const stripped = match[1].trim();
+  return stripped.length >= 8 ? stripped : title;
+}
+
+function normalizePlan(raw, { bySlug, goal, title, catalogNames = [] }) {
   const seen = new Set();
   const stages = [];
 
   for (const stage of raw.stages || []) {
-    const tool = bySlug.get(stage.toolSlug);
+    const ext = externalBindingOf(stage);
+    const tool = ext ? hydrateExternalTool(ext) : bySlug.get(stage.toolSlug);
     if (!tool) continue;
+
+    // Identity for dedupe: a slug for catalog tools, the name for external ones.
+    const key = tool.slug || `ext:${tool.name.toLowerCase()}`;
 
     // The planner occasionally reuses a tool for consecutive stages; merging
     // them reads better than showing the same node twice in a row.
-    if (seen.has(stage.toolSlug) && stages.at(-1)?.toolSlug === stage.toolSlug) {
+    if (seen.has(key) && (stages.at(-1)?.toolSlug || `ext:${stages.at(-1)?.tool.name.toLowerCase()}`) === key) {
       const prev = stages.at(-1);
       prev.title = `${prev.title} & ${stage.title}`;
       prev.output = stage.output || prev.output;
       prev.timeMinutes += Number(stage.timeMinutes) || 15;
       continue;
     }
-    seen.add(stage.toolSlug);
+    seen.add(key);
 
     const alternatives = (Array.isArray(stage.alternativeSlugs) ? stage.alternativeSlugs : [])
       .filter(s => s !== stage.toolSlug && bySlug.has(s))
@@ -329,12 +504,14 @@ function normalizePlan(raw, { bySlug, goal, title }) {
     stages.push({
       id: `stage-${stages.length + 1}`,
       index: stages.length,
-      title: String(stage.title).slice(0, 80),
+      title: stripForeignParenthetical(String(stage.title).slice(0, 80), tool.name, catalogNames),
       toolSlug: tool.slug,
       tool,
-      why: String(stage.why || `${tool.name} handles this stage.`).slice(0, 300),
-      input: String(stage.input || '').slice(0, 300),
-      output: String(stage.output || '').slice(0, 300),
+      // `truncate` rather than `slice`: a hard cut lands mid-word and ships
+      // text like "…kept off the stage list since it on" to the user.
+      why: truncate(String(stage.why || `${tool.name} handles this stage.`), 300),
+      input: truncate(String(stage.input || ''), 300),
+      output: truncate(String(stage.output || ''), 300),
       timeMinutes: Math.min(240, Math.max(5, Number(stage.timeMinutes) || 20)),
       alternatives,
       // Filled in by the playbook phase.
@@ -343,6 +520,7 @@ function normalizePlan(raw, { bySlug, goal, title }) {
       settings: null,
       pitfall: '',
       checkpoint: '',
+      degraded: false,
     });
 
     if (stages.length >= config.ai.maxStages) break;
@@ -362,17 +540,33 @@ function normalizePlan(raw, { bySlug, goal, title }) {
 
   return {
     title: String(raw.title || title || goal).slice(0, 100),
-    summary: String(raw.summary || '').slice(0, 500),
-    outcome: String(raw.outcome || stages.at(-1)?.output || '').slice(0, 300),
+    summary: truncate(String(raw.summary || ''), 500),
+    outcome: truncate(String(raw.outcome || stages.at(-1)?.output || ''), 300),
     difficulty: ['beginner', 'intermediate', 'advanced'].includes(raw.difficulty)
       ? raw.difficulty
       : 'beginner',
     stages,
     tips: (Array.isArray(raw.tips) ? raw.tips : [])
-      .map(t => String(t).slice(0, 240))
+      .map(t => truncate(String(t), 240))
       .filter(Boolean)
       .slice(0, 4),
-    followUp: String(raw.followUp || '').slice(0, 220),
+    /**
+     * What the plan could not properly serve. Kept as structured data rather
+     * than a sentence in the summary, so the reply, the canvas and the eval
+     * harness all read the same thing — and so "we have no tool for this" is
+     * something the product can say out loud instead of a stage quietly
+     * overstating what it delivers.
+     */
+    gaps: (Array.isArray(raw.gaps) ? raw.gaps : [])
+      .filter(g => g?.capability)
+      .slice(0, 3)
+      .map(g => ({
+        capability: truncate(String(g.capability), 120),
+        reason: truncate(String(g.reason || ''), 200),
+        closestSlug: bySlug.has(g.closestSlug) ? g.closestSlug : null,
+        suggestedTool: g.suggestedTool ? String(g.suggestedTool).slice(0, 60) : null,
+      })),
+    followUp: truncate(String(raw.followUp || ''), 220),
   };
 }
 
@@ -380,15 +574,45 @@ function normalizePlan(raw, { bySlug, goal, title }) {
 // Phase 3 — playbooks, generated in parallel
 // ─────────────────────────────────────────────────────────────
 
-/** Deterministic fallback so a stage is never blank if one call fails. */
+/**
+ * Deterministic fallback so a stage is never blank if one call fails.
+ *
+ * Marked `degraded` — that flag is the whole point. Without it this template
+ * was indistinguishable from a written playbook: it rendered the same, was
+ * charged the same, and `patchWorkflow` preserved it across every later refine
+ * because "has steps" was the only test. Two of five stages in one real
+ * conversation shipped this, and nothing anywhere said so.
+ *
+ * It also deliberately does NOT use `stage.why` as step content. `why` is the
+ * planner's rationale for choosing the tool, not an instruction, and when the
+ * planner wrote something odd there it was this fallback that promoted it into
+ * a numbered step the user was told to follow.
+ */
 function fallbackPlaybook(stage) {
   const name = stage.tool.name;
+  const capabilities = (stage.tool.features || []).slice(0, 3).join(', ');
+
   return {
+    degraded: true,
     steps: [
-      { title: `Open ${name} and start a new project`, detail: `Sign in to ${name} and create a new workspace for this stage.` },
-      { title: `Bring in what the last stage produced`, detail: `Import or paste in: ${stage.input}.` },
-      { title: `Do the core work for this stage`, detail: stage.why },
-      { title: `Export the result for the next stage`, detail: `Produce and save: ${stage.output}.` },
+      {
+        title: `Open ${name} and start a new project`,
+        detail: `Sign in to ${name} and create a new workspace for this stage.`,
+      },
+      {
+        title: `Bring in what the last stage produced`,
+        detail: `Import or paste in: ${stage.input}.`,
+      },
+      {
+        title: `Do the core work for this stage`,
+        detail: capabilities
+          ? `Use ${name}'s ${capabilities} to produce this stage's deliverable.`
+          : `Use ${name} to produce this stage's deliverable.`,
+      },
+      {
+        title: `Export the result for the next stage`,
+        detail: `Produce and save: ${stage.output}.`,
+      },
     ],
     prompt: null,
     settings: [
@@ -416,6 +640,15 @@ async function writePlaybook({ goal, stage, position, total, previous, next, for
     const { data } = await completeJson({
       task: 'playbook',
       role: 'planner',
+      /**
+       * Longer than the shared chat ceiling. A playbook is four steps of real
+       * operating instruction plus a paste-ready prompt, three of them run
+       * concurrently, and the general `AI_TIMEOUT_MS` (45s in production) was
+       * cutting them off — which did not surface as an error, it surfaced as a
+       * stage silently shipping the template. The failure was invisible
+       * precisely because the fallback was good enough to render.
+       */
+      timeoutMs: Math.max(config.ai.timeoutMs, 90_000),
       // A touch more variation on a regeneration — the deterministic best
       // guess is exactly what the user just asked to move away from.
       temperature: forceRefresh ? 0.55 : 0.35,
@@ -455,6 +688,7 @@ async function writePlaybook({ goal, stage, position, total, previous, next, for
       : null;
 
     const playbook = {
+      degraded: false,
       steps: data.steps.slice(0, 4).map(s => ({
         title: truncate(String(s.title).replace(/^\d+[.)]\s*/, ''), 90),
         detail: truncate(String(s.detail || ''), 420),
@@ -501,17 +735,27 @@ const PLAYBOOK_CONCURRENCY = 3;
  * only the swapped/added stages, instead of regenerating all of them.
  *
  * A stage is considered unchanged only if its tool, output AND input (i.e. the
- * previous stage's output too) all match the prior plan at the same position —
- * that transitively guarantees the handoff this playbook was written against
- * hasn't shifted, not just the stage's own fields.
+ * previous stage's output too) all match the prior stage it continues — that
+ * transitively guarantees the handoff this playbook was written against hasn't
+ * shifted, not just the stage's own fields.
+ *
+ * "The prior stage it continues" comes from `resolveStageMatches`, the same
+ * resolution `patchWorkflow` uses to assign stage ids. Deciding it here a
+ * second way — by array index, as this used to — meant an insert or a reorder
+ * could copy one stage's playbook onto a stage that then inherited a different
+ * stage's identity.
  */
-function reusePlaybooksFromPrior(stages, priorWorkflow) {
+function reusePlaybooksFromPrior(stages, priorWorkflow, adjustment = '') {
   const priorStages = priorWorkflow?.stages || [];
+  const matches = resolveStageMatches(priorStages, stages, adjustment);
   let reused = 0;
 
   stages.forEach((stage, i) => {
-    const prior = priorStages[i];
+    const prior = matches[i];
     if (!prior || !prior.steps?.length) return;
+    // Never carry a failed generation forward — that is the one case where
+    // regenerating is exactly what the user needs.
+    if (prior.degraded) return;
     if (prior.toolSlug !== stage.toolSlug) return;
     if (prior.output !== stage.output) return;
     // Stage 0's input is free text the model restates every call ("Idea:
@@ -526,6 +770,7 @@ function reusePlaybooksFromPrior(stages, priorWorkflow) {
     stage.settings = prior.settings;
     stage.pitfall = prior.pitfall;
     stage.checkpoint = prior.checkpoint;
+    stage.degraded = false;
     reused++;
   });
 
@@ -633,14 +878,33 @@ function composeReply(workflow) {
       : s.tool.pricing === 'freemium'
         ? 'Freemium'
         : s.tool.pricing === 'paid' ? 'Paid' : 'Contact';
+    // An external tool has no tool page, so it gets its own site as a plain
+    // link and is labelled as unverified — the same rule the grounded-answer
+    // prompt already states for web-sourced tools.
+    const toolRef = s.tool.external
+      ? `[${s.tool.name}](${s.tool.websiteUrl}) *(beyond our catalog)*`
+      : `[${s.tool.name}](/tool/${s.tool.slug})`;
     lines.push(
-      `${i + 1}. **${s.title}** — [${s.tool.name}](/tool/${s.tool.slug}) · ${priceTag} · ${formatDuration(s.timeMinutes)}`
+      `${i + 1}. **${s.title}** — ${toolRef} · ${priceTag} · ${formatDuration(s.timeMinutes)}`
     );
     lines.push(`   → ${s.output}`);
   });
 
   lines.push('', `**You end with:** ${workflow.outcome}`);
   lines.push(`**Total:** ${formatDuration(workflow.totalMinutes)} · ${workflow.costSummary}`);
+
+  // Said plainly and early, because the alternative — which is what used to
+  // happen — is a stage that describes a capability it cannot actually deliver.
+  if (workflow.gaps?.length) {
+    lines.push('', '**What this plan does not cover**');
+    workflow.gaps.forEach(g => {
+      const closest = g.closestSlug ? ` Closest in our catalog: [${g.closestSlug}](/tool/${g.closestSlug}).` : '';
+      const suggestion = g.suggestedTool
+        ? ` Outside our catalog, ${g.suggestedTool} is worth a look — we haven't verified it.`
+        : '';
+      lines.push(`- **${g.capability}** — ${g.reason}${closest}${suggestion}`);
+    });
+  }
 
   if (workflow.tips.length) {
     lines.push('', '**Worth knowing**');
@@ -656,6 +920,10 @@ function composeReply(workflow) {
 
 function assemble(plan, meta) {
   const totalMinutes = plan.stages.reduce((sum, s) => sum + s.timeMinutes, 0);
+  // Counted on the workflow so the admin cost view can see how often we charge
+  // a full generation for a plan carrying template steps. A quality regression
+  // that only shows up as a support ticket is one nobody measures.
+  const degradedStages = plan.stages.filter(s => s.degraded).length;
 
   const workflow = {
     id: `wf_${crypto.randomBytes(8).toString('hex')}`,
@@ -668,9 +936,10 @@ function assemble(plan, meta) {
     costSummary: summariseCost(plan.stages),
     stages: plan.stages,
     tips: plan.tips,
+    gaps: plan.gaps || [],
     followUp: plan.followUp || '',
     createdAt: new Date().toISOString(),
-    meta,
+    meta: { ...meta, degradedStages },
   };
 
   workflow.reply = composeReply(workflow);
@@ -730,6 +999,66 @@ async function answerGrounded({ message, routed, contextMessages, allowExternalT
     intent: routed.intent,
     toolSlugs: cards.map(c => c.slug).filter(slug => content.includes(slug)),
   };
+}
+
+/**
+ * Real products outside the catalog that could serve this goal.
+ *
+ * Only called when the user has explicitly opted in to tools beyond our
+ * catalog. Until this existed, that toggle changed nothing about how a plan was
+ * built: the planner was bound to CANDIDATE_TOOLS on every path, so a user who
+ * asked for something the catalog cannot do got the closest catalog tool either
+ * way — and, in the worst case, a stage that described the tool they should
+ * have had while being bound to the one we could offer.
+ *
+ * The results are what the planner is permitted to bind to. Nothing else: a
+ * product the model recalls from training has no verifiable URL, and an
+ * unverifiable link on a plan is the failure this is meant to remove.
+ *
+ * @returns {Promise<Array<{name,url,tagline,source}>|null>}
+ */
+async function findExternalCandidates({ goal, queries, catalog }) {
+  if (!isWebSearchConfigured()) return null;
+
+  // One search, on the capability the goal is actually about. The router's
+  // sub-queries name jobs ("build mobile app", "collect fee payments"), which
+  // is exactly the phrasing that surfaces products rather than blog posts.
+  const query = `best tools for ${queries.slice(0, 3).join(', ') || goal}`.slice(0, 300);
+  const results = await webSearch(query, { maxResults: 6 });
+  if (!results?.length) return null;
+
+  const known = new Set(catalog.tools.map(t => t.name.toLowerCase()));
+
+  const { data } = await completeJson({
+    task: 'plan:external-candidates',
+    role: 'fast',
+    temperature: 0.1,
+    // Room for the `fast` tier's reasoning tokens as well as the answer — see
+    // the ceiling-retry note in `completeJson`.
+    maxTokens: 2500,
+    messages: [
+      { role: 'system', content: prompts.externalCandidateSystem() },
+      { role: 'user', content: prompts.externalCandidateUser({ goal, webResults: results }) },
+    ],
+    validate: v => (!v || !Array.isArray(v.tools) ? '"tools" must be an array.' : null),
+  }).catch(() => ({ data: { tools: [] } }));
+
+  const byUrl = new Map(results.map(r => [r.url, r]));
+
+  return (data.tools || [])
+    .filter(t => t?.name && t?.url)
+    // The URL has to be one we were actually shown. Anything else is the model
+    // filling in a plausible domain, which is indistinguishable from a real one
+    // right up until the user clicks it.
+    .filter(t => byUrl.has(t.url) || [...byUrl.keys()].some(u => u.startsWith(t.url) || t.url.startsWith(u)))
+    .filter(t => !known.has(String(t.name).toLowerCase()))
+    .slice(0, 6)
+    .map(t => ({
+      name: String(t.name).slice(0, 60),
+      url: String(t.url).slice(0, 300),
+      tagline: String(t.tagline || '').slice(0, 160),
+      pricing: ['free', 'freemium', 'paid', 'contact'].includes(t.pricing) ? t.pricing : 'freemium',
+    }));
 }
 
 /**
@@ -1008,6 +1337,23 @@ export async function handleMessage({
 
   const signals = retrievalSignals(profile);
 
+  /**
+   * An explicit `stageId` means the user clicked a node and asked about it.
+   * That is a question about how to carry out that stage — never a request to
+   * rewrite the plan.
+   *
+   * The router does not reliably see the difference: it is told a workflow
+   * already exists and that adjustments are "refine", and "how exactly do I do
+   * the build step?" is close enough to an adjustment that it classifies as
+   * one. The observed result was a full re-plan on a question — two stages
+   * swapped tools, the user was charged a workflow generation, and work they
+   * had not asked to change was silently replaced.
+   */
+  if (stageId && priorWorkflow && routed.intent === 'refine') {
+    log.info('Question anchored to a stage — answering instead of re-planning', { stageId });
+    routed.intent = 'question';
+  }
+
   if (routed.intent === 'discover' || routed.intent === 'question') {
     // A workflow already on the canvas turns "how do I open the Figma file"
     // from a catalog lookup into a question about a specific stage — answer
@@ -1039,6 +1385,11 @@ export async function handleMessage({
     catalog.tools.length,
     profileFingerprint(profile),
     isRefine ? priorWorkflow.id : 'fresh',
+    // Two users with the same goal now get materially different plans
+    // depending on this flag — one may be bound to the catalog, the other may
+    // reach past it. Serving one's plan to the other is what would make the
+    // toggle look broken even once it works.
+    resolvedExternalTools ? 'ext' : 'catalog',
   ]);
 
   if (!isRefine) {
@@ -1068,6 +1419,28 @@ export async function handleMessage({
     signals,
   });
 
+  /**
+   * On a refine, retrieval runs on the *adjustment's* queries. A tool from a
+   * stage the user never mentioned may not rank at all this time, and since the
+   * validator only accepts slugs that are in the slate, its absence does not
+   * read as "leave that stage alone" — it reads as "that tool does not exist",
+   * and the planner is forced to swap a stage nobody asked about.
+   *
+   * Adding the prior plan's tools back makes "keep everything that still works"
+   * an instruction the planner can actually follow.
+   */
+  if (isRefine) {
+    const present = new Set(cards.map(c => c.slug));
+    for (const stage of priorWorkflow.stages || []) {
+      if (!stage.toolSlug || present.has(stage.toolSlug)) continue;
+      const tool = catalog.bySlug.get(stage.toolSlug);
+      if (tool) {
+        cards.push(toCandidateCard(tool));
+        present.add(stage.toolSlug);
+      }
+    }
+  }
+
   if (!cards.length) {
     return {
       message:
@@ -1076,6 +1449,28 @@ export async function handleMessage({
       workflow: null,
       intent: routed.intent,
     };
+  }
+
+  // Only when the user opted in — this costs a search credit and a fast-model
+  // call, and it is the difference between the toggle meaning something and
+  // meaning nothing.
+  let externalCandidates = null;
+  if (resolvedExternalTools) {
+    onProgress({ phase: 'searching', message: 'Looking beyond the catalog' });
+    externalCandidates = await findExternalCandidates({
+      goal: routed.goal,
+      queries: routed.searchQueries,
+      catalog,
+    }).catch(err => {
+      log.warn('External candidate search failed — planning from the catalog alone', { error: err.message });
+      return null;
+    });
+    if (externalCandidates?.length) {
+      log.info('External candidates offered to the planner', {
+        count: externalCandidates.length,
+        names: externalCandidates.map(c => c.name).join(', '),
+      });
+    }
   }
 
   onProgress({ phase: 'planning', message: 'Designing the workflow' });
@@ -1088,10 +1483,20 @@ export async function handleMessage({
     priorWorkflow: isRefine ? priorWorkflow : null,
     adjustment: isRefine ? sanitized : null,
     profile,
+    allowExternalTools: resolvedExternalTools,
+    externalCandidates,
+    // On the approval turn the brief is the enriched goal we are about to
+    // persist; on every later turn it is read back from the conversation.
+    brief: forcedGoal || conversation.brief || '',
   });
 
   const bySlug = new Map(cards.map(c => [c.slug, catalog.bySlug.get(c.slug)]).filter(([, t]) => t));
-  const normalized = normalizePlan(raw, { bySlug, goal: routed.goal, title: routed.title });
+  const normalized = normalizePlan(raw, {
+    bySlug,
+    goal: routed.goal,
+    title: routed.title,
+    catalogNames: cards.map(c => c.name),
+  });
 
   if (normalized.stages.length < 2) {
     log.warn('Plan collapsed after validation', { stages: normalized.stages.length });
@@ -1101,7 +1506,7 @@ export async function handleMessage({
     });
   }
 
-  const reusedCount = isRefine ? reusePlaybooksFromPrior(normalized.stages, priorWorkflow) : 0;
+  const reusedCount = isRefine ? reusePlaybooksFromPrior(normalized.stages, priorWorkflow, sanitized) : 0;
 
   // The stage list — tools, titles, handovers, timings — is fully decided at
   // this point, but the playbooks below take most of the wall-clock time.
@@ -1152,11 +1557,36 @@ export async function handleMessage({
 
   if (!isRefine) await cache.set(cacheKey, workflow);
 
+  /**
+   * A tool good enough to build a stage on is a tool the catalog should have.
+   * Queueing it for admin review is what turns a gap the user hit today into a
+   * catalog entry the next user does not hit — the alternative is running the
+   * same web search forever for the same missing capability.
+   *
+   * Fire-and-forget: never delays the response, writes only to `SuggestedTool`
+   * (status: pending), never to the live catalog.
+   */
+  const externalUsed = workflow.stages.filter(s => s.tool?.external);
+  if (externalUsed.length) {
+    discoverAndQueueTools({
+      webResults: externalUsed.map(s => ({
+        title: s.tool.name,
+        url: s.tool.websiteUrl,
+        snippet: s.tool.tagline || s.why,
+      })),
+      assistantReply: workflow.reply,
+      sourceQuery: routed.goal,
+      userId,
+    }).catch(() => {});
+  }
+
   onProgress({ phase: 'done', message: 'Workflow ready' });
 
   log.info('Workflow generated', {
     stages: workflow.stages.length,
     reused: reusedCount,
+    external: externalUsed.length,
+    gaps: workflow.gaps?.length || 0,
     minutes: workflow.totalMinutes,
     ms: workflow.meta.ms,
   });
@@ -1168,7 +1598,11 @@ export async function handleMessage({
     intent: routed.intent,
     title: workflow.title,
     goal: routed.goal,
-    toolSlugs: workflow.stages.map(s => s.toolSlug),
+    // Persisted once, on the turn the user approved their intake answers.
+    brief: forcedGoal || undefined,
+    // External stages have no slug — filtered out rather than recorded as
+    // nulls, which would corrupt the conversation's tool-slug grounding.
+    toolSlugs: workflow.stages.map(s => s.toolSlug).filter(Boolean),
   };
 }
 
@@ -1215,7 +1649,10 @@ export async function updateProfileFromTurn({ userId, userMessage, assistantMess
       task: 'profile:extract',
       role: 'fast',
       temperature: 0.1,
-      maxTokens: 300,
+      // See the ceiling-retry note in `completeJson`: 300 was smaller than the
+      // reasoning tier's thinking budget, so this returned nothing at all and
+      // long-term memory quietly stopped growing.
+      maxTokens: 1500,
       messages: [
         { role: 'system', content: prompts.profileExtractionSystem() },
         { role: 'user', content: prompts.profileExtractionUser({ userMessage, assistantMessage }) },

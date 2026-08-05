@@ -227,7 +227,9 @@ async function summarizeHistory({ transcript, task, signal, onEvent }) {
 
   try {
     const { content } = await complete({
-      role: 'fast',
+      // Dense compression, not judgment — same tier as memory.js's rolling
+      // summary, kept separate from `fast` (routing/classification).
+      role: 'utility',
       task: `${task}:summarize`,
       temperature: 0,
       maxTokens: 1500,
