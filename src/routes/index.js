@@ -48,14 +48,39 @@ router.get('/health/ready', async (req, res) => {
     catalogOk = false;
   }
 
-  const ready = dbState === 1 && catalogOk;
+  const { getRedis, isRedisConfigured } = await import('../utils/redis.js');
+  const redis = getRedis();
+  const redisMode = isRedisConfigured() && !redis.isMemoryFallback ? 'redis' : 'memory';
+  let redisOk = redisMode === 'memory';
+  if (redisMode === 'redis') {
+    try {
+      const pong = await redis.ping();
+      redisOk = pong === 'PONG' || pong === 'pong';
+    } catch {
+      redisOk = false;
+    }
+  }
+
+  const queueMode = process.env.REDIS_URL ? 'bullmq' : 'in-process';
+  const mongoHost = (() => {
+    try {
+      return new URL(config.mongoUri).hostname;
+    } catch {
+      return null;
+    }
+  })();
+
+  const ready = dbState === 1 && catalogOk && (redisMode === 'memory' || redisOk);
 
   res.status(ready ? 200 : 503).json({
     success: ready,
     checks: {
       database: dbState === 1 ? 'up' : 'down',
+      mongoHost: mongoHost || 'unset',
       catalog: catalogOk ? `${catalogSize} tools indexed` : 'empty',
       ai: isLLMAvailable() ? 'configured' : 'not configured',
+      redis: redisOk ? redisMode : 'down',
+      queue: queueMode,
     },
     timestamp: new Date().toISOString(),
   });
