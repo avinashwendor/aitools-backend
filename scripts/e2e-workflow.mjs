@@ -34,6 +34,8 @@ import config from '../src/config/index.js';
 import { handleMessage } from '../src/ai/workflowEngine.js';
 import { getCatalog } from '../src/ai/catalog.js';
 import { isLLMAvailable } from '../src/ai/llm.js';
+import { isWebSearchConfigured } from '../src/ai/tools/webSearch.js';
+import { expandIntakeAnswers } from '../src/ai/personalization.js';
 import { foreignToolNames } from '../src/ai/toolNames.js';
 
 const green = s => `\x1b[32m${s}\x1b[0m`;
@@ -55,10 +57,13 @@ const OUT_DIR = argOf('out') || path.join(process.cwd(), '.e2e');
  * its own, which is the reason it has been invisible.
  */
 const FALLBACK_MARKERS = [
+  'Instructions unavailable',
+  'We could not generate the step-by-step playbook',
+  'These are placeholder steps',
+  'Hit Regenerate on this stage',
+  // Legacy template (pre-fix) — still flag if an old cached playbook appears.
   'Bring in what the last stage produced',
   'Do the core work for this stage',
-  'Export the result for the next stage',
-  'Check the output format matches what the next tool expects',
 ];
 
 let CATALOG_NAMES = [];
@@ -206,6 +211,7 @@ async function turn(convo, label, message, opts = {}) {
             title: s.title,
             toolSlug: s.toolSlug,
             toolName: s.tool?.name,
+            external: Boolean(s.tool?.external),
             why: s.why,
             input: s.input,
             output: s.output,
@@ -230,7 +236,12 @@ async function turn(convo, label, message, opts = {}) {
     entry.clarifyingQuestions.forEach(q => console.log(dim(`    ? ${q}`)));
   }
   if (result.workflow) {
-    console.log(dim(`    ${result.workflow.stages.map(s => `${s.title.slice(0, 28)} [${s.tool?.name}]`).join(' → ')}`));
+    console.log(dim(
+      `    ${result.workflow.stages.map(s => {
+        const tag = s.tool?.external ? 'ext' : 'cat';
+        return `${s.title.slice(0, 28)} [${s.tool?.name || '?'} · ${tag}]`;
+      }).join(' → ')}`
+    ));
   }
   problems.forEach(p => console.log(`    ${red('✗')} ${p}`));
 
@@ -280,19 +291,45 @@ async function personaBeginner({ allowExternalTools }) {
   const convo = newConversation(`e2e-${name}`);
   const opts = { allowExternalTools };
 
+  // Mirror the real intake: "All of the above" must expand before it reaches
+  // the enriched goal the planner reads.
+  const intakeQuestions = [
+    {
+      id: 'features',
+      question: 'Which core features are most important to include in v1?',
+      options: [
+        'Attendance tracking',
+        'Grades & report cards',
+        'Announcements / notices',
+        'Timetable / schedule',
+        'Parent-teacher messaging',
+        'All of the above',
+      ],
+    },
+  ];
+  const resolvedAnswers = expandIntakeAnswers(
+    { features: 'All of the above' },
+    intakeQuestions
+  );
+  if (!String(resolvedAnswers.features || '').includes('Attendance tracking')) {
+    throw new Error('expandIntakeAnswers failed to expand "All of the above" before planning');
+  }
+  console.log(dim(`  intake expand: ${resolvedAnswers.features}`));
+
   // The intake questions are asked by the surface, not the engine, when there
   // is no userId — so seed the approved state the way a real session reaches
   // the planner, carrying everything the user answered.
   convo.clarificationState = {
     phase: 'awaiting_approval',
-    questions: [],
-    answersText: '',
+    questions: intakeQuestions,
+    answersText: `Which core features are most important to include in v1? ${resolvedAnswers.features}`,
+    answers: resolvedAnswers,
     baseGoal: 'Create a mobile application for schools and colleges',
     enrichedGoal:
       'Create a mobile application for schools and colleges.\n\nUser preferences:\n' +
-      'Platforms: both iOS and Android. Features: attendance, grades, announcements, timetable, ' +
-      'communication, fee payments. Users: students, parents, teachers and admins. ' +
-      'No preferred no-code platform.',
+      `Which core features are most important to include in v1? ${resolvedAnswers.features}. ` +
+      'Platforms: both iOS and Android. Users: students, parents, teachers and admins. ' +
+      'No preferred no-code platform. Budget: Freemium OK.',
     intakeOverrides: { skill: 'beginner' },
   };
 
@@ -306,6 +343,35 @@ async function personaBeginner({ allowExternalTools }) {
     opts
   );
   reportDiff('refine', compareVersions(first.result.workflow, refine.result.workflow));
+
+  const plan = refine.result.workflow || first.result.workflow;
+  const externalStages = (plan?.stages || []).filter(s => s.tool?.external);
+  if (allowExternalTools) {
+    if (externalStages.length) {
+      console.log(green(
+        `  ✓ beyond-catalog bound ${externalStages.length} external stage(s): ` +
+        externalStages.map(s => s.tool.name).join(', ')
+      ));
+    } else if (isWebSearchConfigured()) {
+      // Soft signal — Tavily may return nothing useful, but the path must have
+      // run without error. Fail hard only when the plan still looks like a
+      // website stack after the user insisted on a native mobile app.
+      const names = (plan?.stages || []).map(s => s.tool?.name || s.toolSlug).join(', ');
+      console.log(yellow(
+        `  ! beyond-catalog: no external stages bound (catalog: ${names || 'none'}). ` +
+        'Search ran but the planner stayed in-catalog.'
+      ));
+      if (/lovable|v0|framer|webflow|bubble/i.test(names) && !/flutterflow|adalo|glide|thunkable|draftbit|bravo/i.test(names)) {
+        const msg =
+          'BEYOND_CATALOG expected a mobile-app builder (or external tool) after refine, ' +
+          `got catalog-only web stack: ${names}`;
+        refine.entry.problems.push(msg);
+        console.log(`    ${red('✗')} ${msg}`);
+      }
+    } else {
+      console.log(yellow('  ! beyond-catalog: Tavily not configured — external path skipped'));
+    }
+  }
 
   const buildStage = refine.result.workflow?.stages?.[2];
   if (buildStage) {

@@ -177,10 +177,12 @@ SKILL: the user is ${skill}. Match tool complexity to that level.
 
 Respond with JSON only:
 {"title":"...","summary":"...","outcome":"...","difficulty":"beginner|intermediate|advanced",
- "stages":[{"title":"...","toolSlug":"...","why":"...","input":"...","output":"...",
+ "stages":[{"title":"...","toolSlug":"...","externalTool":null,"why":"...","input":"...","output":"...",
             "timeMinutes":20,"alternativeSlugs":["..."]}],
  "gaps":[{"capability":"...","reason":"...","closestSlug":"...","suggestedTool":"..."}],
- "tips":["..."],"followUp":"..."}`;
+ "tips":["..."],"followUp":"..."}
+For an external stage set toolSlug to null and externalTool to
+{"name":"...","url":"...","pricing":"freemium"} copied from EXTERNAL_CANDIDATES.`;
 }
 
 export function plannerUser({

@@ -128,6 +128,7 @@ export const resetPreferences = async (req, res) => {
     profile.skillLevel = null;
     profile.pricingPreference = null;
     profile.industry = null;
+    profile.allowExternalTools = false;
     profile.toolsAlreadyUsing = [];
     profile.preferredTools = [];
     profile.rejectedTools = [];

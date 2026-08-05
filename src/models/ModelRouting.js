@@ -1,14 +1,12 @@
 import mongoose from 'mongoose';
 
 /**
- * Which model serves each role, overriding `AI_PROVIDERS`.
+ * Which model serves each role — the live source of truth for model ids.
  *
- * The env var is the bootstrap default; this is the live value. The split
- * matters because the two answer different questions. `AI_PROVIDERS` is where
- * keys and base URLs live — secrets that belong in the deployment. Which model
- * serves the `fast` role is an operational decision that changes when a gateway
- * drops a model, and pushing it through an env var means a redeploy to react to
- * something that has already started failing.
+ * `AI_PROVIDERS` still owns keys, base URLs and provider failover order
+ * (secrets that belong in the deployment). Its model-name fields are bootstrap
+ * defaults only: `initModelRouting` copies any missing role into this document
+ * once at boot, and from then on only the admin panel changes what runs.
  *
  * The failure that motivated this: a gateway listed four models in `/v1/models`
  * and served exactly one. Three of the four roles were pointed at models that
@@ -26,13 +24,23 @@ const modelRoutingSchema = new mongoose.Schema(
     key: { type: String, default: 'default', unique: true, immutable: true },
 
     /**
-     * `{ [providerName]: { reasoning, planner, fast, utility } }`.
+     * `{ [providerName]: { reasoning, planner, fast, utility } }` — model ids.
      *
-     * Sparse by design — a role absent here means "use what AI_PROVIDERS said".
-     * Storing only the deltas keeps the env meaningful as the documented
-     * baseline instead of a value that is always shadowed.
+     * After boot seeding, every role for every configured provider should be
+     * present. A missing role is a bug, not a silent env fallback.
      */
     overrides: { type: mongoose.Schema.Types.Mixed, default: {} },
+
+    /**
+     * `{ [providerName]: { reasoning, planner, fast, utility } }` — max_tokens
+     * ceilings. Owned by the admin panel the same way model ids are. Env
+     * `AI_MAX_TOKENS` / `AI_AGENTIC_MAX_TOKENS` are bootstrap defaults only.
+     *
+     * Per-provider on purpose: OpenRouter reserves credits against the
+     * requested ceiling, so a key that can only afford 3500 needs a lower
+     * planner cap than Omega even when both serve the same role.
+     */
+    tokenLimits: { type: mongoose.Schema.Types.Mixed, default: {} },
 
     /**
      * Last observed reachability per model id, from the admin panel's test

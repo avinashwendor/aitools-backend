@@ -40,6 +40,7 @@ import { cancelBuild, activeBuildCount } from '../agentic/architect/index.js';
 import { subscribe } from '../agentic/events.js';
 import { isWebSearchConfigured } from '../ai/tools/webSearch.js';
 import { isLLMAvailable } from '../ai/llm.js';
+import { expandIntakeAnswers } from '../ai/personalization.js';
 import { planAllows, planLimit, creditCost } from '../billing/plans.js';
 import { checkLimit, isUnmetered } from '../billing/credits.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
@@ -635,7 +636,7 @@ export const continueBuild = asyncHandler(async (req, res) => {
 
   const answeringIntake = build.status === 'awaiting_clarification';
   const intakeAnswers = req.body.intakeAnswers && typeof req.body.intakeAnswers === 'object'
-    ? req.body.intakeAnswers
+    ? expandIntakeAnswers(req.body.intakeAnswers, build.clarifyingQuestions || [])
     : null;
 
   let content = message.slice(0, 8000);

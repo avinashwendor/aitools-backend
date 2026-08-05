@@ -159,6 +159,43 @@ const NOTE_QUESTIONS = {
 
 const normalise = value => String(value ?? '').trim().toLowerCase();
 
+const isAllOfTheAbove = value =>
+  /^all of the above\.?$/i.test(String(value ?? '').trim());
+
+/**
+ * Expand "All of the above" into the real option list so the planner context,
+ * captured-preferences chips, and profile notes see the concrete choices.
+ *
+ * @param {Record<string, string>|null|undefined} answers
+ * @param {Array<{id?: string, options?: string[]}>|null|undefined} questions
+ * @returns {Record<string, string>}
+ */
+export function expandIntakeAnswers(answers, questions) {
+  if (!answers || typeof answers !== 'object') return {};
+
+  const byId = new Map(
+    (Array.isArray(questions) ? questions : [])
+      .filter(q => q?.id != null)
+      .map(q => [String(q.id), q])
+  );
+
+  const expanded = {};
+  for (const [id, raw] of Object.entries(answers)) {
+    const answer = String(raw ?? '').trim();
+    if (!answer) continue;
+    if (!isAllOfTheAbove(answer)) {
+      expanded[id] = answer;
+      continue;
+    }
+    const options = byId.get(String(id))?.options;
+    const others = Array.isArray(options)
+      ? options.map(String).filter(opt => !isAllOfTheAbove(opt))
+      : [];
+    expanded[id] = others.length ? others.join(', ') : answer;
+  }
+  return expanded;
+}
+
 /**
  * @param {Record<string, string>} answers  `{questionId: chosenOption}`
  * @returns {{facts: object, overrides: {pricing?: string, skill?: string}}}
@@ -202,6 +239,7 @@ export default {
   profileFingerprint,
   retrievalSignals,
   hasExhaustedIntake,
+  expandIntakeAnswers,
   factsFromIntakeAnswers,
   GENERAL_DOMAIN,
 };

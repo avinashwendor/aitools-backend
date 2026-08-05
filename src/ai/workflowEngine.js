@@ -29,6 +29,7 @@ import {
   profileFingerprint,
   retrievalSignals,
   hasExhaustedIntake,
+  expandIntakeAnswers,
   factsFromIntakeAnswers,
   GENERAL_DOMAIN,
 } from './personalization.js';
@@ -269,13 +270,33 @@ function heuristicRoute(message, hasPriorWorkflow, profile) {
 
 /**
  * A stage's binding, whichever form it took.
- * @returns {{name:string}|null} the external tool, or null for a catalog stage
+ *
+ * When the model names an EXTERNAL_CANDIDATES product but drops or invents the
+ * URL, fill the verified URL from the offered map — that is the whole point of
+ * only allowing names we searched for.
+ *
+ * @param {object} stage
+ * @param {Map<string, {name:string,url:string,pricing?:string,tagline?:string}>|null} [offeredExternal]
+ * @returns {{name:string,url:string,pricing?:string,tagline?:string}|null}
  */
-function externalBindingOf(stage) {
+function externalBindingOf(stage, offeredExternal = null) {
   const ext = stage?.externalTool;
   if (!ext || typeof ext !== 'object') return null;
-  if (!ext.name || !ext.url) return null;
-  return ext;
+  const name = String(ext.name || '').trim();
+  if (!name) return null;
+
+  const offered = offeredExternal?.get(name.toLowerCase()) || null;
+  const url = String(ext.url || offered?.url || '').trim();
+  if (!url) return null;
+
+  return {
+    name: offered?.name || name,
+    url,
+    pricing: ['free', 'freemium', 'paid', 'contact'].includes(ext.pricing)
+      ? ext.pricing
+      : (offered?.pricing || 'freemium'),
+    tagline: String(ext.tagline || offered?.tagline || '').slice(0, 160),
+  };
 }
 
 async function plan({
@@ -350,7 +371,7 @@ async function plan({
       const badExternal = [];
 
       for (const stage of v.stages) {
-        const ext = externalBindingOf(stage);
+        const ext = externalBindingOf(stage, offeredExternal);
         if (ext) {
           if (!allowExternalTools) {
             badExternal.push(`${ext.name} (external tools are not enabled for this user)`);
@@ -359,7 +380,19 @@ async function plan({
           }
           continue;
         }
-        if (!validSlugs.has(stage.toolSlug)) badSlugs.push(stage.toolSlug);
+
+        const slug = stage.toolSlug;
+        // Null/empty slug is what the prompt asks for on external stages. When
+        // the externalTool object is missing or incomplete, say that clearly —
+        // otherwise the repair loop sees "CANDIDATE_TOOLS: ." and cannot fix it.
+        if (slug == null || slug === '') {
+          const attempted = stage.externalTool?.name
+            ? `"${stage.externalTool.name}" (copy name+url from EXTERNAL_CANDIDATES into externalTool, and set toolSlug to null)`
+            : '(null toolSlug with no externalTool — bind a CANDIDATE_TOOLS slug, or an EXTERNAL_CANDIDATES entry)';
+          badSlugs.push(attempted);
+          continue;
+        }
+        if (!validSlugs.has(slug)) badSlugs.push(slug);
       }
 
       if (badSlugs.length) {
@@ -392,14 +425,14 @@ async function plan({
        */
       const declared = [
         ...v.stages.map(s => {
-          const ext = externalBindingOf(s);
+          const ext = externalBindingOf(s, offeredExternal);
           return ext ? ext.name : cards.find(c => c.slug === s.toolSlug)?.name;
         }).filter(Boolean),
         ...(Array.isArray(v.gaps) ? v.gaps.map(g => g?.suggestedTool).filter(Boolean) : []),
       ];
 
       for (const [i, stage] of v.stages.entries()) {
-        const ext = externalBindingOf(stage);
+        const ext = externalBindingOf(stage, offeredExternal);
         const boundName = ext ? ext.name : (cards.find(c => c.slug === stage.toolSlug)?.name || stage.toolSlug);
 
         const foreign = foreignToolNames(`${stage.title} — ${stage.why || ''}`, boundName, {
@@ -470,12 +503,15 @@ function stripForeignParenthetical(title, boundName, catalogNames) {
   return stripped.length >= 8 ? stripped : title;
 }
 
-function normalizePlan(raw, { bySlug, goal, title, catalogNames = [] }) {
+function normalizePlan(raw, { bySlug, goal, title, catalogNames = [], externalCandidates = null }) {
+  const offeredExternal = new Map(
+    (externalCandidates || []).map(c => [String(c.name).toLowerCase(), c])
+  );
   const seen = new Set();
   const stages = [];
 
   for (const stage of raw.stages || []) {
-    const ext = externalBindingOf(stage);
+    const ext = externalBindingOf(stage, offeredExternal);
     const tool = ext ? hydrateExternalTool(ext) : bySlug.get(stage.toolSlug);
     if (!tool) continue;
 
@@ -590,28 +626,34 @@ function normalizePlan(raw, { bySlug, goal, title, catalogNames = [] }) {
  */
 function fallbackPlaybook(stage) {
   const name = stage.tool.name;
-  const capabilities = (stage.tool.features || []).slice(0, 3).join(', ');
 
+  // Deliberately not a fake how-to. The previous template read like a real
+  // playbook ("Bring in what the last stage produced…") and users followed it
+  // thinking the model wrote it — while logs said the provider was out of
+  // credit. Keep four slots so the UI layout holds, but make every line say
+  // the instructions are missing.
   return {
     degraded: true,
     steps: [
       {
-        title: `Open ${name} and start a new project`,
-        detail: `Sign in to ${name} and create a new workspace for this stage.`,
+        title: 'Instructions unavailable',
+        detail: `We could not generate the step-by-step playbook for ${name} just now (AI provider error). Hit Regenerate on this stage.`,
       },
       {
-        title: `Bring in what the last stage produced`,
-        detail: `Import or paste in: ${stage.input}.`,
+        title: 'What this stage needs',
+        detail: stage.input
+          ? `Input for this stage: ${stage.input}`
+          : 'Use the output of the previous stage as your starting point.',
       },
       {
-        title: `Do the core work for this stage`,
-        detail: capabilities
-          ? `Use ${name}'s ${capabilities} to produce this stage's deliverable.`
-          : `Use ${name} to produce this stage's deliverable.`,
+        title: 'What to produce',
+        detail: stage.output
+          ? `Deliverable: ${stage.output}`
+          : `Open ${name} and produce the artifact this stage is responsible for.`,
       },
       {
-        title: `Export the result for the next stage`,
-        detail: `Produce and save: ${stage.output}.`,
+        title: 'Next action',
+        detail: `Regenerate this playbook when the AI service is healthy, or work directly in ${name}.`,
       },
     ],
     prompt: null,
@@ -619,8 +661,8 @@ function fallbackPlaybook(stage) {
       { label: 'Input', value: stage.input || 'Output of the previous stage' },
       { label: 'Deliverable', value: stage.output || 'The artifact this stage produces' },
     ],
-    pitfall: 'Check the output format matches what the next tool expects before moving on.',
-    checkpoint: `You have ${stage.output}.`,
+    pitfall: 'These are placeholder steps — do not treat them as a full playbook. Regenerate this stage.',
+    checkpoint: stage.output ? `You have ${stage.output}.` : `Stage in ${name} is complete.`,
   };
 }
 
@@ -1187,13 +1229,27 @@ export async function handleMessage({
 
   // ── Clarification intake (no planner tokens until user approves) ──
   if (clarifyState?.phase === 'asking' && !priorWorkflow) {
-    const enrichedGoal = `${clarifyState.baseGoal || sanitized}\n\nUser preferences:\n${sanitized}`;
+    // "All of the above" is a chip label — expand it to the real option list
+    // so the planner context and the approval summary show concrete choices.
+    const resolvedAnswers = expandIntakeAnswers(
+      intakeAnswers,
+      clarifyState.questions || []
+    );
+    const questions = clarifyState.questions || [];
+    const preferencesText = questions.some(q => resolvedAnswers[q.id])
+      ? questions
+          .filter(q => resolvedAnswers[q.id])
+          .map(q => `${q.question} ${resolvedAnswers[q.id]}`)
+          .join('. ')
+      : sanitized;
+    const enrichedGoal =
+      `${clarifyState.baseGoal || sanitized}\n\nUser preferences:\n${preferencesText}`;
 
     // The answers arrived as structured choices, so read them rather than
     // sending the prose back through an LLM to re-derive what the user
     // already picked from a dropdown. Awaited, not fire-and-forget: the
     // approval turn immediately below reloads this profile.
-    const { facts, overrides } = factsFromIntakeAnswers(intakeAnswers);
+    const { facts, overrides } = factsFromIntakeAnswers(resolvedAnswers);
     if (userId && Object.keys(facts).length) {
       await updateProfileFacts(userId, facts).catch(err =>
         log.warn('Failed to persist intake facts', { error: err.message })
@@ -1203,8 +1259,8 @@ export async function handleMessage({
     if (userId) {
       await saveClarificationState(userId, sessionId, {
         phase: 'awaiting_approval',
-        questions: clarifyState.questions || [],
-        answersText: sanitized,
+        questions,
+        answersText: preferencesText,
         enrichedGoal,
         baseGoal: clarifyState.baseGoal || sanitized,
         // Carried forward so the approval turn honours the answers even if the
@@ -1212,19 +1268,19 @@ export async function handleMessage({
         intakeOverrides: overrides,
         // Kept so a page reload can still show what was captured, rather than
         // only the turn that submitted it.
-        answers: intakeAnswers || {},
+        answers: resolvedAnswers,
       });
     }
     return {
       message:
         `Thanks — here's what I'll plan for:\n\n**${clarifyState.baseGoal || 'Your project'}**\n\n` +
-        `${sanitized}\n\n` +
+        `${preferencesText}\n\n` +
         `When you're ready, hit **Generate workflow** and I'll design the full build plan.`,
       workflow: null,
       intent: 'clarify',
       readyToApprove: true,
       clarifyingQuestions: null,
-      capturedPreferences: intakeAnswers || null,
+      capturedPreferences: Object.keys(resolvedAnswers).length ? resolvedAnswers : null,
     };
   }
 
@@ -1496,6 +1552,7 @@ export async function handleMessage({
     goal: routed.goal,
     title: routed.title,
     catalogNames: cards.map(c => c.name),
+    externalCandidates,
   });
 
   if (normalized.stages.length < 2) {

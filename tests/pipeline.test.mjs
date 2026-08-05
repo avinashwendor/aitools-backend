@@ -63,6 +63,7 @@ const cache = (await import('../src/ai/cache.js')).default;
 const UserProfile = (await import('../src/models/UserProfile.js')).default;
 const {
   profileFingerprint,
+  expandIntakeAnswers,
   factsFromIntakeAnswers,
   hasExhaustedIntake,
 } = await import('../src/ai/personalization.js');
@@ -582,6 +583,43 @@ describe('personalization', () => {
     // Empty in, empty out — never invent a preference from nothing.
     assert.deepEqual(factsFromIntakeAnswers(null), { facts: {}, overrides: {} });
     assert.deepEqual(factsFromIntakeAnswers({ budget: '' }), { facts: {}, overrides: {} });
+  });
+
+  test('"All of the above" expands to the concrete option list', () => {
+    const questions = [
+      {
+        id: 'features',
+        question: 'Which core features are most important to include in v1?',
+        options: [
+          'Attendance tracking',
+          'Grades & report cards',
+          'Announcements',
+          'Fee payments',
+          'All of the above',
+        ],
+      },
+      {
+        id: 'budget',
+        question: "What's your budget?",
+        options: ['Free only', 'Freemium OK', 'Paid is fine'],
+      },
+    ];
+
+    const expanded = expandIntakeAnswers(
+      { features: 'All of the above', budget: 'Freemium OK' },
+      questions
+    );
+
+    assert.equal(
+      expanded.features,
+      'Attendance tracking, Grades & report cards, Announcements, Fee payments'
+    );
+    assert.equal(expanded.budget, 'Freemium OK');
+    assert.equal(
+      expandIntakeAnswers({ features: 'All of the above.' }, questions).features,
+      expanded.features
+    );
+    assert.deepEqual(expandIntakeAnswers(null, questions), {});
   });
 
   test('a user-pinned field survives later inference', () => {

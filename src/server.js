@@ -152,7 +152,9 @@ async function start() {
   // request so a repointed role is honoured immediately rather than on the
   // first TTL refresh; `llm.js` resolves roles synchronously and cannot await.
   await initModelRouting().catch(err =>
-    log.warn('Could not load model routing overrides — using env defaults', { error: err.message })
+    log.warn('Could not load model routing — env bootstrap models will be used until Mongo is reachable', {
+      error: err.message,
+    })
   );
 
   server = app.listen(config.port, () => {

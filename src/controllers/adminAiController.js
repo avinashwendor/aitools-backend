@@ -18,14 +18,22 @@
 
 import config from '../config/index.js';
 import ModelRouting from '../models/ModelRouting.js';
-import { currentOverrides, applyOverrides } from '../ai/modelRouting.js';
+import {
+  currentOverrides,
+  currentTokenLimits,
+  applyOverrides,
+  clampTokenLimit,
+  envTokenLimitFor,
+  TOKEN_LIMIT_BOUNDS,
+  ROUTING_ROLES,
+} from '../ai/modelRouting.js';
 import { getProviderStatus } from '../ai/llm.js';
 import { bus, EVENTS } from '../utils/events.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('admin:ai');
 
-export const ROLES = ['reasoning', 'planner', 'fast', 'utility'];
+export const ROLES = ROUTING_ROLES;
 
 /**
  * What each role is for, in the terms that decide it. Served to the UI so the
@@ -62,22 +70,31 @@ const ROLE_INFO = {
   },
 };
 
-/** The model a role resolves to today, and where that value came from. */
-function resolveRole(provider, role, overrides) {
-  const override = overrides?.[provider.name]?.[role] || null;
-  const envValue =
+/** The model + token ceiling a role resolves to today. */
+function resolveRole(provider, role, overrides, tokenLimits) {
+  const routed = overrides?.[provider.name]?.[role] || null;
+  const envBootstrap =
     role === 'reasoning' ? provider.reasoning || provider.planner
       : role === 'fast' ? provider.fast
       : role === 'utility' ? provider.utility || provider.fast
       : provider.planner;
+  const tokenLimit = tokenLimits?.[provider.name]?.[role] ?? null;
+  const envTokenDefault = envTokenLimitFor(role);
+  const bounds = TOKEN_LIMIT_BOUNDS[role];
 
   return {
     role,
     ...ROLE_INFO[role],
-    active: override || envValue || null,
-    source: override ? 'override' : 'env',
-    envDefault: envValue || null,
-    override,
+    // Runtime uses the routing table; env is only shown so admins can see the
+    // original bootstrap value if they want to restore it.
+    active: routed || envBootstrap || null,
+    source: routed ? 'routing' : 'env-bootstrap',
+    envDefault: envBootstrap || null,
+    override: routed,
+    tokenLimit: tokenLimit ?? envTokenDefault,
+    tokenLimitSource: tokenLimit != null ? 'routing' : 'env-bootstrap',
+    envTokenDefault,
+    tokenLimitBounds: bounds,
   };
 }
 
@@ -107,6 +124,7 @@ export const getRouting = async (req, res, next) => {
   try {
     const doc = await ModelRouting.findOne({ key: 'default' }).lean();
     const overrides = doc?.overrides || currentOverrides();
+    const tokenLimits = doc?.tokenLimits || currentTokenLimits();
     const providers = providerView();
 
     res.json({
@@ -114,7 +132,7 @@ export const getRouting = async (req, res, next) => {
       data: {
         providers: providers.map(p => ({
           ...p,
-          roles: ROLES.map(role => resolveRole(p, role, overrides)),
+          roles: ROLES.map(role => resolveRole(p, role, overrides, tokenLimits)),
         })),
         health: doc?.health || {},
         updatedAt: doc?.updatedAt || null,
@@ -329,7 +347,12 @@ export const testModels = async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────
 export const updateRouting = async (req, res, next) => {
   try {
-    const { provider: providerName, roles = {}, skipVerification = false } = req.body;
+    const {
+      provider: providerName,
+      roles = {},
+      tokenLimits: tokenLimitPatch = {},
+      skipVerification = false,
+    } = req.body;
 
     const provider = config.ai.providers.find(p => p.name === providerName);
     if (!provider) {
@@ -339,6 +362,14 @@ export const updateRouting = async (req, res, next) => {
     const invalidRole = Object.keys(roles).find(r => !ROLES.includes(r));
     if (invalidRole) {
       return res.status(400).json({ success: false, message: `Unknown role "${invalidRole}".` });
+    }
+
+    const invalidLimitRole = Object.keys(tokenLimitPatch || {}).find(r => !ROLES.includes(r));
+    if (invalidLimitRole) {
+      return res.status(400).json({
+        success: false,
+        message: `Unknown role in tokenLimits "${invalidLimitRole}".`,
+      });
     }
 
     /**
@@ -376,15 +407,29 @@ export const updateRouting = async (req, res, next) => {
     overrides[providerName] = { ...(overrides[providerName] || {}) };
 
     for (const [role, model] of Object.entries(roles)) {
-      // An empty value clears the override and hands the role back to the env
-      // default, which is how you undo a change without knowing what it was.
-      if (!model) delete overrides[providerName][role];
-      else overrides[providerName][role] = String(model).slice(0, 120);
+      // Empty means "leave this role unchanged". Clearing back to env is no
+      // longer supported — model ids are owned by this table after boot seed.
+      if (!model) continue;
+      overrides[providerName][role] = String(model).slice(0, 120);
+    }
+
+    const tokenLimits = { ...(existing?.tokenLimits || {}) };
+    tokenLimits[providerName] = { ...(tokenLimits[providerName] || {}) };
+    for (const [role, raw] of Object.entries(tokenLimitPatch || {})) {
+      if (raw === '' || raw == null) continue;
+      const clamped = clampTokenLimit(role, raw);
+      if (clamped == null) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid token limit for ${role}: ${raw}`,
+        });
+      }
+      tokenLimits[providerName][role] = clamped;
     }
 
     const doc = await ModelRouting.findOneAndUpdate(
       { key: 'default' },
-      { $set: { overrides, updatedBy: req.user._id } },
+      { $set: { overrides, tokenLimits, updatedBy: req.user._id } },
       { upsert: true, new: true }
     ).lean();
 
@@ -393,12 +438,18 @@ export const updateRouting = async (req, res, next) => {
     // otherwise serve the previous model until a background reload landed —
     // for the one request most likely to be the admin checking their change.
     // Other instances pick it up on their own TTL.
-    applyOverrides(doc.overrides);
+    applyOverrides(doc.overrides, doc.tokenLimits);
     bus.emit(EVENTS.MODEL_ROUTING_CHANGED);
+
+    const limitSummary = Object.entries(tokenLimitPatch || {})
+      .filter(([, v]) => v != null && v !== '')
+      .map(([r, v]) => `${r}=${v}`)
+      .join(', ');
 
     log.info('Model routing updated', {
       provider: providerName,
-      roles: Object.entries(roles).map(([r, m]) => `${r}=${m || 'env default'}`).join(', '),
+      roles: Object.entries(roles).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(', '),
+      tokenLimits: limitSummary || 'unchanged',
       by: String(req.user._id),
     });
 
@@ -406,6 +457,7 @@ export const updateRouting = async (req, res, next) => {
       success: true,
       data: {
         overrides: doc.overrides,
+        tokenLimits: doc.tokenLimits,
         verification,
         message: 'Routing updated — live on the next request, no redeploy needed.',
       },

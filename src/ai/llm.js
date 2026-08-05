@@ -11,7 +11,7 @@ import config from '../config/index.js';
 import { createLogger } from '../utils/logger.js';
 import { recordCall } from './telemetry.js';
 import { recordLlmUsage } from '../billing/meterContext.js';
-import { overrideFor } from './modelRouting.js';
+import { overrideFor, tokenLimitFor } from './modelRouting.js';
 
 const log = createLogger('ai:llm');
 
@@ -48,9 +48,8 @@ const providers = config.ai.providers.map(p => ({
 
 if (providers.length) {
   log.info('LLM provider chain ready', {
-    chain: providers.map(p => `${p.name}(${p.plannerModel})`).join(' → '),
-    reasoning: providers.map(p => `${p.name}(${p.reasoningModel})`).join(' → '),
-    utility: providers.map(p => `${p.name}(${p.utilityModel})`).join(' → '),
+    chain: providers.map(p => `${p.name}(key+url from env)`).join(' → '),
+    note: 'Model ids come from admin panel routing (seeded from env once at boot)',
   });
 } else {
   log.warn('No AI provider configured — LLM calls will fail fast with AI_DISABLED');
@@ -62,7 +61,23 @@ const QUOTA_COOLOFF_MS = 5 * 60 * 1000;
 export const isLLMAvailable = () => providers.length > 0;
 
 /**
+ * Env bootstrap model for a role — used only when admin routing has not seeded
+ * that role yet. Runtime resolution prefers the admin panel snapshot.
+ */
+function envModelFor(provider, role) {
+  if (role === 'reasoning') return provider.reasoningModel || provider.plannerModel;
+  if (role === 'fast') return provider.fastModel;
+  if (role === 'utility') return provider.utilityModel || provider.fastModel;
+  return provider.plannerModel;
+}
+
+/**
  * Resolve a role to this provider's model list.
+ *
+ * Model ids come from the admin panel routing table (`modelRouting.js`), not
+ * from env. Env still supplies keys, base URLs and provider order. `AI_PROVIDERS`
+ * model fields are bootstrap defaults that `initModelRouting` seeds into Mongo
+ * once — after that, only the panel changes what runs.
  *
  * Four tiers, and the split is by what breaks if you get it wrong rather than
  * by cost:
@@ -87,29 +102,59 @@ export const isLLMAvailable = () => providers.length > 0;
  *              invented-endpoint graphs this system was rebuilt to stop.
  */
 function modelsFor(provider, role) {
-  // An admin repointing a role in the panel wins over the env default. The
-  // lookup is a synchronous read of an in-process snapshot — see
-  // `ai/modelRouting.js` for why it cannot touch the database here.
-  const override = overrideFor(provider.name, role);
+  // Synchronous read of the in-process snapshot — see `ai/modelRouting.js`.
+  const routed = overrideFor(provider.name, role);
+  const primary = routed || envModelFor(provider, role);
+  if (!routed && primary) {
+    log.warn('Role has no admin routing entry — using env bootstrap until seeded', {
+      provider: provider.name,
+      role,
+      model: primary,
+    });
+  }
 
   if (role === 'reasoning') {
-    return [override || provider.reasoningModel || provider.plannerModel].filter(Boolean);
+    return [primary].filter(Boolean);
   }
-  const envPrimary = role === 'fast' ? provider.fastModel
-    : role === 'utility' ? (provider.utilityModel || provider.fastModel)
-    : provider.plannerModel;
-  const primary = override || envPrimary;
+  // Env `fallbackModels` stay as last-resort ids on the same provider when the
+  // primary is unreachable (400/404), not as a parallel source of truth.
   return [primary, ...provider.fallbackModels.filter(m => m !== primary)].filter(Boolean);
+}
+
+/**
+ * OpenRouter (and similar gateways) reserve credits against the *requested*
+ * max_tokens. A 402 that says "can only afford N" is not an empty account —
+ * lowering the ceiling and retrying usually works. Distinct from a true
+ * out-of-credit response, which should bench the provider.
+ */
+export function parseAffordableTokens(err) {
+  const text = `${err?.message || ''} ${err?.error?.message || ''}`;
+  const match = text.match(/can only afford\s+(\d+)/i)
+    || text.match(/affordable[:\s]+(\d+)/i);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+export function isTokenAffordabilityError(err) {
+  if (parseAffordableTokens(err) != null) return true;
+  const text = `${err?.message || ''} ${err?.error?.message || ''}`.toLowerCase();
+  return /fewer max_tokens|reduce max_tokens|max_tokens.*(afford|credit)/i.test(text);
 }
 
 /**
  * A 429 means two very different things: "slow down" (retry helps) or
  * "you are out of credit" (retry never helps). Providers signal the latter in
  * the message rather than the status, so match on it and bench the provider.
+ *
+ * Deliberately excludes the "requires more credits, or fewer max_tokens"
+ * affordability pattern — that is handled by lowering max_tokens, not by
+ * benching the whole provider for five minutes.
  */
 function isQuotaExhausted(err) {
+  if (isTokenAffordabilityError(err)) return false;
   const text = `${err?.message || ''} ${JSON.stringify(err?.error ?? '')}`.toLowerCase();
-  return /no credits|out of credits|insufficient|quota|exhausted|billing|top up|payment required/.test(text);
+  return /no credits|out of credits|insufficient credits|insufficient_quota|quota|exhausted|billing|top up|payment required/.test(text);
 }
 
 export class LLMError extends Error {
@@ -258,15 +303,13 @@ export async function complete({
   task = 'generic',
   signal,
 } = {}) {
-  // Resolved from the role rather than defaulted in the signature, so a caller
-  // that asks for reasoning gets the agentic budget without having to know
-  // there are two of them.
-  const tokenCeiling = maxTokens === undefined
-    ? (role === 'reasoning' ? config.ai.agenticMaxTokens : config.ai.maxTokens)
-    : maxTokens;
-
   const callTimeout = timeoutMs
     ?? (role === 'reasoning' ? config.ai.agenticTimeoutMs : config.ai.timeoutMs);
+
+  // Env bootstrap only — used when admin routing has not seeded a ceiling yet.
+  const envCeiling = role === 'reasoning'
+    ? config.ai.agenticMaxTokens
+    : config.ai.maxTokens;
 
   if (!providers.length) {
     throw new LLMError('AI is not configured on this server.', {
@@ -287,11 +330,24 @@ export async function complete({
       continue;
     }
 
+    // Token ceiling is owned by the admin panel (per provider × role). Once
+    // seeded, call-site `maxTokens` is ignored — that is how env/hardcoded
+    // 2200→6600 widens were bypassing what ops configured and tripping
+    // OpenRouter 402s. Before seed, fall back to the call-site or env default.
+    const adminCeiling = tokenLimitFor(provider.name, role);
+    const tokenCeiling = adminCeiling
+      ?? (maxTokens != null && maxTokens > 0 ? maxTokens : envCeiling);
+
     // An explicit `model` override only makes sense on the provider that
     // actually offers it — the first one. Later providers use their own roles.
     const chain = model && provider === providers[0] ? [model] : modelsFor(provider, role);
 
     for (const candidateModel of chain) {
+      // Per-model ceiling so an affordability 402 can lower it and retry
+      // without poisoning the next provider's attempt.
+      let effectiveCeiling = tokenCeiling;
+      let affordabilityRetried = false;
+
       for (let attempt = 0; attempt <= config.ai.maxRetries; attempt++) {
         try {
           const response = await provider.client.chat.completions.create(
@@ -302,7 +358,7 @@ export async function complete({
               // Omitted entirely when there is no ceiling, rather than sent as
               // null: providers differ on whether null means "unlimited" or is
               // a 400, and absent means the model's own maximum everywhere.
-              ...(tokenCeiling > 0 ? { max_tokens: tokenCeiling } : {}),
+              ...(effectiveCeiling > 0 ? { max_tokens: effectiveCeiling } : {}),
               top_p: 0.9,
               stream: false,
               // Some providers (e.g. Perplexity Sonar) only accept
@@ -387,6 +443,35 @@ export async function complete({
 
           const status = err?.status ?? err?.response?.status;
 
+          // OpenRouter-style "can only afford N tokens": lower the ceiling and
+          // retry the same model. This is not an empty account — benching here
+          // was how playbooks silently degraded to dummy text while the log
+          // said `tried: none`.
+          const affordable = parseAffordableTokens(err);
+          if (
+            (affordable != null || isTokenAffordabilityError(err))
+            && !affordabilityRetried
+            && effectiveCeiling > 0
+          ) {
+            const reduced = affordable != null
+              ? Math.max(256, Math.min(effectiveCeiling - 1, affordable - 64))
+              : Math.max(256, Math.floor(effectiveCeiling * 0.6));
+            if (reduced < effectiveCeiling) {
+              log.warn('Provider rejected max_tokens — retrying with what the key can afford', {
+                provider: provider.name,
+                model: candidateModel,
+                from: effectiveCeiling,
+                to: reduced,
+                affordable,
+              });
+              tried.push(`${provider.name}:afford-${effectiveCeiling}→${reduced}`);
+              effectiveCeiling = reduced;
+              affordabilityRetried = true;
+              attempt -= 1; // don't consume a transient-retry slot
+              continue;
+            }
+          }
+
           // Out of credit: every model here will fail identically. Bench the
           // whole provider and move on rather than grinding through its list.
           if (isQuotaExhausted(err)) {
@@ -415,10 +500,16 @@ export async function complete({
             log.warn('Model unavailable, falling through', {
               provider: provider.name, model: candidateModel, status,
             });
+            tried.push(`${provider.name}:${candidateModel}:http${status}`);
             break;
           }
 
-          if (!isRetryable(err) || attempt === config.ai.maxRetries) break;
+          // Surface non-retryable failures (incl. bare 402) in `tried` so the
+          // final error log is never `tried: none` with a useful reason below.
+          if (!isRetryable(err) || attempt === config.ai.maxRetries) {
+            tried.push(`${provider.name}:${candidateModel}:http${status || 'err'}`);
+            break;
+          }
 
           // Honour the provider's own backpressure signal when it sends one;
           // guessing shorter than Retry-After just burns the next attempt too.
@@ -518,17 +609,32 @@ export async function completeJson({ validate, ...opts }) {
    * that helps, so ask for it once before falling through to repair.
    */
   const ranOutOfRoom = !parsed && first.finishReason === 'length';
+  let widenedCeiling = null;
   if (ranOutOfRoom) {
-    const ceiling = opts.maxTokens ?? config.ai.maxTokens;
-    const widened = Math.min(Math.max(ceiling * 3, 2000), 16_000);
+    const role = opts.role || 'planner';
+    const adminCap = tokenLimitFor(first.provider, role)
+      ?? (role === 'reasoning' ? config.ai.agenticMaxTokens : config.ai.maxTokens);
+    const ceiling = opts.maxTokens != null && opts.maxTokens > 0
+      ? Math.min(opts.maxTokens, adminCap)
+      : adminCap;
+    // Widen within the admin-configured ceiling only — never above what the
+    // panel set for this provider × role (that was the OpenRouter 402 path).
+    widenedCeiling = Math.min(
+      Math.max(Math.floor(ceiling * 1.5), ceiling + 400),
+      adminCap
+    );
     log.warn('JSON completion hit the token ceiling before emitting content — retrying with more room', {
       task: opts.task,
+      provider: first.provider,
       from: ceiling,
-      to: widened,
+      to: widenedCeiling,
+      adminCap,
       contentLength: (first.content || '').length,
     });
-    first = await complete({ ...opts, json: true, maxTokens: widened });
-    parsed = extractJson(first.content);
+    if (widenedCeiling > ceiling) {
+      first = await complete({ ...opts, json: true, maxTokens: widenedCeiling });
+      parsed = extractJson(first.content);
+    }
   }
 
   let problem = null;
@@ -545,7 +651,7 @@ export async function completeJson({ validate, ...opts }) {
     temperature: 0.1,
     // Carry the widened ceiling into the repair: the correction has to fit too,
     // and a repair that truncates is just the original failure again.
-    ...(ranOutOfRoom ? { maxTokens: Math.min(Math.max((opts.maxTokens ?? config.ai.maxTokens) * 3, 2000), 16_000) } : {}),
+    ...(widenedCeiling != null ? { maxTokens: widenedCeiling } : {}),
     messages: [
       ...opts.messages,
       { role: 'assistant', content: first.content.slice(0, 4000) },
