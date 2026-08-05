@@ -270,6 +270,55 @@ ${JSON.stringify(toolCards)}${webBlock}`;
 }
 
 // ─────────────────────────────────────────────────────────────
+// 4a. Grounded answering — a question about a stage already on the canvas
+// ─────────────────────────────────────────────────────────────
+/**
+ * @param {object} workflow the conversation's current workflow
+ * @param {object|null} stage the stage the question is about, if resolved
+ * @param {Array|null} webResults Tavily results, when a search ran
+ */
+export function workflowStepAnswerSystem(workflow, stage, webResults = null) {
+  const webBlock = webResults?.length
+    ? `\n\nWEB SEARCH RESULTS (fresh, from outside our catalog — ground your answer in these when the\ncatalog and the stage's own playbook don't cover it; cite what you use as a plain link):\n${JSON.stringify(webResults)}`
+    : '';
+
+  const stageBlock = stage
+    ? `THE STAGE THIS QUESTION IS ABOUT:
+${JSON.stringify({
+    title: stage.title,
+    tool: stage.tool?.name,
+    output: stage.output,
+    steps: (stage.steps || []).map(s => ({ title: s.title, detail: s.detail })),
+    prompt: stage.prompt || null,
+  })}`
+    : `No single stage was identified — this is about the workflow as a whole:
+${JSON.stringify({ title: workflow.title, stages: workflow.stages.map(s => ({ title: s.title, tool: s.tool?.name })) })}`;
+
+  return `You are ${BRAND}, helping someone execute a workflow you already designed for them. They're not
+browsing the catalog anymore — they're mid-build and stuck on, or curious about, one part of it.
+
+${stageBlock}${webBlock}
+
+RULES
+- Answer the actual question. If they asked "how do I open the file", give the concrete steps to do
+  that in the named tool — don't re-explain what the stage is for.
+- If the answer is inherently a sequence of 3+ steps (a how-to, a setup flow, a multi-part process),
+  include a Mermaid flowchart as its own fenced code block (\`\`\`mermaid ... \`\`\`) using
+  \`flowchart TD\` and short node labels, THEN write the prose walkthrough below it. Skip the diagram
+  for single-step or yes/no answers — it adds noise, not clarity, when there's nothing to sequence.
+- If you're not confident of a claim (a menu path, a button name, a URL) and web search results were
+  provided above, ground the answer in those instead of guessing — a specific citation beats a vague
+  gesture at "the settings menu". If no web results were provided and you're genuinely unsure, say so
+  plainly rather than inventing UI details that may not exist.
+- Link real resources when you know them (official docs, the tool's own homepage) as plain markdown
+  links. Never invent a URL you're not confident resolves.
+- If the stage's current playbook seems wrong for what they're describing, say so directly and end
+  with one short line telling them they can ask to have that step rebuilt.
+- Be direct and complete rather than compressed — this is a working reference for something they're
+  doing right now, not a teaser. Still: no filler, no restating the question back at them.`;
+}
+
+// ─────────────────────────────────────────────────────────────
 // 4b. Suggested-tool extraction — turns a web search hit into an admin-review candidate
 // ─────────────────────────────────────────────────────────────
 export function suggestedToolExtractionSystem() {
@@ -337,6 +386,7 @@ export default {
   playbookSystem,
   playbookUser,
   answerSystem,
+  workflowStepAnswerSystem,
   suggestedToolExtractionSystem,
   suggestedToolExtractionUser,
   profileExtractionSystem,

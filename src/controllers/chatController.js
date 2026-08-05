@@ -197,7 +197,7 @@ async function persistTurn(userId, sessionId, payload, { isFirstTurn = false } =
 // POST /api/chat
 // ─────────────────────────────────────────────────────────────
 export const sendMessage = async (req, res) => {
-  const { message, sessionId = 'default', allowExternalTools, intakeAnswers } = req.body;
+  const { message, sessionId = 'default', allowExternalTools, intakeAnswers, stageId } = req.body;
   const userId = req.user._id;
 
   try {
@@ -219,6 +219,7 @@ export const sendMessage = async (req, res) => {
           planId: req.user.subscription?.plan,
           allowExternalTools: resolvedExternal,
           intakeAnswers,
+          stageId,
         });
       } catch (err) {
         // Failed work is free for the user but not for us — keep the spend visible.
@@ -268,7 +269,7 @@ export const sendMessage = async (req, res) => {
 // POST /api/chat/stream — Server-Sent Events
 // ─────────────────────────────────────────────────────────────
 export const streamMessage = async (req, res) => {
-  const { message, sessionId = 'default', allowExternalTools, intakeAnswers } = req.body;
+  const { message, sessionId = 'default', allowExternalTools, intakeAnswers, stageId } = req.body;
   const userId = req.user._id;
 
   res.writeHead(200, {
@@ -310,6 +311,7 @@ export const streamMessage = async (req, res) => {
           planId: req.user.subscription?.plan,
           allowExternalTools: resolvedExternal,
           intakeAnswers,
+          stageId,
           // Progress events carrying real workflow data go out as `partial` so a
           // status-label consumer can never mistake a payload for a message.
           onProgress: event => {
@@ -430,6 +432,59 @@ export const regenerateStage = async (req, res) => {
     }).catch(() => {});
 
     res.json({ success: true, data: { stageId: resolvedStageId, ...playbook } });
+  } catch (err) {
+    sendError(res, err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/chat/stage-highlight
+// ─────────────────────────────────────────────────────────────
+/**
+ * Pins a selected span to a stage so "what is X" doesn't just answer once
+ * and vanish — the span itself gets marked in the playbook (see
+ * StepDetailModal's `<HighlightedText>`), permanently, across reloads and
+ * re-opens, with the question that was asked about it kept alongside.
+ *
+ * Deliberately not routed through `handleMessage`/`patchWorkflow`: this is
+ * metadata about content that already exists, not a request to change the
+ * workflow, so it skips the LLM (and its credit charge) entirely — the same
+ * reasoning `updateLastWorkflow` documents for a stage-playbook rewrite that
+ * isn't a conversational turn either.
+ */
+export const saveStageHighlight = async (req, res) => {
+  const { sessionId = 'default', stageId, text, question } = req.body;
+
+  try {
+    const conversation = await loadConversation(req.user._id, sessionId);
+    const workflow = conversation.lastWorkflow;
+    const stage = workflow?.stages?.find(s => s.id === stageId);
+
+    if (!stage) {
+      return res.status(404).json({
+        success: false,
+        code: 'NO_STAGE',
+        message: 'That stage is no longer part of this workflow.',
+      });
+    }
+
+    const highlight = {
+      id: `hl_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      text: String(text).slice(0, 400),
+      question: String(question || '').slice(0, 500),
+      createdAt: new Date().toISOString(),
+    };
+
+    // Capped rather than unbounded — a stage someone keeps interrogating
+    // should still read as a playbook, not accrue an infinite margin of notes.
+    const highlights = [...(stage.highlights || []), highlight].slice(-40);
+
+    const updatedStages = workflow.stages.map(s =>
+      s.id === stageId ? { ...s, highlights } : s
+    );
+    await updateLastWorkflow(req.user._id, sessionId, { ...workflow, stages: updatedStages });
+
+    res.json({ success: true, data: { stageId, highlight } });
   } catch (err) {
     sendError(res, err);
   }

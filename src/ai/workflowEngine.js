@@ -732,6 +732,60 @@ async function answerGrounded({ message, routed, contextMessages, allowExternalT
   };
 }
 
+/**
+ * Best-effort match when the caller didn't pass an explicit `stageId` (no
+ * node was selected on the canvas) — the question likely names the stage's
+ * tool or title directly ("how do I open the Figma file", "the Notion step
+ * isn't right"). Falls back to null (whole-workflow question) rather than
+ * guessing wrong, since a mismatched stage is worse than no stage.
+ */
+function inferStage(workflow, message) {
+  const text = String(message || '').toLowerCase();
+  return (
+    workflow.stages.find(s => s.tool?.name && text.includes(s.tool.name.toLowerCase())) ||
+    workflow.stages.find(s => text.includes(String(s.title || '').toLowerCase())) ||
+    null
+  );
+}
+
+/**
+ * A question asked while a workflow is already on the canvas — "how do I
+ * open the Figma file", "this step's process is wrong", "explain step 3" —
+ * is a different job from general tool discovery: it needs the actual stage
+ * content in context, room to write a real explanation (not a 150-word
+ * catalog blurb), and it should reach for the web whenever the answer is a
+ * genuine how-to rather than only when the catalog came back thin.
+ */
+async function answerWorkflowStepQuestion({ message, workflow, stageId, contextMessages, allowExternalTools }) {
+  const stage = (stageId && workflow.stages.find(s => s.id === stageId)) || inferStage(workflow, message);
+
+  const shouldSearch = allowExternalTools && isWebSearchConfigured();
+  const searchQuery = stage ? `${stage.tool?.name || ''} ${message}`.trim() : message;
+  const webResults = shouldSearch ? await webSearch(searchQuery) : null;
+
+  const { content } = await complete({
+    task: 'answer',
+    role: 'planner',
+    temperature: 0.4,
+    maxTokens: 1100,
+    messages: [
+      { role: 'system', content: prompts.workflowStepAnswerSystem(workflow, stage, webResults) },
+      ...contextMessages.slice(-6),
+      { role: 'user', content: fence(message) },
+    ],
+  });
+
+  const finalMessage = checkOutput(content);
+
+  return {
+    message: finalMessage,
+    workflow: null,
+    intent: 'question',
+    stageId: stage?.id || null,
+    toolSlugs: [],
+  };
+}
+
 // ─────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────
@@ -754,6 +808,7 @@ export async function handleMessage({
   planId = null,
   allowExternalTools = false,
   intakeAnswers = null,
+  stageId = null,
   onProgress = noop,
 }) {
   const startedAt = Date.now();
@@ -954,6 +1009,16 @@ export async function handleMessage({
   const signals = retrievalSignals(profile);
 
   if (routed.intent === 'discover' || routed.intent === 'question') {
+    // A workflow already on the canvas turns "how do I open the Figma file"
+    // from a catalog lookup into a question about a specific stage — answer
+    // it with that stage's content in context instead of generic tool copy.
+    if (priorWorkflow) {
+      onProgress({ phase: 'searching', message: 'Looking into that step' });
+      return answerWorkflowStepQuestion({
+        message: sanitized, workflow: priorWorkflow, stageId, contextMessages,
+        allowExternalTools: resolvedExternalTools,
+      });
+    }
     onProgress({ phase: 'searching', message: `Searching ${catalog.tools.length} tools` });
     return answerGrounded({
       message: sanitized, routed, contextMessages,

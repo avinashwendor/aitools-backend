@@ -8,6 +8,7 @@ import {
   sendMessage,
   streamMessage,
   regenerateStage,
+  saveStageHighlight,
   getHistory,
   getSessions,
   clearHistory,
@@ -47,6 +48,12 @@ const messageValidation = [
     .isObject().withMessage('intakeAnswers must be an object')
     .custom(value => Object.keys(value).length <= 10)
     .withMessage('Too many intake answers'),
+  // The workflow stage a question is anchored to — set when the user asked
+  // about a specific node instead of typing a bare chat message.
+  body('stageId')
+    .optional({ nullable: true })
+    .isString().withMessage('stageId must be a string')
+    .isLength({ max: 80 }).withMessage('stageId is too long'),
 ];
 
 /**
@@ -89,6 +96,20 @@ router.post(
   [body('stageId').trim().notEmpty().withMessage('stageId is required')],
   validate,
   regenerateStage
+);
+
+// No AI call and nothing metered — this pins an already-generated span to
+// the stage, it doesn't ask the model for anything new.
+router.post(
+  '/stage-highlight',
+  [
+    body('stageId').trim().notEmpty().withMessage('stageId is required'),
+    body('text').trim().notEmpty().isLength({ max: 400 }).withMessage('text is required'),
+    body('question').optional().isString().isLength({ max: 500 }),
+    body('sessionId').optional().isString().isLength({ max: 120 }),
+  ],
+  validate,
+  saveStageHighlight
 );
 
 router.get('/history', getHistory);
