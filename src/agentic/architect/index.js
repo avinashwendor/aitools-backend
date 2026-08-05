@@ -384,7 +384,12 @@ async function buildInner({ build, workflow, user, controller, usage }) {
   const awaitingClarification = Boolean(
     state.awaitingClarification || outcome?.result?.awaitingClarification
   );
-  const succeeded = Boolean(outcome?.finished && !error && !canceled && !awaitingClarification);
+  // Only a successful `finish` (or ask_clarifying) hands work over. A prose-only
+  // exit (`finishReason: 'answered'`) used to count as succeeded and leave a
+  // half-built invalid graph marked done.
+  const succeeded = Boolean(
+    state.handedOver && outcome?.finished && !error && !canceled && !awaitingClarification
+  );
   const endCheck = validateGraph(state.graph, {
     mode: 'architect',
     requirements: [],
@@ -427,9 +432,13 @@ async function buildInner({ build, workflow, user, controller, usage }) {
       (awaitingClarification ? 'Need a few details before building.' : ''),
     error:
       error ||
-      (outcome && !outcome.finished && !awaitingClarification
-        ? 'The architect ran out of steps before it finished. Ask it to continue.'
-        : null),
+      (awaitingClarification
+        ? null
+        : !outcome?.finished
+          ? 'The architect ran out of steps before it finished. Ask it to continue.'
+          : !state.handedOver
+            ? 'The architect stopped without handing over a finished workflow. Ask it to continue.'
+            : null),
     canceled,
     awaitingClarification,
     clarifyingQuestions: state.clarifyingQuestions,
