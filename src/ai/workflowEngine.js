@@ -163,13 +163,29 @@ function buildDefaultIntakeQuestions(profile) {
   return stripKnownProfileQuestions(questions, profile).slice(0, MAX_INTAKE_QUESTIONS);
 }
 
+/** Standing profile facts the planner can treat as known without re-asking. */
+function profileKnownLines(profile) {
+  if (!profile) return [];
+  const lines = [];
+  if (profile.skillLevel) lines.push(`Skill level: ${profile.skillLevel}`);
+  if (profile.pricingPreference) lines.push(`Budget preference: ${profile.pricingPreference}`);
+  if (profile.industry) lines.push(`Industry: ${profile.industry}`);
+  if (profile.toolsAlreadyUsing?.length) {
+    lines.push(`Already uses: ${profile.toolsAlreadyUsing.slice(0, 6).join(', ')}`);
+  }
+  return lines.slice(0, 8);
+}
+
+function sanitizeBriefingLines(raw) {
+  return (Array.isArray(raw) ? raw : [])
+    .map(line => String(line || '').trim().slice(0, 160))
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
 /**
- * Ask the model what it still needs to know before planning this goal.
- *
- * Used when the router returned a workflow intent but no usable
- * clarifyingQuestions (e.g. it skipped them because budget/skill were already
- * on the profile). Questions are invented for *this* goal — not picked from a
- * static list.
+ * Ask the model: what do I already know, what do I still need, then invent
+ * questions only for the gaps. Not a static questionnaire.
  */
 async function inventIntakeQuestions({ goal, message, profile }) {
   const { data } = await completeJson({
@@ -184,40 +200,42 @@ async function inventIntakeQuestions({ goal, message, profile }) {
         content:
           `Goal: ${String(goal || message).slice(0, 500)}\n` +
           `User message: ${fence(String(message || '').slice(0, 800))}\n\n` +
-          'Invent 2-5 clarifyingQuestions whose answers would change the workflow you would plan. ' +
-          'Do not ask for facts already in the profile block.',
+          'List alreadyKnow and stillNeed, then invent clarifyingQuestions only for stillNeed. ' +
+          'If stillNeed is empty, return clarifyingQuestions: [].',
       },
     ],
     validate: v => {
-      if (!Array.isArray(v?.clarifyingQuestions) || v.clarifyingQuestions.length < 2) {
-        return '"clarifyingQuestions" must contain 2-5 questions specific to this goal.';
+      if (!v || typeof v !== 'object') return 'Response must be a JSON object.';
+      if (!Array.isArray(v.clarifyingQuestions)) {
+        return '"clarifyingQuestions" must be an array (empty if nothing left to ask).';
+      }
+      if (v.clarifyingQuestions.length > 0 && v.clarifyingQuestions.length < 2) {
+        return 'Ask at least 2 clarifyingQuestions, or return an empty array.';
       }
       return null;
     },
   });
 
-  return sanitizeClarifyingQuestions(data.clarifyingQuestions);
+  return {
+    questions: sanitizeClarifyingQuestions(data.clarifyingQuestions),
+    alreadyKnow: sanitizeBriefingLines(data.alreadyKnow),
+    stillNeed: sanitizeBriefingLines(data.stillNeed),
+  };
 }
 
 /**
- * Resolve intake for a new workflow: prefer the router's LLM questions, then a
- * dedicated invent pass, never a hardcoded goal questionnaire.
+ * Resolve intake for a new workflow.
  *
- * Domain exhaustion used to wipe questions entirely — that is why a returning
- * app-builders user skipped intake on a brand-new ecommerce ask. Exhaustion
- * only means "don't re-ask budget/skill"; goal-specific asks still run.
+ * Always runs an invent pass so the model explicitly separates already-known
+ * facts from still-needed decisions — even when the router already proposed
+ * questions. Returns `{ questions, alreadyKnow, stillNeed }`.
  */
 async function resolveIntakeQuestions({ routed, profile, message }) {
-  let questions = stripKnownProfileQuestions(
-    routed.clarifyingQuestions?.length
-      ? routed.clarifyingQuestions
-      : [],
+  const fromRouter = stripKnownProfileQuestions(
+    routed.clarifyingQuestions?.length ? routed.clarifyingQuestions : [],
     profile
   );
-
-  if (questions.length >= 2) {
-    return dedupeQuestions(questions);
-  }
+  const knownFromProfile = profileKnownLines(profile);
 
   try {
     const invented = await inventIntakeQuestions({
@@ -225,20 +243,72 @@ async function resolveIntakeQuestions({ routed, profile, message }) {
       message,
       profile,
     });
-    questions = stripKnownProfileQuestions(invented, profile);
-    if (questions.length >= 2) {
-      log.info('Invented goal-specific intake questions', {
-        count: questions.length,
-        ids: questions.map(q => q.id).join(','),
-      });
-      return dedupeQuestions(questions);
-    }
-  } catch (err) {
-    log.warn('Intake invent pass failed — using generic fallback', { error: err.message });
-  }
+    let questions = stripKnownProfileQuestions(invented.questions, profile);
 
-  return dedupeQuestions(buildDefaultIntakeQuestions(profile));
+    // Prefer invent (it reasoned about gaps). Fall back to router questions if
+    // invent returned nothing usable but the router had asks.
+    if (questions.length < 2 && fromRouter.length >= 2) {
+      questions = fromRouter;
+    }
+    if (!questions.length && !invented.stillNeed.length) {
+      // Model says nothing left to ask — that is valid; approval still required.
+      return {
+        questions: [],
+        alreadyKnow: invented.alreadyKnow.length ? invented.alreadyKnow : knownFromProfile,
+        stillNeed: [],
+      };
+    }
+    if (questions.length < 2) {
+      questions = dedupeQuestions(buildDefaultIntakeQuestions(profile));
+    }
+
+    log.info('Intake briefing ready', {
+      questions: questions.length,
+      alreadyKnow: (invented.alreadyKnow.length ? invented.alreadyKnow : knownFromProfile).length,
+      stillNeed: invented.stillNeed.length,
+    });
+
+    return {
+      questions: dedupeQuestions(questions),
+      alreadyKnow: invented.alreadyKnow.length ? invented.alreadyKnow : knownFromProfile,
+      stillNeed: invented.stillNeed.length
+        ? invented.stillNeed
+        : questions.map(q => q.question),
+    };
+  } catch (err) {
+    log.warn('Intake invent pass failed — using router/generic questions', { error: err.message });
+    const questions = dedupeQuestions(
+      fromRouter.length >= 2 ? fromRouter : buildDefaultIntakeQuestions(profile)
+    );
+    return {
+      questions,
+      alreadyKnow: knownFromProfile,
+      stillNeed: questions.map(q => q.question),
+    };
+  }
 }
+
+function formatApprovalMessage({ baseGoal, preferencesText, alreadyKnow, stillNeed }) {
+  const parts = [
+    `Thanks — here's what I'll plan for:\n\n**${baseGoal || 'Your project'}**`,
+  ];
+  if (alreadyKnow?.length) {
+    parts.push(`\n\n**Already know**\n${alreadyKnow.map(l => `- ${l}`).join('\n')}`);
+  }
+  if (preferencesText) {
+    parts.push(`\n\n**Your answers**\n${preferencesText}`);
+  }
+  if (stillNeed?.length && !preferencesText) {
+    parts.push(`\n\n**Still open**\n${stillNeed.map(l => `- ${l}`).join('\n')}`);
+  }
+  parts.push(
+    '\n\nIf you want anything else factored in — constraints, tools you already use, ' +
+    'or a detail I missed — add it below, then approve and I\'ll design the full build plan.'
+  );
+  return parts.join('');
+}
+
+const EXTRA_NOTES_RE = /Additional notes from the user:\s*([\s\S]+)/i;
 
 async function route({ message, contextMessages, categories, hasPriorWorkflow, profile, requireQuestions = false }) {
   const { data } = await completeJson({
@@ -1328,16 +1398,15 @@ export async function handleMessage({
     const enrichedGoal =
       `${clarifyState.baseGoal || sanitized}\n\nUser preferences:\n${preferencesText}`;
 
-    // The answers arrived as structured choices, so read them rather than
-    // sending the prose back through an LLM to re-derive what the user
-    // already picked from a dropdown. Awaited, not fire-and-forget: the
-    // approval turn immediately below reloads this profile.
     const { facts, overrides } = factsFromIntakeAnswers(resolvedAnswers);
     if (userId && Object.keys(facts).length) {
       await updateProfileFacts(userId, facts).catch(err =>
         log.warn('Failed to persist intake facts', { error: err.message })
       );
     }
+
+    const alreadyKnow = clarifyState.alreadyKnow || [];
+    const stillNeed = clarifyState.stillNeed || [];
 
     if (userId) {
       await saveClarificationState(userId, sessionId, {
@@ -1346,24 +1415,25 @@ export async function handleMessage({
         answersText: preferencesText,
         enrichedGoal,
         baseGoal: clarifyState.baseGoal || sanitized,
-        // Carried forward so the approval turn honours the answers even if the
-        // profile write above failed.
         intakeOverrides: overrides,
-        // Kept so a page reload can still show what was captured, rather than
-        // only the turn that submitted it.
         answers: resolvedAnswers,
+        alreadyKnow,
+        stillNeed,
       });
     }
     return {
-      message:
-        `Thanks — here's what I'll plan for:\n\n**${clarifyState.baseGoal || 'Your project'}**\n\n` +
-        `${preferencesText}\n\n` +
-        `When you're ready, hit **Generate workflow** and I'll design the full build plan.`,
+      message: formatApprovalMessage({
+        baseGoal: clarifyState.baseGoal || 'Your project',
+        preferencesText,
+        alreadyKnow,
+        stillNeed: [],
+      }),
       workflow: null,
       intent: 'clarify',
       readyToApprove: true,
       clarifyingQuestions: null,
       capturedPreferences: Object.keys(resolvedAnswers).length ? resolvedAnswers : null,
+      intakeBriefing: { alreadyKnow, stillNeed: [] },
     };
   }
 
@@ -1371,6 +1441,11 @@ export async function handleMessage({
   let forcedOverrides = {};
   if (clarifyState?.phase === 'awaiting_approval' && APPROVAL_RE.test(sanitized)) {
     forcedGoal = clarifyState.enrichedGoal || clarifyState.baseGoal || sanitized;
+    const extraMatch = sanitized.match(EXTRA_NOTES_RE);
+    const extraNotes = extraMatch?.[1]?.trim();
+    if (extraNotes) {
+      forcedGoal = `${forcedGoal}\n\nAdditional notes from the user:\n${extraNotes.slice(0, 1500)}`;
+    }
     forcedOverrides = clarifyState.intakeOverrides || {};
     if (userId) await clearClarificationState(userId, sessionId);
   }
@@ -1447,16 +1522,53 @@ export async function handleMessage({
     const intakeDomain = routed.domains[0] || GENERAL_DOMAIN;
     const exhausted = hasExhaustedIntake(profile, intakeDomain, MAX_CLARIFYING_ASKS);
 
-    // Always resolve questions via the LLM (router, then invent pass). Domain
-    // exhaustion must not skip intake — it only affects whether we re-ask
-    // standing profile facts inside resolveIntakeQuestions.
-    const questions = await resolveIntakeQuestions({
+    const {
+      questions,
+      alreadyKnow,
+      stillNeed,
+    } = await resolveIntakeQuestions({
       routed,
       profile,
       message: sanitized,
     });
 
-    if (questions.length && clarifyState?.phase !== 'awaiting_approval') {
+    if (clarifyState?.phase === 'awaiting_approval') {
+      // Already waiting on Generate — don't restart intake.
+    } else if (!questions.length) {
+      // Model decided the message + profile cover the goal. Still require
+      // explicit human approval (and an optional "anything else" note).
+      const enrichedGoal = routed.goal;
+      if (userId) {
+        recordIntakeAsk(userId, intakeDomain).catch(() => {});
+        await saveClarificationState(userId, sessionId, {
+          phase: 'awaiting_approval',
+          questions: [],
+          answersText: '',
+          enrichedGoal,
+          baseGoal: routed.goal,
+          intakeOverrides: {},
+          answers: {},
+          alreadyKnow,
+          stillNeed: [],
+        }).catch(err =>
+          log.warn('Failed to persist clarification state', { error: err.message })
+        );
+      }
+      return {
+        message: formatApprovalMessage({
+          baseGoal: routed.goal,
+          preferencesText: '',
+          alreadyKnow,
+          stillNeed: [],
+        }),
+        workflow: null,
+        intent: 'clarify',
+        readyToApprove: true,
+        clarifyingQuestions: null,
+        capturedPreferences: null,
+        intakeBriefing: { alreadyKnow, stillNeed: [] },
+      };
+    } else {
       if (exhausted) {
         log.info('Domain intake previously exhausted — still asking LLM questions for this goal', {
           domain: intakeDomain,
@@ -1466,9 +1578,6 @@ export async function handleMessage({
       }
       if (userId) {
         recordIntakeAsk(userId, intakeDomain).catch(() => {});
-        // Awaited: the approval turn reloads this state. Fire-and-forget let a
-        // fast second message race past an empty clarificationState and skip
-        // intake entirely.
         await saveClarificationState(userId, sessionId, {
           phase: 'asking',
           questions,
@@ -1476,15 +1585,25 @@ export async function handleMessage({
           enrichedGoal: '',
           baseGoal: routed.goal,
           intakeOverrides: {},
+          alreadyKnow,
+          stillNeed,
         }).catch(err =>
           log.warn('Failed to persist clarification state', { error: err.message })
         );
       }
+
+      const knownBlock = alreadyKnow.length
+        ? `\n\n**Already know**\n${alreadyKnow.map(l => `- ${l}`).join('\n')}\n\n`
+        : '\n\n';
+
       return {
-        message: 'Before I design your workflow, a few quick questions:',
+        message:
+          `Before I design your workflow, I'll confirm what I know and ask only what's still open.${knownBlock}` +
+          `A few quick questions:`,
         workflow: null,
         intent: 'clarify',
         clarifyingQuestions: questions,
+        intakeBriefing: { alreadyKnow, stillNeed },
       };
     }
   }

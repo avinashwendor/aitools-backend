@@ -343,7 +343,15 @@ export async function clearClarificationState(userId, sessionId) {
     {
       $set: {
         clarificationState: {
-          phase: null, questions: [], answersText: '', enrichedGoal: '', baseGoal: '', intakeOverrides: {},
+          phase: null,
+          questions: [],
+          answersText: '',
+          enrichedGoal: '',
+          baseGoal: '',
+          intakeOverrides: {},
+          answers: {},
+          alreadyKnow: [],
+          stillNeed: [],
         },
       },
     }

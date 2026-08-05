@@ -90,6 +90,9 @@ const conversationSchema = new mongoose.Schema(
       intakeOverrides: { type: mongoose.Schema.Types.Mixed, default: {} },
       /** Raw `{questionId: answer}` map, so a reload can still show it back. */
       answers: { type: mongoose.Schema.Types.Mixed, default: {} },
+      /** LLM briefing: what we already know vs still need before planning. */
+      alreadyKnow: { type: [String], default: [] },
+      stillNeed: { type: [String], default: [] },
     },
 
     turnCount: { type: Number, default: 0 },

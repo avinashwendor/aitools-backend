@@ -95,24 +95,29 @@ Respond with exactly:
 }
 
 /**
- * Second-pass intake when the router returned a workflow intent but no usable
- * goal-specific questions (common once budget/skill are already on the profile).
+ * Second-pass intake: think known-vs-needed, then ask only for the gaps.
  * The model invents the asks — nothing here is a fixed questionnaire.
  */
 export function intakeQuestionsSystem(profile = null) {
-  return `You write clarifying intake questions for ${BRAND} before a workflow is planned.
+  return `You prepare intake for ${BRAND} before a workflow is planned.
 
-Given a user's goal, return 2-5 short questions whose answers would change which tools
-and stages get planned. Prefer multiple-choice. At least half must be specific to THIS
-goal (not generic budget/skill/timeline filler). Skip anything already known from the
-profile block. Never ask filler you do not need.
+Think in two columns first:
+1. alreadyKnow — facts from the profile block and/or the user's message that you can
+   treat as settled for this plan (short phrases, e.g. "Budget: free", "Wants no-code").
+2. stillNeed — decisions that would change tools or stages and are NOT yet answered
+   (short phrases, e.g. "Which mobile platforms", "What they sell").
 
-Each item:
+Then write clarifyingQuestions ONLY for stillNeed — 2-5 short asks. Prefer
+multiple-choice. At least half must be specific to THIS goal. Skip anything in
+alreadyKnow. If stillNeed is empty because the message + profile cover the goal,
+return clarifyingQuestions: [].
+
+Each question:
 {"id":"short_snake_id","question":"...","type":"choice","options":["...","..."]}
 or {"id":"...","question":"...","type":"text"}
 
 Respond with JSON only:
-{"clarifyingQuestions":[...]}${profileBlock(profile)}`;
+{"alreadyKnow":["..."],"stillNeed":["..."],"clarifyingQuestions":[...]}${profileBlock(profile)}`;
 }
 
 // ─────────────────────────────────────────────────────────────

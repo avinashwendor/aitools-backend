@@ -256,6 +256,7 @@ export const sendMessage = async (req, res) => {
         clarifyingQuestions: result.clarifyingQuestions || null,
         readyToApprove: result.readyToApprove || false,
         capturedPreferences: result.capturedPreferences || null,
+        intakeBriefing: result.intakeBriefing || null,
         workflowDiff: result.workflowDiff || null,
         sessionId,
         // Lets the UI update the credit pill without a second round trip.
@@ -343,6 +344,7 @@ export const streamMessage = async (req, res) => {
         clarifyingQuestions: result.clarifyingQuestions || null,
         readyToApprove: result.readyToApprove || false,
         capturedPreferences: result.capturedPreferences || null,
+        intakeBriefing: result.intakeBriefing || null,
         workflowDiff: result.workflowDiff || null,
         sessionId,
         billing,
@@ -519,6 +521,13 @@ export const getHistory = async (req, res) => {
         readyToApprove: clarify?.phase === 'awaiting_approval',
         capturedPreferences:
           clarify?.phase === 'awaiting_approval' ? clarify.answers || null : null,
+        intakeBriefing:
+          clarify?.phase === 'asking' || clarify?.phase === 'awaiting_approval'
+            ? {
+                alreadyKnow: clarify.alreadyKnow || [],
+                stillNeed: clarify.stillNeed || [],
+              }
+            : null,
       },
     });
   } catch (err) {
