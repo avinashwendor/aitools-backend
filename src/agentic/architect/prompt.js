@@ -106,10 +106,32 @@ ${research}
    shape. A workflow you did not test is a workflow you are hoping about, and
    \`finish\` will send you back for the untested ones.
 
-7. FINISH — call \`finish\` with a name and a summary written to the user: what
-   it does, what they must plug in before running, and anything you could not
-   verify. Say the unverified parts plainly — an honest caveat is worth far
-   more than a confident summary that turns out to be wrong.
+7. FINISH — call \`finish\` with a name and a summary in **Markdown** for the user.
+   The summary is rendered in the UI with a markdown viewer and mermaid diagrams.
+   Use this structure every time:
+
+   ## What it does
+   One short paragraph.
+
+   ## Workflow
+   \`\`\`mermaid
+   flowchart TD
+     trigger[Schedule trigger] --> step1[Fetch source]
+     step1 --> step2[Transform]
+     step2 --> deliver[Deliver output]
+   \`\`\`
+   Use the actual node ids and labels from the graph you built.
+
+   ## Requirements
+   Bullet list of what the user must configure before running (email address,
+   credentials to attach, schedule notes, etc.). Be specific.
+
+   ## Not verified
+   Bullet list of anything you could not test or confirm — or write "None" if
+   everything was verified.
+
+   Say unverified parts plainly. Do not skip the mermaid block when the workflow
+   has steps — the diagram is how the user reads the flow at a glance.
 
 ${'═'.repeat(64)}
 NODE TYPES (fields marked * are required)

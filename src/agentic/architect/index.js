@@ -953,8 +953,9 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
       summary: {
         type: 'string',
         description:
-          'Written to the user: what it does, what they must plug in before running, and ' +
-          'anything you could not verify. A few short paragraphs at most.',
+          'Markdown for the user. Required sections: ## What it does, ## Workflow ' +
+          '(with a ```mermaid flowchart TD``` block showing the real nodes), ' +
+          '## Requirements (bullets), ## Not verified (bullets or "None").',
       },
     },
     required: ['summary'],
