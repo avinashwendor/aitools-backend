@@ -317,13 +317,12 @@ const config = {
      * Model calls one architect session may make.
      *
      * This is the budget for the whole build: planning, searching, reading
-     * documentation, writing the graph and testing steps. Twenty is roughly
-     * three doc pages plus a six-node workflow with two test runs, which covers
-     * the large majority of real requests. Raising it does not make builds
-     * better so much as longer — the failure mode past this point is a model
-     * that has already succeeded and is polishing.
+     * documentation, writing the graph and testing steps. Thirty-six covers a
+     * typical build: one plan, two doc reads, a six-node graph with two test
+     * runs, and finish. The failure mode below this is planning forever without
+     * ever calling edit_graph — which costs the user credits and delivers nothing.
      */
-    architectMaxSteps: num(process.env.AGENT_ARCHITECT_MAX_STEPS, 20),
+    architectMaxSteps: num(process.env.AGENT_ARCHITECT_MAX_STEPS, 36),
 
     /** Architect sessions one user may have running at once. */
     architectConcurrency: num(process.env.AGENT_ARCHITECT_CONCURRENCY, 2),

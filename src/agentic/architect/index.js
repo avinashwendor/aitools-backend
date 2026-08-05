@@ -149,6 +149,12 @@ async function buildInner({ build, workflow, user, controller, usage }) {
     testScope: { trigger: {} },
     /** Node ids that were executed and worked — the build's evidence. */
     tested: [],
+    /** Set after the first successful plan call — further plan calls are refused. */
+    planRecorded: false,
+    /** Set after the first edit_graph call. */
+    graphEdited: false,
+    /** find_api_docs + search_web + read_url calls before the first edit_graph. */
+    researchBeforeBuild: 0,
     /**
      * How many times `finish` has been refused.
      *
@@ -243,6 +249,18 @@ async function buildInner({ build, workflow, user, controller, usage }) {
         if (event.type === 'thinking' && event.text?.trim()) {
           await emit({ type: 'thought', detail: event.text });
         }
+      },
+      budgetNudge: ({ remaining }) => {
+        const actions = state.graph.nodes.filter(node => !String(node.type).startsWith('trigger.'));
+        if (actions.length === 0) {
+          return (
+            `[Budget: ${remaining} model call${remaining === 1 ? '' : 's'} left.] ` +
+            `The graph still has no action steps — only planning and research do not count as ` +
+            `building. Call edit_graph NOW: add trigger.schedule (or the right trigger), fetch, ` +
+            `summarise, and deliver. Do not call plan or read more docs.`
+          );
+        }
+        return null;
       },
     });
   } catch (err) {
@@ -418,6 +436,22 @@ function untestedRequests(state) {
     .map(node => node.id);
 }
 
+function actionNodeCount(graph) {
+  return (graph?.nodes || []).filter(node => !String(node.type).startsWith('trigger.')).length;
+}
+
+/** Refuse open-ended research once the architect should be building instead. */
+function assertMayResearch(state) {
+  if (state.graphEdited) return;
+  if (state.researchBeforeBuild >= 3) {
+    throw new Error(
+      'You have already researched enough for one session. Call edit_graph now — add the ' +
+      'trigger and the first real steps. You can test_step after the graph exists.'
+    );
+  }
+  state.researchBeforeBuild += 1;
+}
+
 function buildTools({ state, emit, flushGraph, user, signal, searchable, goal }) {
   const tools = {};
 
@@ -441,6 +475,13 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     },
     required: ['steps'],
     run: async ({ steps }) => {
+      if (state.planRecorded) {
+        throw new Error(
+          'The plan is already recorded. Do not call plan again — call edit_graph to add nodes ' +
+          'and connect them, then test_step and finish.'
+        );
+      }
+      state.planRecorded = true;
       state.plan = (steps || []).slice(0, 12).map(step => ({
         title: safeMessage(step.title, 200),
         detail: safeMessage(step.detail, 1000),
@@ -480,6 +521,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
       },
       required: ['service'],
       run: async ({ service }) => {
+        assertMayResearch(state);
         const found = await searchDocs(String(service), { maxPages: 2 });
         if (!found) {
           throw new Error('Documentation search is unavailable right now — try search_web and read_url.');
@@ -517,6 +559,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
       },
       required: ['query'],
       run: async ({ query }) => {
+        assertMayResearch(state);
         const results = await webSearch(String(query), { maxResults: 6 });
         if (!results) throw new Error('Web search is unavailable right now — build from what you know and say so.');
         await emit({
@@ -541,6 +584,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     },
     required: ['url'],
     run: async ({ url, why }) => {
+      assertMayResearch(state);
       // `allowRender` on: a build reads a given page once, so a rendered retry
       // costs one credit to turn an empty app shell into the reference the
       // whole step was for. Workflow nodes, which fetch on every run, don't
@@ -720,6 +764,7 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     },
     required: ['operations'],
     run: async ({ operations }) => {
+      state.graphEdited = true;
       const result = applyOperations(state.graph, operations || []);
       state.graph = result.graph;
       if (result.name) state.name = result.name;
@@ -884,6 +929,13 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
     required: ['summary'],
     terminal: true,
     run: async ({ name, summary }) => {
+      if (actionNodeCount(state.graph) === 0) {
+        throw new Error(
+          'The graph has no action steps yet — only a trigger (or nothing) is not a workflow. ' +
+          'Call edit_graph to add fetch, summarise, and deliver steps, then call finish again.'
+        );
+      }
+
       /*
        * The gate. `finish` is the only way out of the loop, so checking here is
        * the one place a broken graph cannot get past.

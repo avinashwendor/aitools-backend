@@ -95,6 +95,15 @@ const TOOL_TIMEOUT_MS = 90_000;
  */
 const LANDING_WARNING_AT = 2;
 
+function defaultLandingNudge(remaining, terminalTool) {
+  return (
+    `[Budget: ${remaining} model call${remaining === 1 ? '' : 's'} left in this session.] ` +
+    `Stop starting new work. Finish what you have and call \`${terminalTool}\` now — ` +
+    `state plainly in the summary anything you could not verify or complete. ` +
+    `An honest partial result is useful; being cut off mid-step is not.`
+  );
+}
+
 /** Rough token count. Four characters per token is close enough to decide with. */
 export function estimateTokens(messages) {
   let chars = 0;
@@ -287,6 +296,8 @@ async function summarizeHistory({ transcript, task, signal, onEvent }) {
  * @param {(event:object)=>void} [opts.onEvent]
  * @param {AbortSignal} [opts.signal]
  * @param {object} [opts.context]              passed to every tool handler
+ * @param {({remaining:number, steps:number, maxSteps:number})=>string|null} [opts.budgetNudge]
+ *   replaces the default landing warning when non-null
  * @returns {Promise<{finished, finishReason, result, text, steps, transcript, toolCalls, usage}>}
  */
 export async function runAgentLoop({
@@ -303,6 +314,7 @@ export async function runAgentLoop({
   onEvent = () => {},
   signal,
   context = {},
+  budgetNudge = null,
 }) {
   const wireTools = toWireTools(tools);
   const terminalTool = Object.entries(tools).find(([, tool]) => tool.terminal)?.[0] || null;
@@ -362,15 +374,15 @@ export async function runAgentLoop({
      */
     if (terminalTool && !nudged.landing && maxSteps - steps <= LANDING_WARNING_AT) {
       nudged.landing = true;
+      const remaining = maxSteps - steps + 1;
+      const custom = budgetNudge?.({ remaining, steps, maxSteps });
       transcript.push({
         role: 'user',
         content:
-          `[Budget: ${maxSteps - steps + 1} model call${maxSteps - steps === 0 ? '' : 's'} left in this session.] ` +
-          `Stop starting new work. Finish what you have and call \`${terminalTool}\` now — ` +
-          `state plainly in the summary anything you could not verify or complete. ` +
-          `An honest partial result is useful; being cut off mid-step is not.`,
+          custom ??
+          defaultLandingNudge(remaining, terminalTool),
       });
-      onEvent({ type: 'budget_warning', remaining: maxSteps - steps + 1 });
+      onEvent({ type: 'budget_warning', remaining });
     }
 
     let response;

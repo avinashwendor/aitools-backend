@@ -127,7 +127,10 @@ export const NODE_REGISTRY = {
       ),
       T.text('atHour', 'At hour (UTC)', {
         placeholder: '9',
-        help: 'Only used for daily and weekly schedules.',
+        help:
+          'Used for daily and weekly schedules. For weekday-only runs, set every to day and ' +
+          'atHour to 8, then add a core.code step after the trigger that returns early on ' +
+          'Saturday/Sunday (getUTCDay() 0 or 6).',
       }),
     ],
     outputs: [{ path: 'trigger.firedAt', label: 'Fired at' }],
@@ -585,7 +588,11 @@ export const NODE_REGISTRY = {
     sideEffects: true,
     handles: { in: true, out: OUT },
     fields: [
-      T.text('to', 'To', { required: true, placeholder: 'you@example.com' }),
+      T.text('to', 'To', {
+        required: true,
+        placeholder: 'you@example.com',
+        help: 'Sent through the server mail integration — no API key field on this node.',
+      }),
       T.text('subject', 'Subject', { required: true, placeholder: 'Your daily digest' }),
       T.textarea('body', 'Body', { required: true, placeholder: '{{ llm_1.text }}' }),
     ],
