@@ -20,6 +20,7 @@
  * workflows is one indexed range query a minute, not a thousand live timers.
  */
 
+import { randomBytes } from 'crypto';
 import { Queue, Worker } from 'bullmq';
 import config from '../config/index.js';
 import { AgentRun, AgentBuild, AgentWorkflow, User } from '../models/index.js';
@@ -38,6 +39,14 @@ const SWEEP_QUEUE = 'agentic-schedule';
 /** BullMQ rejects custom job ids that contain `:`. Keep a stable, deduping prefix. */
 function jobId(kind, id) {
   return `${kind}-${String(id)}`;
+}
+
+/**
+ * Builds are continued on the same AgentBuild id. A fixed jobId makes BullMQ
+ * ignore the second enqueue while a completed intake job is still retained.
+ */
+function uniqueBuildJobId(buildId) {
+  return jobId('build', `${buildId}-${Date.now()}-${randomBytes(3).toString('hex')}`);
 }
 
 let runQueue = null;
@@ -154,10 +163,13 @@ export async function enqueueBuild({ buildId, userId }) {
       attempts: 1,
       removeOnComplete: 50,
       removeOnFail: 100,
-      jobId: jobId('build', buildId),
+      // Unique per enqueue — continues reuse the same buildId and must not
+      // collide with the completed intake job still sitting in Redis.
+      jobId: uniqueBuildJobId(buildId),
     }
   );
 
+  log.info('Architect build enqueued', { buildId: String(buildId) });
   return { queued: true, inline: false };
 }
 

@@ -652,14 +652,20 @@ function buildTools({
       },
       questions: {
         type: 'array',
-        description: '3–5 questions. Prefer choice with concrete options; text for emails/URLs.',
+        description:
+          '3–5 questions. Prefer choice with concrete options as plain strings ' +
+          '(e.g. ["Hacker News","Reddit","Custom RSS URL"]), never objects. Use text for emails/URLs.',
         items: {
           type: 'object',
           properties: {
             id: { type: 'string', description: 'Stable id: delivery, source, topic, schedule, budget…' },
             question: { type: 'string' },
             type: { type: 'string', enum: ['choice', 'text'] },
-            options: { type: 'array', items: { type: 'string' } },
+            options: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Plain string labels only — not {label,value} objects.',
+            },
           },
           required: ['id', 'question'],
         },

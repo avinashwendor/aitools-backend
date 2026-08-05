@@ -37,6 +37,18 @@ export function goalNeedsClarification(goal) {
   return !(hasRecipient && hasTopic);
 }
 
+/** Coerce model-authored option entries into plain UI labels. */
+function optionLabel(value) {
+  if (value == null) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value).trim();
+  }
+  if (typeof value === 'object') {
+    return String(value.label || value.value || value.text || value.name || value.id || '').trim();
+  }
+  return String(value).trim();
+}
+
 /** Normalise model-authored questions into the shape ClarifyingQuestions expects. */
 export function normalizeClarifyingQuestions(raw) {
   const list = Array.isArray(raw) ? raw : [];
@@ -54,16 +66,18 @@ export function normalizeClarifyingQuestions(raw) {
       .slice(0, 40) || `q${i + 1}`;
 
     const options = Array.isArray(item.options)
-      ? item.options.map(o => String(o).trim().slice(0, 80)).filter(Boolean).slice(0, 8)
+      ? [...new Set(item.options.map(optionLabel).filter(Boolean))].slice(0, 8)
       : [];
 
-    const type = item.type === 'text' || options.length === 0 ? 'text' : 'choice';
+    // Objects that stringified to "[object Object]" are useless — treat as text.
+    const usableOptions = options.filter(o => o !== '[object Object]');
+    const type = item.type === 'text' || usableOptions.length < 2 ? 'text' : 'choice';
 
     out.push({
       id,
       question,
       type,
-      ...(type === 'choice' ? { options } : {}),
+      ...(type === 'choice' ? { options: usableOptions } : {}),
     });
   }
 
