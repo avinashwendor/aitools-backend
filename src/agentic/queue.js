@@ -35,6 +35,11 @@ const RUN_QUEUE = 'agentic-runs';
 const BUILD_QUEUE = 'agentic-builds';
 const SWEEP_QUEUE = 'agentic-schedule';
 
+/** BullMQ rejects custom job ids that contain `:`. Keep a stable, deduping prefix. */
+function jobId(kind, id) {
+  return `${kind}-${String(id)}`;
+}
+
 let runQueue = null;
 let runWorker = null;
 let buildQueue = null;
@@ -81,7 +86,7 @@ export async function enqueueRun({ runId, userId }) {
       attempts: 1,
       removeOnComplete: 100,
       removeOnFail: 200,
-      jobId: `run:${runId}`,
+      jobId: jobId('run', runId),
     }
   );
 
@@ -149,7 +154,7 @@ export async function enqueueBuild({ buildId, userId }) {
       attempts: 1,
       removeOnComplete: 50,
       removeOnFail: 100,
-      jobId: `build:${buildId}`,
+      jobId: jobId('build', buildId),
     }
   );
 
