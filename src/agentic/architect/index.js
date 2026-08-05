@@ -394,14 +394,14 @@ async function buildInner({ build, workflow, user, controller, usage }) {
     mode: 'architect',
     requirements: [],
   });
-  // Keep a valid partial graph (continue can finish it). Roll back only when the
-  // session ended with structural damage — multi-trigger, orphans, etc.
-  // Intake-only sessions must not leave half-built guesses on the canvas.
+  // Keep any graph that gained action nodes — continue can fix validation.
+  // Rolling back on step-budget / prose-exit was wiping real progress (HN fetch
+  // chains) and stranding the user on a blank manual trigger.
   const keepGraph =
     !awaitingClarification &&
     (succeeded ||
       state.handedOver ||
-      (endCheck.errors.length === 0 && actionNodeCount(state.graph) > 0));
+      (state.graphEdited && actionNodeCount(state.graph) > 0));
 
   if (keepGraph) {
     workflow.blueprint = {
@@ -413,7 +413,8 @@ async function buildInner({ build, workflow, user, controller, usage }) {
     };
     if (!workflow.composedFrom) workflow.composedFrom = build.goal.slice(0, 2000);
     await flushGraph().catch(err => log.warn('Final graph flush failed', { error: err.message }));
-  } else if (state.graphEdited) {
+  } else if (state.graphEdited && !awaitingClarification) {
+    // Only roll back structural disasters with zero usable actions.
     await restoreSessionStart().catch(err =>
       log.warn('Could not restore pre-build graph', { error: err.message })
     );
