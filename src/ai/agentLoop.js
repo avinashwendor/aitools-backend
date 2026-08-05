@@ -97,10 +97,9 @@ const LANDING_WARNING_AT = 2;
 
 function defaultLandingNudge(remaining, terminalTool) {
   return (
-    `[Budget: ${remaining} model call${remaining === 1 ? '' : 's'} left in this session.] ` +
-    `Stop starting new work. Finish what you have and call \`${terminalTool}\` now — ` +
-    `state plainly in the summary anything you could not verify or complete. ` +
-    `An honest partial result is useful; being cut off mid-step is not.`
+    `(Architect runtime — not a user message.) ${remaining} model call` +
+    `${remaining === 1 ? '' : 's'} left. Call \`${terminalTool}\` on this turn with what you have. ` +
+    `State anything unverified in the summary. Do not research further.`
   );
 }
 
@@ -442,8 +441,8 @@ export async function runAgentLoop({
         transcript.push({
           role: 'user',
           content:
-            `You answered without calling \`${terminalTool}\`, so nothing was handed over. ` +
-            `Make that call now with what you just wrote. If you cannot, say which step is blocking you.`,
+            `(Architect runtime — not a user message.) You replied in prose without calling ` +
+            `\`${terminalTool}\`, so nothing was saved. Call \`${terminalTool}\` now with what you have.`,
         });
         onEvent({ type: 'nudge', tool: terminalTool });
         continue;

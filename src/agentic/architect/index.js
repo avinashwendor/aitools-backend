@@ -351,26 +351,25 @@ async function buildInner({ build, workflow, user, controller, usage }) {
       budgetNudge: ({ remaining }) => {
         if (needsClarification && !state.awaitingClarification) {
           return (
-            `[Budget: ${remaining} model call${remaining === 1 ? '' : 's'} left.] ` +
-            `Call ask_clarifying NOW with 3–5 questions (delivery, source, topic, schedule, ` +
-            `paid vs free APIs). Do not call plan, research tools, or edit_graph.`
+            `(Architect runtime — not a user message.) ${remaining} call` +
+            `${remaining === 1 ? '' : 's'} left. Call ask_clarifying with 3–5 questions ` +
+            `(delivery, source, topic, schedule, paid vs free). Do not plan or edit_graph yet.`
           );
         }
         const actions = state.graph.nodes.filter(node => !String(node.type).startsWith('trigger.'));
         if (actions.length === 0) {
           return (
-            `[Budget: ${remaining} model call${remaining === 1 ? '' : 's'} left.] ` +
-            `The graph still has no action steps — only planning and research do not count as ` +
-            `building. Call edit_graph NOW: add trigger.schedule (or the right trigger), fetch, ` +
-            `summarise, and deliver. Do not call plan or read more docs.`
+            `(Architect runtime — not a user message.) ${remaining} call` +
+            `${remaining === 1 ? '' : 's'} left. The graph has no action nodes yet. ` +
+            `Call edit_graph now (schedule → fetch → summarise → email). Skip more research.`
           );
         }
         const check = validateGraph(state.graph, { mode: 'architect', requirements: [] });
         if (check.errors.length) {
           return (
-            `[Budget: ${remaining} model call${remaining === 1 ? '' : 's'} left.] ` +
-            `The graph is still invalid (${check.errors[0]}). Fix with edit_graph — deleteNode ` +
-            `orphans and extra triggers — then finish.`
+            `(Architect runtime — not a user message.) ${remaining} call` +
+            `${remaining === 1 ? '' : 's'} left. Graph invalid: ${check.errors[0]}. ` +
+            `Fix with edit_graph, then finish.`
           );
         }
         return null;
