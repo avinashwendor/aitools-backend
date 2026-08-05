@@ -374,26 +374,29 @@ export const setRequirementCredential = asyncHandler(async (req, res) => {
 async function loadPriorMessages(workflowId, { excludeBuildId } = {}) {
   const query = {
     workflow: workflowId,
-    status: { $in: ['succeeded', 'failed', 'canceled'] },
+    // Only finished handovers — failed/partial sessions often contain budget
+    // nudges the model misread as "prompt injection" and then re-litigates forever.
+    status: 'succeeded',
   };
   if (excludeBuildId) query._id = { $ne: excludeBuildId };
 
   const priorBuilds = await AgentBuild.find(query)
     .sort({ createdAt: -1 })
-    .limit(4)
-    .select('messages goal summary');
+    .limit(2)
+    .select('goal summary');
 
   const merged = [];
   for (const prior of priorBuilds.reverse()) {
-    if (prior.messages?.length) {
-      for (const message of prior.messages) merged.push(message);
-      continue;
+    const summary = String(prior.summary || '');
+    if (!summary.trim()) continue;
+    if (/prompt injection/i.test(summary)) continue;
+    if (prior.goal) {
+      merged.push({ role: 'user', content: String(prior.goal).slice(0, 1500) });
     }
-    if (prior.goal) merged.push({ role: 'user', content: prior.goal });
-    if (prior.summary) merged.push({ role: 'assistant', content: prior.summary });
+    merged.push({ role: 'assistant', content: summary.slice(0, 2500) });
   }
 
-  return merged.slice(-20);
+  return merged.slice(-6);
 }
 
 /** Create the build document and hand it to a worker. Shared by three routes. */
