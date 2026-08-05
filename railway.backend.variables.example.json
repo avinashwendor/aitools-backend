@@ -28,7 +28,7 @@
   "GOOGLE_CLIENT_ID": "",
   "GOOGLE_CLIENT_SECRET": "",
   "GOOGLE_REDIRECT_URI": "https://aitools-backend-production.up.railway.app/api/integrations/google/callback",
-  "RESEND_API_KEY": "",
-  "EMAIL_FROM": "AI Tools <noreply@yourdomain.com>",
+  "RESEND_API_KEY": "YOUR_RESEND_API_KEY",
+  "EMAIL_FROM": "AI Tools <beth.t@example.com>",
   "INTERNAL_API_SECRET": "REPLACE_WITH_openssl_rand_base64_48"
 }
