@@ -500,9 +500,8 @@ describe('personalization', () => {
     // A user carrying a profile must NOT be served the anonymous cache entry:
     // the profile is what tells the planner which tools to avoid, so reusing
     // another user's plan silently discards it.
-    // A returning user: already asked about this domain, so intake is spent
-    // and the request goes straight to planning — which is exactly the case
-    // where the missing cache dimension used to serve them someone else's plan.
+    // Seed past intake (approval turn) so this exercises planning + cache, not
+    // the clarifying-question gate — intake now always asks for a new goal.
     const profiledUser = newTestUser();
     await UserProfile.create({
       user: profiledUser,
@@ -511,10 +510,20 @@ describe('personalization', () => {
       intakeAsks: [{ domain: '_general', count: 3, lastAskedAt: new Date() }],
     });
 
-    queue(routerFor(goal), plan, playbook(), playbook());
+    const approved = emptyConversation();
+    approved.clarificationState = {
+      phase: 'awaiting_approval',
+      questions: [],
+      answersText: '',
+      baseGoal: goal,
+      enrichedGoal: goal,
+      intakeOverrides: { skill: 'advanced' },
+    };
+
+    queue(plan, playbook(), playbook());
     const second = await handleMessage({
-      message: goal,
-      conversation: emptyConversation(),
+      message: 'Yes, create the workflow with these preferences.',
+      conversation: approved,
       userId: profiledUser,
     });
 

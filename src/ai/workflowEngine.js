@@ -96,7 +96,28 @@ function sanitizeClarifyingQuestions(raw) {
     }));
 }
 
-/** Fallback intake when the router skips questions on a detailed first message. */
+/** Drop questions whose answers are already on the standing profile. */
+function stripKnownProfileQuestions(questions, profile) {
+  return (questions || []).filter(q => {
+    if (q.id === 'budget' && profile?.pricingPreference) return false;
+    if (q.id === 'skill' && profile?.skillLevel) return false;
+    return Boolean(q?.id && q?.question);
+  });
+}
+
+function dedupeQuestions(questions) {
+  const seen = new Set();
+  return questions.filter(q => {
+    if (!q?.id || seen.has(q.id)) return false;
+    seen.add(q.id);
+    return true;
+  }).slice(0, MAX_INTAKE_QUESTIONS);
+}
+
+/**
+ * Last-resort generic intake when every LLM pass failed.
+ * Not goal-aware — prefer `inventIntakeQuestions` whenever possible.
+ */
 function buildDefaultIntakeQuestions(profile) {
   const questions = [];
 
@@ -139,15 +160,84 @@ function buildDefaultIntakeQuestions(profile) {
     options: ['Speed', 'Quality', 'Lowest cost', 'Learning as I go'],
   });
 
-  if (questions.length < 4) {
-    questions.push({
-      id: 'constraints',
-      question: 'Any other constraints or preferences?',
-      type: 'text',
-    });
+  return stripKnownProfileQuestions(questions, profile).slice(0, MAX_INTAKE_QUESTIONS);
+}
+
+/**
+ * Ask the model what it still needs to know before planning this goal.
+ *
+ * Used when the router returned a workflow intent but no usable
+ * clarifyingQuestions (e.g. it skipped them because budget/skill were already
+ * on the profile). Questions are invented for *this* goal — not picked from a
+ * static list.
+ */
+async function inventIntakeQuestions({ goal, message, profile }) {
+  const { data } = await completeJson({
+    task: 'route:intake',
+    role: 'fast',
+    temperature: 0.2,
+    maxTokens: 2500,
+    messages: [
+      { role: 'system', content: prompts.intakeQuestionsSystem(profile) },
+      {
+        role: 'user',
+        content:
+          `Goal: ${String(goal || message).slice(0, 500)}\n` +
+          `User message: ${fence(String(message || '').slice(0, 800))}\n\n` +
+          'Invent 2-5 clarifyingQuestions whose answers would change the workflow you would plan. ' +
+          'Do not ask for facts already in the profile block.',
+      },
+    ],
+    validate: v => {
+      if (!Array.isArray(v?.clarifyingQuestions) || v.clarifyingQuestions.length < 2) {
+        return '"clarifyingQuestions" must contain 2-5 questions specific to this goal.';
+      }
+      return null;
+    },
+  });
+
+  return sanitizeClarifyingQuestions(data.clarifyingQuestions);
+}
+
+/**
+ * Resolve intake for a new workflow: prefer the router's LLM questions, then a
+ * dedicated invent pass, never a hardcoded goal questionnaire.
+ *
+ * Domain exhaustion used to wipe questions entirely — that is why a returning
+ * app-builders user skipped intake on a brand-new ecommerce ask. Exhaustion
+ * only means "don't re-ask budget/skill"; goal-specific asks still run.
+ */
+async function resolveIntakeQuestions({ routed, profile, message }) {
+  let questions = stripKnownProfileQuestions(
+    routed.clarifyingQuestions?.length
+      ? routed.clarifyingQuestions
+      : [],
+    profile
+  );
+
+  if (questions.length >= 2) {
+    return dedupeQuestions(questions);
   }
 
-  return questions.slice(0, MAX_INTAKE_QUESTIONS);
+  try {
+    const invented = await inventIntakeQuestions({
+      goal: routed.goal,
+      message,
+      profile,
+    });
+    questions = stripKnownProfileQuestions(invented, profile);
+    if (questions.length >= 2) {
+      log.info('Invented goal-specific intake questions', {
+        count: questions.length,
+        ids: questions.map(q => q.id).join(','),
+      });
+      return dedupeQuestions(questions);
+    }
+  } catch (err) {
+    log.warn('Intake invent pass failed — using generic fallback', { error: err.message });
+  }
+
+  return dedupeQuestions(buildDefaultIntakeQuestions(profile));
 }
 
 async function route({ message, contextMessages, categories, hasPriorWorkflow, profile, requireQuestions = false }) {
@@ -190,27 +280,20 @@ async function route({ message, contextMessages, categories, hasPriorWorkflow, p
       if (['workflow', 'refine'].includes(v.intent) && !v.goal) {
         return '"goal" is required for workflow and refine intents.';
       }
-      // A brand-new workflow ask needs real intake. Accepting an empty array
-      // here unconditionally is exactly what let every first-time ask fall
-      // through to the same generic questions regardless of the goal — force
-      // one self-repair pass unless the profile genuinely already covers it.
-      // Also lenient once intake is exhausted in some domain: at that point an
-      // empty array from the router is the *correct* answer for a returning
-      // user, not a compliance failure, and forcing a repair round-trip over
-      // it would only add latency for no benefit (the questions get thrown
-      // away by the exhaustion check downstream regardless).
-      const profileIsRich =
-        Boolean(profile?.skillLevel && profile?.pricingPreference) ||
-        (profile?.intakeAsks || []).some(a => hasExhaustedIntake(profile, a.domain, MAX_CLARIFYING_ASKS));
+      // A brand-new workflow ask needs real intake. Profile richness only means
+      // budget/skill can be omitted — not that the whole array may be empty.
+      // Goal-specific questions (platform, catalog, audience) must still run;
+      // otherwise a returning app-builders user never gets asked about a new
+      // ecommerce goal. The engine fills a fallback pack if the model still
+      // returns [], but forcing one repair pass keeps questions on-goal.
       if (
         requireQuestions &&
         v.intent === 'workflow' &&
         !hasPriorWorkflow &&
-        !profileIsRich &&
-        !(Array.isArray(v.clarifyingQuestions) && v.clarifyingQuestions.length)
+        !(Array.isArray(v.clarifyingQuestions) && v.clarifyingQuestions.length >= 2)
       ) {
-        return '"clarifyingQuestions" must contain 2-5 questions specific to this goal — it can only ' +
-          'be empty when the profile block already covers budget and skill.';
+        return '"clarifyingQuestions" must contain 2-5 questions specific to this goal ' +
+          '(budget/skill may be omitted when the profile already has them).';
       }
       return null;
     },
@@ -1364,23 +1447,38 @@ export async function handleMessage({
     const intakeDomain = routed.domains[0] || GENERAL_DOMAIN;
     const exhausted = hasExhaustedIntake(profile, intakeDomain, MAX_CLARIFYING_ASKS);
 
-    const questions = exhausted
-      ? []
-      : (routed.clarifyingQuestions?.length
-          ? routed.clarifyingQuestions
-          : buildDefaultIntakeQuestions(profile));
+    // Always resolve questions via the LLM (router, then invent pass). Domain
+    // exhaustion must not skip intake — it only affects whether we re-ask
+    // standing profile facts inside resolveIntakeQuestions.
+    const questions = await resolveIntakeQuestions({
+      routed,
+      profile,
+      message: sanitized,
+    });
 
     if (questions.length && clarifyState?.phase !== 'awaiting_approval') {
+      if (exhausted) {
+        log.info('Domain intake previously exhausted — still asking LLM questions for this goal', {
+          domain: intakeDomain,
+          count: questions.length,
+          ids: questions.map(q => q.id).join(','),
+        });
+      }
       if (userId) {
         recordIntakeAsk(userId, intakeDomain).catch(() => {});
-        saveClarificationState(userId, sessionId, {
+        // Awaited: the approval turn reloads this state. Fire-and-forget let a
+        // fast second message race past an empty clarificationState and skip
+        // intake entirely.
+        await saveClarificationState(userId, sessionId, {
           phase: 'asking',
           questions,
           answersText: '',
           enrichedGoal: '',
           baseGoal: routed.goal,
           intakeOverrides: {},
-        }).catch(() => {});
+        }).catch(err =>
+          log.warn('Failed to persist clarification state', { error: err.message })
+        );
       }
       return {
         message: 'Before I design your workflow, a few quick questions:',

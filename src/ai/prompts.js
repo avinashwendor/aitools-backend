@@ -72,25 +72,47 @@ FIELDS
                  use the user's known skill level if you have one, otherwise "beginner".
 - clarifyingQuestions: [] normally. For a NEW "workflow" intent (no prior workflow in this chat),
                  you MUST return 2-5 short intake questions before any plan is generated — unless the
-                 user's message already answers them OR the profile block below already covers budget
-                 and skill. THIS IS NOT OPTIONAL: an empty array here for a first-time workflow ask is
-                 only correct when the profile block truly already covers it — never return [] just to
-                 save output length.
+                 user's message already answers the decisions this goal needs. THIS IS NOT OPTIONAL.
+                 Knowing budget/skill from the profile block does NOT make an empty array correct —
+                 you still must ask about THIS goal (platform, audience, catalog, payments, output
+                 format, etc.). Never return [] just to save output length.
                  At least half of the questions must be SPECIFIC TO THIS GOAL, not generic — name the
-                 actual decision this goal requires (e.g. for a newsletter: sending platform and rough
-                 list size; for a SaaS MVP: whether they can code at all and who the first users are;
-                 for a video, the target platform and length). Fill any remaining slots with: output
-                 format, AI vs manual approach, free vs paid budget, tools they already use, platform/
-                 channel, skill level. Prefer multiple-choice. Each item:
+                 actual decision this goal requires (e.g. for ecommerce: what they sell and how they
+                 take payment; for a newsletter: sending platform and rough list size; for a SaaS MVP:
+                 whether they can code at all and who the first users are; for a video, the target
+                 platform and length). Prefer multiple-choice. Each item:
                  {"id":"budget","question":"...","type":"choice","options":["Free only","Freemium OK","Paid is fine"]}
                  or {"id":"...","question":"...","type":"text"}. Never more than 5, and never ask
-                 something you already know from the block below.
+                 something you already know from the block below (skip budget/skill when the profile
+                 already has them — replace those slots with more goal-specific asks).
                  Reuse these exact ids where a generic question fits, so the answers can be stored
                  without guessing: "budget", "skill", "timeline", "approach", "priority", "constraints".
-                 Goal-specific questions should get their own short id (e.g. "platform", "list_size").${profileBlock(profile)}
+                 Goal-specific questions should get their own short id (e.g. "platform", "catalog",
+                 "payments", "list_size").${profileBlock(profile)}
 
 Respond with exactly:
 {"intent":"...","goal":"...","title":"...","domains":[],"searchQueries":[],"pricing":"any","skill":"beginner","clarifyingQuestions":[]}`;
+}
+
+/**
+ * Second-pass intake when the router returned a workflow intent but no usable
+ * goal-specific questions (common once budget/skill are already on the profile).
+ * The model invents the asks — nothing here is a fixed questionnaire.
+ */
+export function intakeQuestionsSystem(profile = null) {
+  return `You write clarifying intake questions for ${BRAND} before a workflow is planned.
+
+Given a user's goal, return 2-5 short questions whose answers would change which tools
+and stages get planned. Prefer multiple-choice. At least half must be specific to THIS
+goal (not generic budget/skill/timeline filler). Skip anything already known from the
+profile block. Never ask filler you do not need.
+
+Each item:
+{"id":"short_snake_id","question":"...","type":"choice","options":["...","..."]}
+or {"id":"...","question":"...","type":"text"}
+
+Respond with JSON only:
+{"clarifyingQuestions":[...]}${profileBlock(profile)}`;
 }
 
 // ─────────────────────────────────────────────────────────────
