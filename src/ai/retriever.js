@@ -101,7 +101,12 @@ function rank(scoreMap) {
  * @param {number} [opts.limit]
  * @param {{preferred?:string[],rejected?:string[],owned?:string[]}} [opts.signals]
  *   the user's own history, from `personalization.retrievalSignals`
- * @returns {Promise<{candidates: object[], cards: object[], corpusSize: number}>}
+ * @returns {Promise<{candidates: object[], cards: object[], scores: number[],
+ *   dense: boolean, corpusSize: number}>}
+ *   `scores` is parallel to `candidates` — the fused, boosted score, only
+ *   meaningful *relative to the other scores in the same call*. `dense` says
+ *   whether the vector leg actually contributed, which is the difference
+ *   between "we understood the question" and "we matched some words".
  */
 export async function retrieve({
   queries = [],
@@ -111,7 +116,9 @@ export async function retrieve({
   signals = EMPTY_SIGNALS,
 } = {}) {
   const catalog = await getCatalog();
-  if (!catalog.tools.length) return { candidates: [], cards: [], corpusSize: 0 };
+  if (!catalog.tools.length) {
+    return { candidates: [], cards: [], scores: [], dense: false, corpusSize: 0 };
+  }
 
   const cleanQueries = queries.map(q => String(q || '').trim()).filter(Boolean);
   if (!cleanQueries.length) cleanQueries.push('');
@@ -123,12 +130,16 @@ export async function retrieve({
     .map(tokens => rank(bm25(tokens, catalog)));
 
   // ── 2b. Dense per sub-query, fused into the same RRF as BM25 ──
+  let dense = false;
   if (isVectorStoreConfigured()) {
     const slugIndex = new Map(catalog.tools.map((t, i) => [t.slug, i]));
     const denseResults = await Promise.all(cleanQueries.map(q => searchTools(q, limit)));
     for (const hits of denseResults) {
       const docIndices = hits.map(h => slugIndex.get(h.slug)).filter(i => i !== undefined);
-      if (docIndices.length) rankedLists.push(docIndices);
+      if (docIndices.length) {
+        rankedLists.push(docIndices);
+        dense = true;
+      }
     }
   }
 
@@ -251,6 +262,8 @@ export async function retrieve({
   return {
     candidates: selected.map(s => s.tool),
     cards: selected.map(s => toCandidateCard(s.tool)),
+    scores: selected.map(s => s.score),
+    dense,
     corpusSize: catalog.tools.length,
   };
 }

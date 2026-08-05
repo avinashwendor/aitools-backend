@@ -1,6 +1,7 @@
 import { Tool, User } from '../models/index.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import config from '../config/index.js';
+import { searchCatalogByMeaning } from '../ai/toolSearch.js';
 
 /**
  * Get all tools with filtering, sorting, and pagination
@@ -81,6 +82,51 @@ export const getTools = async (req, res, next) => {
           pages: Math.ceil(totalCount / limitNum),
           hasMore: pageNum * limitNum < totalCount,
         },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Natural-language search over the catalog.
+ * POST /api/tools/ai-search  { query, limit?, pricing?, category? }
+ *
+ * Deliberately not metered: it costs one embedding call and no LLM turn, and
+ * a discovery surface that asks visitors to spend credits before they've found
+ * anything isn't discovery. The rate limit on the route is what protects it.
+ */
+export const aiSearchTools = async (req, res, next) => {
+  try {
+    const { query, limit, pricing, category } = req.body || {};
+    const text = String(query || '').trim();
+
+    if (text.length < 3) {
+      throw new ApiError(400, 'Ask in a few more words — three characters is not a question.');
+    }
+    if (text.length > 400) {
+      throw new ApiError(400, 'Keep the question under 400 characters.');
+    }
+
+    const parsedLimit = Number.parseInt(limit, 10);
+    const resultLimit = Math.min(48, Math.max(1, Number.isNaN(parsedLimit) ? 24 : parsedLimit));
+
+    const answer = await searchCatalogByMeaning(text, {
+      limit: resultLimit,
+      pricing,
+      category,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        query: text,
+        tools: answer.results,
+        intent: answer.intent,
+        mode: answer.mode,
+        vectorSearchAvailable: answer.vectorSearchAvailable,
+        corpusSize: answer.corpusSize,
       },
     });
   } catch (error) {
