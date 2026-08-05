@@ -42,15 +42,20 @@ export const MODEL_PRICES_USD = {
   /*
    * Anthropic.
    *
+   * Keyed on OpenRouter's actual slugs (dot-separated versions, e.g.
+   * `claude-opus-4.8` — verify with `curl https://openrouter.ai/api/v1/models`
+   * before adding a new one; a hyphen where OpenRouter uses a dot silently
+   * misses the specific row below instead of erroring).
+   *
    * Ordered specific → general, and the generic `claude-opus-4` / `claude-
    * sonnet-4` entries below the versioned ones are the safety net: longest
-   * substring wins, so `claude-opus-4-8` matches its own row while an
-   * unreleased `claude-opus-4-9` still falls back to opus pricing rather than
+   * substring wins, so `claude-opus-4.8` matches its own row while an
+   * unreleased `claude-opus-4.9` still falls back to opus pricing rather than
    * to DEFAULT_MODEL_PRICE, which would under-report the most expensive model
    * in the chain by a factor of thirty.
    */
-  'claude-opus-4-8': { input: 15.0, output: 75.0 },
-  'claude-sonnet-6': { input: 3.0, output: 15.0 },
+  'claude-opus-4.8': { input: 15.0, output: 75.0 },
+  'claude-sonnet-4.6': { input: 3.0, output: 15.0 },
   'claude-haiku-4': { input: 1.0, output: 5.0 },
   'claude-sonnet-4': { input: 3.0, output: 15.0 },
   'claude-opus-4': { input: 15.0, output: 75.0 },
@@ -63,7 +68,7 @@ export const MODEL_PRICES_USD = {
 
   // Mistral / DeepSeek / Qwen commonly seen on OpenRouter
   'mixtral-8x7b': { input: 0.24, output: 0.24 },
-  'deepseek-pro-v4': { input: 0.6, output: 2.4 },
+  'deepseek-v4-pro': { input: 0.6, output: 2.4 },
   'deepseek-chat': { input: 0.27, output: 1.1 },
   'deepseek-r1': { input: 0.55, output: 2.19 },
   'qwen-2.5-72b': { input: 0.35, output: 0.4 },
