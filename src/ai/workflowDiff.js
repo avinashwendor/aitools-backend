@@ -25,33 +25,89 @@ export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
   const priorStages = prior.stages || [];
   const nextStages = next.stages || [];
   const adjustmentLower = String(adjustment).toLowerCase();
+  const norm = s => String(s || '').toLowerCase();
 
-  const priorBySlug = new Map(priorStages.map(s => [s.toolSlug, s]));
-  const priorByTitle = new Map(priorStages.map(s => [String(s.title || '').toLowerCase(), s]));
+  /**
+   * Matching runs as ordered passes over the *whole* next-stage list, rather
+   * than resolving each next-stage greedily in isolation. A single greedy
+   * pass processes stages left to right, so when a stage is inserted midway
+   * through the plan, the inserted stage gets resolved before the real stage
+   * that used to sit at its new index does — and a same-position fallback
+   * would let the inserted stage steal that later stage's identity before
+   * the correct title match ever gets a chance to run. Doing title-matching
+   * as its own global pass first means position never gets to arbitrate a
+   * case it's wrong about.
+   *
+   * Every prior stage can be claimed by at most one next stage. Two
+   * next-stages that both moved away from the same tool (e.g. a global
+   * "replace Figma" adjustment touching several stages) must NOT both
+   * resolve to the same prior stage — a duplicate id downstream collapses
+   * two nodes onto one in the canvas graph and onto one `stageId` in the
+   * task board, which is exactly the "connections broke" / "tasks didn't
+   * update" reports.
+   */
+  const claimed = new Set();
+  const matches = new Array(nextStages.length).fill(null);
+  const assign = (i, priorStage) => { matches[i] = priorStage; claimed.add(priorStage.id); };
 
+  // Pass 1: exact title match anywhere in the prior plan — the strongest,
+  // position-independent signal that two stages are "the same step".
+  nextStages.forEach((stage, i) => {
+    const hit = priorStages.find(ps => !claimed.has(ps.id) && norm(ps.title) === norm(stage.title));
+    if (hit) assign(i, hit);
+  });
+
+  // Pass 2: same position and same tool — the ordinary no-op-refine case
+  // where wording changed slightly but the stage didn't move.
+  nextStages.forEach((stage, i) => {
+    if (matches[i]) return;
+    const atIndex = priorStages[i];
+    if (atIndex && !claimed.has(atIndex.id) && atIndex.toolSlug === stage.toolSlug) assign(i, atIndex);
+  });
+
+  // Pass 3: the adjustment names the tool being replaced ("replace
+  // ElevenLabs with Play.ht") — a same-position tool swap.
+  nextStages.forEach((stage, i) => {
+    if (matches[i]) return;
+    const hit = priorStages.find(ps =>
+      !claimed.has(ps.id) &&
+      (adjustmentLower.includes(norm(ps.tool?.name) || ' ') || adjustmentLower.includes(ps.toolSlug.replace(/-/g, ' ')))
+    );
+    if (hit) assign(i, hit);
+  });
+
+  // Pass 4: whatever prior stage is still sitting at the same position —
+  // last resort, only reliable when the stage count didn't change.
+  nextStages.forEach((stage, i) => {
+    if (matches[i]) return;
+    const atIndex = priorStages[i];
+    if (atIndex && !claimed.has(atIndex.id)) assign(i, atIndex);
+  });
+
+  const usedIds = new Set(claimed);
   const changedStageIds = [];
   const preservedStageIds = [];
   const replacedTools = [];
 
   const mergedStages = nextStages.map((stage, index) => {
-    const priorAtIndex = priorStages[index];
-    let priorStage = priorAtIndex;
+    const priorStage = matches[index];
 
-    // Tool-swap refinements ("replace ElevenLabs") — match the stage being replaced.
-    if (priorAtIndex && priorAtIndex.toolSlug !== stage.toolSlug) {
-      const mentionedPrior = priorStages.find(ps =>
-        adjustmentLower.includes(ps.tool?.name?.toLowerCase() || '') ||
-        adjustmentLower.includes(ps.toolSlug.replace(/-/g, ' '))
-      );
-      if (mentionedPrior) priorStage = mentionedPrior;
+    if (!priorStage) {
+      // Genuinely new stage (the plan grew). Guard the freshly generated id
+      // against colliding with a not-yet-claimed prior id or an id already
+      // placed earlier in this same merge — either would reproduce the same
+      // duplicate-id corruption the claim tracking above prevents.
+      let id = stage.id;
+      while (usedIds.has(id)) id = `${stage.id}-${Math.random().toString(36).slice(2, 6)}`;
+      usedIds.add(id);
+      changedStageIds.push(id);
+      return { ...stage, id };
     }
 
-    const sameTool = priorStage?.toolSlug === stage.toolSlug;
-    const sameTitle = priorStage && String(priorStage.title).toLowerCase() === String(stage.title).toLowerCase();
-    const sameOutput = priorStage?.output === stage.output;
-    const hasPlaybook = Boolean(priorStage?.steps?.length);
-
-    const unchanged = priorStage && sameTool && sameOutput && hasPlaybook;
+    const sameTool = priorStage.toolSlug === stage.toolSlug;
+    const sameOutput = priorStage.output === stage.output;
+    const hasPlaybook = Boolean(priorStage.steps?.length);
+    const unchanged = sameTool && sameOutput && hasPlaybook;
 
     if (unchanged) {
       preservedStageIds.push(priorStage.id);
@@ -63,21 +119,25 @@ export function patchWorkflow(prior, next, { adjustment = '' } = {}) {
         settings: priorStage.settings,
         pitfall: priorStage.pitfall,
         checkpoint: priorStage.checkpoint,
+        // Selection highlights saved via /chat/stage-highlight point at exact
+        // substrings of THIS content — carried forward only when the content
+        // didn't change, same as steps/prompt above. A changed stage drops
+        // them because the phrase they were pinned to may no longer exist.
+        highlights: priorStage.highlights,
       };
     }
 
-    const stageId = priorStage?.id || stage.id;
-    changedStageIds.push(stageId);
+    changedStageIds.push(priorStage.id);
 
-    if (priorStage && priorStage.toolSlug !== stage.toolSlug) {
+    if (!sameTool) {
       replacedTools.push({
-        stageId,
+        stageId: priorStage.id,
         from: { slug: priorStage.toolSlug, name: priorStage.tool?.name },
         to: { slug: stage.toolSlug, name: stage.tool?.name },
       });
     }
 
-    return { ...stage, id: stageId };
+    return { ...stage, id: priorStage.id };
   });
 
   const workflow = {
