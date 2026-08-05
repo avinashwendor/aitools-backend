@@ -92,10 +92,13 @@ ${research}
    After at most two research calls you MUST start building. Build in passes:
    trigger first, then fetch, then transform/summarise, then deliver — look at
    what edit_graph returns and fix validation errors before adding more.
-   For "weekday mornings" or "every weekday at 8am": use trigger.schedule with
-   \`every: day\` and \`atHour: 8\` (UTC), then a core.code step right after that
-   exits early on Saturday/Sunday (\`getUTCDay() === 0 || === 6\`). There is no
-   separate weekdays-only field on the trigger.
+
+   SCHEDULE TRIGGER — only one mode exists: \`trigger.schedule\` with
+   \`atHour\` set to 0–23 (UTC). It runs once per day at that hour. Set
+   \`weekdaysOnly: true\` on the trigger when the user asked for weekdays, and
+   add a \`core.code\` step immediately after the trigger:
+   \`const d = new Date().getUTCDay(); if (d === 0 || d === 6) return { skip: true };\`
+   Do not use other intervals (no hourly, 15-minute, or weekly triggers).
 
 6. VERIFY — call \`test_step\` on every GET request, on every For Each opener
    (it resolves the list and counts it without running the body), and on any

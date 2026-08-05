@@ -34,6 +34,7 @@ import { AgentWorkflow, AgentRun, AgentBuild, AgentCredential, User } from '../m
 import { publicRegistry, getNodeDef } from '../agentic/registry.js';
 import { validateGraph, suggestNodeId } from '../agentic/graph.js';
 import { enqueueRun, enqueueBuild, computeNextRun } from '../agentic/queue.js';
+import { syncWorkflowSchedule } from '../agentic/scheduleSync.js';
 import { cancelRun, activeRunCount } from '../agentic/runner.js';
 import { cancelBuild, activeBuildCount } from '../agentic/architect/index.js';
 import { subscribe } from '../agentic/events.js';
@@ -204,6 +205,7 @@ export const updateWorkflow = asyncHandler(async (req, res) => {
     workflow.graph = { nodes, edges };
     workflow.version += 1;
     workflow.validation = { ...revalidate(workflow), checkedAt: new Date() };
+    syncWorkflowSchedule(workflow);
   }
 
   if (req.body.schedule) {
@@ -220,10 +222,21 @@ export const updateWorkflow = asyncHandler(async (req, res) => {
     }
 
     workflow.schedule.enabled = Boolean(req.body.schedule.enabled);
-    if (req.body.schedule.every) workflow.schedule.every = String(req.body.schedule.every);
     if (req.body.schedule.atHour !== undefined) {
       workflow.schedule.atHour = Math.min(23, Math.max(0, Number(req.body.schedule.atHour) || 0));
     }
+    workflow.schedule.every = 'day';
+
+    const trigger = workflow.graph?.nodes?.find(node => node.type === 'trigger.schedule');
+    if (trigger) {
+      trigger.data = trigger.data || {};
+      trigger.data.values = trigger.data.values || {};
+      trigger.data.values.atHour = String(workflow.schedule.atHour);
+      if (req.body.schedule.weekdaysOnly !== undefined) {
+        trigger.data.values.weekdaysOnly = Boolean(req.body.schedule.weekdaysOnly);
+      }
+    }
+
     workflow.schedule.nextRunAt = workflow.schedule.enabled
       ? computeNextRun(workflow.schedule)
       : null;

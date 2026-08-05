@@ -47,6 +47,7 @@ import { getExecutor } from '../executors.js';
 import { resolveValues } from '../interpolate.js';
 import { capOutput, safeMessage } from '../safety.js';
 import { publish } from '../events.js';
+import { syncWorkflowSchedule } from '../scheduleSync.js';
 import { withMetering, summarize } from '../../billing/meterContext.js';
 import { spend, recordFailure } from '../../billing/credits.js';
 import { meteredCost } from '../../billing/plans.js';
@@ -237,6 +238,7 @@ async function buildInner({ build, workflow, user, controller, usage }) {
       ...validateGraph(state.graph, { requirements: state.requirements }),
       checkedAt: new Date(),
     };
+    syncWorkflowSchedule(workflow, { enableWhenPresent: true });
     await workflow.save();
     publish(build._id, { type: 'build.graph', workflow: workflow.toEditorJSON() });
   };
@@ -489,7 +491,8 @@ function buildTools({ state, emit, flushGraph, user, signal, searchable, goal })
   tools.plan = defineTool({
     description:
       'Record the stages you intend to build, in order. Call this once, early, before you ' +
-      'start editing the graph. The user watches this while you work.',
+      'start editing the graph. Each stage must name the concrete node types you will add ' +
+      '(e.g. trigger.schedule → core.http → core.llm → core.email). The user watches this.',
     properties: {
       steps: {
         type: 'array',

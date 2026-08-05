@@ -113,24 +113,29 @@ export const NODE_REGISTRY = {
     kind: 'trigger',
     group: 'Triggers',
     label: 'Schedule',
-    description: 'Runs on a repeating interval.',
+    description: 'Runs once every day at the hour you pick (UTC).',
     icon: 'Clock',
     accent: '#3b82f6',
     credits: 0,
     handles: { in: false, out: OUT },
     fields: [
       T.select(
-        'every',
-        'Run every',
-        ['15 minutes', 'hour', '6 hours', 'day', 'week'],
-        { default: 'day', required: true }
+        'atHour',
+        'Run at hour (UTC)',
+        Array.from({ length: 24 }, (_, hour) => String(hour)),
+        {
+          default: '9',
+          required: true,
+          help:
+            'Fires once per day at this hour, UTC. Enable “Run on schedule” below ' +
+            'and activate the workflow for it to arm.',
+        }
       ),
-      T.text('atHour', 'At hour (UTC)', {
-        placeholder: '9',
+      T.boolean('weekdaysOnly', 'Weekdays only', {
+        default: false,
         help:
-          'Used for daily and weekly schedules. For weekday-only runs, set every to day and ' +
-          'atHour to 8, then add a core.code step after the trigger that returns early on ' +
-          'Saturday/Sunday (getUTCDay() 0 or 6).',
+          'When on, add a Code step right after this trigger that skips Saturday ' +
+          'and Sunday (getUTCDay() 0 or 6). The architect does this automatically.',
       }),
     ],
     outputs: [{ path: 'trigger.firedAt', label: 'Fired at' }],
