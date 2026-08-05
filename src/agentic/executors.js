@@ -178,6 +178,15 @@ const executors = {
       trigger: trigger?.payload || {},
     });
 
+    /*
+     * `return { skip: true }` is the weekday/weekend gate. Surface `skip` at
+     * the top level so the runner can short-circuit the rest of the chain —
+     * wrapping it only under `result` would make weekend digests still fire.
+     */
+    if (result && typeof result === 'object' && !Array.isArray(result) && result.skip === true) {
+      return { result, skip: true, reason: result.reason || 'Skipped by code' };
+    }
+
     return { result };
   },
 

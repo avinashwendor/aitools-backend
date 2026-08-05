@@ -189,10 +189,14 @@ export const NODE_REGISTRY = {
         default: '// `input` is the previous step. `steps` holds every step by id.\nreturn input;',
         help:
           'Runs in a sandbox with no network and no filesystem. Return the value you want ' +
-          'downstream. Available: input, steps, trigger.',
+          'downstream. Available: input, steps, trigger. Return { skip: true } to stop the ' +
+          'rest of the workflow (used for weekday-only schedules).',
       }),
     ],
-    outputs: [{ path: 'result', label: 'Returned value' }],
+    outputs: [
+      { path: 'result', label: 'Returned value' },
+      { path: 'skip', label: 'Stopped the run (true/false)' },
+    ],
   },
 
   'core.template': {

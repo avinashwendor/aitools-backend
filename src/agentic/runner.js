@@ -264,6 +264,22 @@ async function runInner({ run, workflow, user, controller, usage }) {
     if (outcome.output?.branch) openHandle.set(node.id, outcome.output.branch);
     scope[node.id] = outcome.output;
 
+    /*
+     * Early exit. A Code step that returns `{ skip: true }` (weekend gate,
+     * empty feed, etc.) must stop the rest of the chain — otherwise a
+     * "weekdays only" schedule still emails on Saturday.
+     */
+    if (outcome.output?.skip === true) {
+      for (let j = i + 1; j < ordered.length; j++) {
+        if (run.steps[j].status === 'pending') {
+          run.steps[j].status = 'skipped';
+          await persistStep(run, j);
+          emit(run, 'step.update', { index: j, step: plainStep(run.steps[j]) });
+        }
+      }
+      break;
+    }
+
     const region = regionByForEach.get(node.id);
     if (region) {
       const looped = await runRegion({

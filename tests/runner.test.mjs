@@ -148,6 +148,30 @@ describe('the walk', () => {
   });
 
   /**
+   * Weekday-only schedules return `{ skip: true }` from a Code step. Without
+   * short-circuiting here, Saturday still fetches HN and sends email.
+   */
+  test('Code returning { skip: true } stops the rest of the chain', async () => {
+    const run = await runGraph({
+      nodes: [
+        node('t', 'trigger.manual'),
+        node('gate', 'core.code', {
+          script: 'return { skip: true, reason: "weekend" };',
+        }),
+        node('work', 'core.template', { value: 'should-not-run' }),
+        node('mail', 'core.template', { value: 'also-not' }),
+      ],
+      edges: [edge('t', 'gate'), edge('gate', 'work'), edge('work', 'mail')],
+    });
+
+    assert.equal(run.status, 'succeeded');
+    assert.equal(stepFor(run, 'gate').status, 'done');
+    assert.equal(stepFor(run, 'gate').output.skip, true);
+    assert.equal(stepFor(run, 'work').status, 'skipped');
+    assert.equal(stepFor(run, 'mail').status, 'skipped');
+  });
+
+  /**
    * The reason the runner tracks liveness at all: topologically sorting and then
    * running everything means the "false" arm's side effects happen anyway.
    */
