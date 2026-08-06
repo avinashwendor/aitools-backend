@@ -410,8 +410,31 @@ describe('workflow engine', () => {
 
     assert.equal(result.intent, 'clarify');
     assert.equal(result.workflow, null);
-    assert.equal(result.clarifyingQuestions.length, 1);
+
+    /*
+     * The router's own question leads, and generic defaults pad behind it.
+     *
+     * `resolveIntakeQuestions` tops a thin router briefing up to a usable
+     * intake rather than asking a single question and planning off the rest —
+     * one question is not enough to plan a vague goal from, and the second
+     * "invent more questions" LLM round that used to fill the gap left the
+     * studio sitting on "Working out what to ask…" for 90s+.
+     *
+     * What must hold is that padding never *displaces* the goal-aware
+     * question the router wrote: that one is the only one that knows what the
+     * user actually asked for.
+     */
     assert.equal(result.clarifyingQuestions[0].id, 'skill');
+    assert.ok(
+      result.clarifyingQuestions.length >= 2,
+      'a vague goal is padded to a usable intake, not asked a single question'
+    );
+    const ids = result.clarifyingQuestions.map(q => q.id);
+    assert.equal(new Set(ids).size, ids.length, 'padding must not duplicate a question id');
+    for (const q of result.clarifyingQuestions) {
+      assert.ok(q.question, 'every question has prose');
+      assert.ok(q.type === 'choice' || q.type === 'text', 'every question has a known type');
+    }
   });
 
   test('answers discovery questions with grounded prose and no workflow', async () => {
@@ -518,6 +541,15 @@ describe('personalization', () => {
       baseGoal: goal,
       enrichedGoal: goal,
       intakeOverrides: { skill: 'advanced' },
+      /*
+       * What the intake turn actually persisted. The approval turn does not
+       * re-route, so these are the only retrieval queries in existence by the
+       * time it plans — it used to slice them out of the enriched goal
+       * instead, which meant planning against "…\n\nUser preferences:\nWhat
+       * is your budget for too…" rather than against the goal.
+       */
+      searchQueries: SEARCH_QUERIES,
+      domains: [],
     };
 
     queue(plan, playbook(), playbook());

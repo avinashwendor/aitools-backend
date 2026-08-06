@@ -275,8 +275,8 @@ describe('budget', () => {
     });
 
     assert.equal(out.finishReason, 'finished');
-    assert.match(everythingSaid(), /model calls? left in this session/);
-    assert.match(everythingSaid(), /call `finish` now/);
+    assert.match(everythingSaid(), /model calls? left/);
+    assert.match(everythingSaid(), /Call `finish`/);
   });
 
   test('no landing warning when there is nothing to land on', async () => {

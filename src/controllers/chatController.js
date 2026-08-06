@@ -155,8 +155,28 @@ function sendError(res, err, { streaming = false } = {}) {
   else log.warn('Chat request rejected', { code, status });
 
   if (streaming) {
+    /**
+     * A guardrail refusal (`status: 200`) is a considered assistant reply, not
+     * a transport failure — and it has to look the same on both endpoints.
+     *
+     * Sent as `error` it surfaced in the studio as a red bar plus a generic
+     * "I couldn't process that", so the one thing the refusal is for — telling
+     * the user *why* and what to ask instead — never reached them. It also
+     * never landed in the transcript, so the conversation showed the question
+     * with no answer under it.
+     */
+    if (status === 200) {
+      res.write(`event: result\ndata: ${JSON.stringify({
+        message, workflow: null, intent: 'refused',
+        clarifyingQuestions: null, readyToApprove: false,
+      })}\n\n`);
+      res.write(`event: done\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+      return res.end();
+    }
+    // Headers are already flushed on this route; the status line is only
+    // settable if the failure beat `writeHead`.
     if (!res.headersSent) res.status(status);
-    res.write(`event: error\ndata: ${JSON.stringify({ code, message })}\n\n`);
+    res.write(`event: error\ndata: ${JSON.stringify({ code, message, status })}\n\n`);
     return res.end();
   }
 
@@ -193,18 +213,42 @@ async function persistTurn(userId, sessionId, payload, { isFirstTurn = false } =
   // committed to; a board is created only by an explicit "Add to tasks".
 }
 
+/**
+ * A guardrail refusal is delivered as a normal assistant turn, so it has to be
+ * written to the transcript like one.
+ *
+ * Without this the refusal only existed in the HTTP response: the client
+ * rendered it, then the routine post-turn `invalidateQueries` refetched the
+ * conversation from Mongo and it disappeared, leaving the user's question
+ * sitting there unanswered. Worse, the next message would be planned against a
+ * history in which the refusal never happened.
+ *
+ * Returns true when the error was a refusal and has been recorded.
+ */
+async function persistRefusalIfAny(err, { userId, sessionId, message, isFirstTurn }) {
+  if (!(err instanceof GuardrailError) || err.status !== 200) return false;
+  await persistTurn(userId, sessionId, {
+    userMessage: message,
+    assistantMessage: err.userMessage || err.message,
+    intent: 'refused',
+  }, { isFirstTurn }).catch(() => {});
+  return true;
+}
+
 // ─────────────────────────────────────────────────────────────
 // POST /api/chat
 // ─────────────────────────────────────────────────────────────
 export const sendMessage = async (req, res) => {
   const { message, sessionId = 'default', allowExternalTools, intakeAnswers, stageId } = req.body;
   const userId = req.user._id;
+  let hadPriorMessages = true;
 
   try {
     // Everything inside this scope reports its token and search spend to the
     // same accumulator, however deep in the engine it happens.
     const { result, billing } = await withMetering(async usage => {
       const conversation = await loadConversation(userId, sessionId);
+      hadPriorMessages = Boolean(conversation.messages?.length);
       const resolvedExternal = await resolveAllowExternalTools(req.user, allowExternalTools);
       if (typeof allowExternalTools === 'boolean') {
         updateProfileFacts(userId, { allowExternalTools }).catch(() => {});
@@ -231,7 +275,7 @@ export const sendMessage = async (req, res) => {
 
       const charged = await chargeTurn({ user: req.user, result: turn, usage, sessionId });
 
-      const isFirstTurn = !(conversation.messages?.length);
+      const isFirstTurn = !hadPriorMessages;
       await persistTurn(userId, sessionId, {
         userMessage: message,
         assistantMessage: turn.message,
@@ -264,6 +308,9 @@ export const sendMessage = async (req, res) => {
       },
     });
   } catch (err) {
+    await persistRefusalIfAny(err, {
+      userId, sessionId, message, isFirstTurn: !hadPriorMessages,
+    }).catch(() => {});
     sendError(res, err);
   }
 };
@@ -297,9 +344,15 @@ export const streamMessage = async (req, res) => {
   let aborted = false;
   req.on('close', () => { aborted = true; clearInterval(heartbeat); });
 
+  // Hoisted so the catch below can tell a first turn from a later one when it
+  // records a refusal — the conversation itself is loaded inside the metering
+  // scope, but "was this session empty" is needed on the failure path too.
+  let hadPriorMessages = true;
+
   try {
     await withMetering(async usage => {
       const conversation = await loadConversation(userId, sessionId);
+      hadPriorMessages = Boolean(conversation.messages?.length);
       const resolvedExternal = await resolveAllowExternalTools(req.user, allowExternalTools);
       if (typeof allowExternalTools === 'boolean') {
         updateProfileFacts(userId, { allowExternalTools }).catch(() => {});
@@ -335,7 +388,34 @@ export const streamMessage = async (req, res) => {
       // work is already done by the time we get here.
       const billing = await chargeTurn({ user: req.user, result, usage, sessionId });
 
-      if (aborted) return;
+      const isFirstTurn = !hadPriorMessages;
+
+      /**
+       * Persist BEFORE deciding what to tell the socket, and unconditionally.
+       *
+       * This used to sit after an `if (aborted) return`, which meant closing
+       * the tab (or pressing Stop) during the ~60s build charged the user for
+       * a workflow that was then thrown away: the pipeline had already run,
+       * the credits were already spent, and the only copy of the result was
+       * the one we dropped on the floor. Whether the browser is still
+       * listening has nothing to do with whether the work happened.
+       */
+      await persistTurn(userId, sessionId, {
+        userMessage: message,
+        assistantMessage: result.message,
+        toolSlugs: result.toolSlugs || [],
+        goal: result.goal,
+        brief: result.brief,
+        workflow: result.workflow ?? undefined,
+        workflowDiff: result.workflowDiff ?? undefined,
+        title: result.title,
+        intent: result.intent,
+      }, { isFirstTurn });
+
+      if (aborted) {
+        clearInterval(heartbeat);
+        return;
+      }
 
       send('result', {
         message: result.message,
@@ -352,24 +432,14 @@ export const streamMessage = async (req, res) => {
       send('done', { ok: true });
       clearInterval(heartbeat);
       res.end();
-
-      const isFirstTurn = !(conversation.messages?.length);
-
-      await persistTurn(userId, sessionId, {
-        userMessage: message,
-        assistantMessage: result.message,
-        toolSlugs: result.toolSlugs || [],
-        goal: result.goal,
-        brief: result.brief,
-        workflow: result.workflow ?? undefined,
-        workflowDiff: result.workflowDiff ?? undefined,
-        title: result.title,
-        intent: result.intent,
-      }, { isFirstTurn });
     });
   } catch (err) {
     clearInterval(heartbeat);
+    await persistRefusalIfAny(err, {
+      userId, sessionId, message, isFirstTurn: !hadPriorMessages,
+    }).catch(() => {});
     if (!aborted) sendError(res, err, { streaming: true });
+    else if (!res.writableEnded) res.end();
   }
 };
 
@@ -505,15 +575,39 @@ export const getHistory = async (req, res) => {
 
     const clarify = conversation.clarificationState;
 
+    /**
+     * The diff from the most recent turn that produced one.
+     *
+     * `patchWorkflow` records exactly which stages a refine changed, which it
+     * preserved and which tools it swapped — and the studio shows that as the
+     * "what changed" summary after a refine. Without replaying it here the
+     * summary survived only until the page reloaded, so anyone who refined,
+     * got interrupted and came back had a silently rewritten plan and no way
+     * to see what had moved.
+     *
+     * Read from the tail backwards: only the newest diff describes the
+     * workflow currently on the canvas.
+     */
+    const messages = conversation.messages || [];
+    let lastWorkflowDiff = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role !== 'assistant') continue;
+      if (messages[i].workflowDiff) lastWorkflowDiff = messages[i].workflowDiff;
+      // The newest assistant turn decides: if it produced a workflow without a
+      // diff (a fresh generation), there is nothing to report as "changed".
+      if (messages[i].workflow || messages[i].workflowDiff) break;
+    }
+
     res.json({
       success: true,
       data: {
-        messages: (conversation.messages || []).map(m => ({
+        messages: messages.map(m => ({
           role: m.role,
           content: m.content,
           createdAt: m.createdAt,
         })),
         workflow: conversation.lastWorkflow || null,
+        workflowDiff: lastWorkflowDiff,
         goal: conversation.goal || '',
         title: conversation.title || '',
         clarifyingQuestions:
@@ -561,10 +655,11 @@ export const exportWorkflow = async (req, res) => {
     const sessionId = req.query.sessionId || 'default';
     const format = String(req.query.format || 'n8n').toLowerCase();
 
-    if (!['n8n', 'markdown', 'md'].includes(format)) {
+    const validFormats = ['n8n', 'markdown', 'md', 'make', 'mermaid', 'script', 'js'];
+    if (!validFormats.includes(format)) {
       return res.status(400).json({
         success: false,
-        message: 'format must be n8n or markdown',
+        message: `format must be one of: ${validFormats.join(', ')}`,
       });
     }
 
@@ -584,28 +679,19 @@ export const exportWorkflow = async (req, res) => {
       sessionId,
     };
 
-    if (format === 'n8n') {
-      const { toN8nWorkflow, n8nFilename } = await import('../ai/exporters/n8n.js');
-      const n8n = toN8nWorkflow(workflow);
-      return res.json({
-        success: true,
-        data: {
-          format: 'n8n',
-          filename: n8nFilename(workflow),
-          workflow: n8n,
-          source,
-        },
-      });
-    }
+    const { exportWorkflow: doExport } = await import('../ai/exporters/index.js');
+    const result = doExport(workflow, format);
 
-    const { toMarkdown, markdownFilename } = await import('../ai/exporters/markdown.js');
-    const markdown = toMarkdown(workflow);
     return res.json({
       success: true,
       data: {
-        format: 'markdown',
-        filename: markdownFilename(workflow),
-        markdown,
+        format,
+        filename: result.filename,
+        content: result.content,
+        mimeType: result.mimeType,
+        // Legacy compatibility fields
+        workflow: format === 'n8n' ? JSON.parse(result.content) : undefined,
+        markdown: ['markdown', 'md'].includes(format) ? result.content : undefined,
         source,
       },
     });

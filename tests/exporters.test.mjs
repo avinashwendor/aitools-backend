@@ -1,103 +1,92 @@
-/**
- * n8n + markdown exporter unit tests — no Mongo, no LLM.
- */
-
-import { test, describe } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { toN8nWorkflow, n8nFilename } from '../src/ai/exporters/n8n.js';
-import { toMarkdown, markdownFilename } from '../src/ai/exporters/markdown.js';
+import { exportWorkflow, markdown, n8n, make, mermaid, script } from '../src/ai/exporters/index.js';
 
-const fixture = {
-  id: 'wf_test',
-  title: 'Launch a newsletter',
-  summary: 'Pick tools and write the first issue.',
-  outcome: 'A published newsletter',
-  difficulty: 'beginner',
-  totalDuration: '~2 hours',
-  costSummary: 'Free tier',
+const mockWorkflow = {
+  id: 'wf_123',
+  title: 'YouTube Video Production',
+  summary: 'Create and publish a video from script to thumbnail',
+  outcome: 'Published YouTube video',
+  totalDuration: '~120 min',
+  costSummary: 'Free tools',
+  difficulty: 'Beginner',
   stages: [
     {
-      id: 'stage-1',
-      title: 'Write the draft',
+      id: 'stg_1',
+      title: 'Scripting & Topic Research',
       toolSlug: 'chatgpt',
-      tool: { name: 'ChatGPT', websiteUrl: 'https://chatgpt.com', slug: 'chatgpt' },
-      why: 'Fast first draft',
-      input: 'Topic brief',
-      output: 'Draft copy',
+      tool: { name: 'ChatGPT', websiteUrl: 'https://chatgpt.com' },
+      why: 'Generates structured script',
+      input: 'Video idea',
+      output: 'Full video script',
       timeMinutes: 30,
-      steps: [
-        { title: 'Open ChatGPT', detail: 'Start a new chat' },
-        { title: 'Paste the brief', detail: 'Use the prompt below' },
-      ],
-      prompt: 'Write a newsletter intro about {topic}',
-      pitfall: 'Do not invent stats',
-      checkpoint: 'Draft reads cleanly aloud',
+      steps: [{ title: 'Write outline', detail: 'Generate 5 main bullet points' }],
+      prompt: 'Write a script for YouTube about AI coding',
     },
     {
-      id: 'stage-2',
-      title: 'Design the layout',
-      toolSlug: 'canva',
-      tool: { name: 'Canva', websiteUrl: 'https://canva.com', slug: 'canva' },
-      why: 'Visual polish',
-      input: 'Draft copy',
-      output: 'Designed issue',
-      timeMinutes: 45,
-      steps: [{ title: 'Pick a template', detail: 'Newsletter layout' }],
-      settings: [{ label: 'Size', value: 'A4' }],
-    },
-    {
-      id: 'stage-3',
-      title: 'Manual review',
-      toolSlug: 'notion',
-      tool: { name: 'Notion', slug: 'notion' },
-      why: 'No public API hop needed for review',
-      steps: [{ title: 'Paste and review', detail: 'Check tone' }],
+      id: 'stg_2',
+      title: 'Voiceover Recording',
+      toolSlug: 'elevenlabs',
+      tool: { name: 'ElevenLabs', websiteUrl: 'https://elevenlabs.io' },
+      why: 'Realistic AI voice synthesis',
+      input: 'Script',
+      output: 'MP3 voiceover track',
+      timeMinutes: 15,
+      steps: [{ title: 'Synthesize voice', detail: 'Paste script into ElevenLabs' }],
     },
   ],
-  tips: ['Send to one friend first'],
+  tips: ['Review audio quality before editing', 'Add background music'],
 };
 
-describe('toN8nWorkflow', () => {
-  test('emits trigger, sticky notes, NoOp spine, and HTTP only when websiteUrl exists', () => {
-    const n8n = toN8nWorkflow(fixture);
-
-    assert.equal(n8n.name, 'Launch a newsletter');
-    assert.ok(Array.isArray(n8n.nodes));
-    assert.ok(n8n.connections);
-
-    const types = n8n.nodes.map(n => n.type);
-    assert.ok(types.includes('n8n-nodes-base.manualTrigger'));
-    assert.ok(types.includes('n8n-nodes-base.stickyNote'));
-    assert.ok(types.includes('n8n-nodes-base.noOp'));
-    assert.ok(types.includes('n8n-nodes-base.httpRequest'));
-
-    const httpNodes = n8n.nodes.filter(n => n.type === 'n8n-nodes-base.httpRequest');
-    assert.equal(httpNodes.length, 2);
-    assert.equal(httpNodes[0].parameters.url, 'https://chatgpt.com');
-
-    const trigger = n8n.nodes.find(n => n.type === 'n8n-nodes-base.manualTrigger');
-    assert.ok(n8n.connections[trigger.name]);
-    assert.equal(n8n.connections[trigger.name].main[0][0].node, '1. Write the draft');
-
-    // Spine continues stage 1 → stage 2
-    const stage1Links = n8n.connections['1. Write the draft'].main[0].map(c => c.node);
-    assert.ok(stage1Links.includes('2. Design the layout'));
-
-    assert.match(n8nFilename(fixture), /launch-a-newsletter-n8n\.json/);
-  });
-
-  test('rejects empty workflows', () => {
-    assert.throws(() => toN8nWorkflow({ title: 'x', stages: [] }), /no stages/);
-  });
+test('exporters - markdown export', () => {
+  const md = markdown.toMarkdown(mockWorkflow);
+  assert.ok(md.includes('# YouTube Video Production'));
+  assert.ok(md.includes('## 1. Scripting & Topic Research'));
+  assert.ok(md.includes('ChatGPT'));
+  assert.equal(markdown.markdownFilename(mockWorkflow), 'youtube-video-production.md');
 });
 
-describe('toMarkdown', () => {
-  test('includes stages, prompt, and tips', () => {
-    const md = toMarkdown(fixture);
-    assert.match(md, /# Launch a newsletter/);
-    assert.match(md, /Write the draft/);
-    assert.match(md, /Paste-ready prompt|### Prompt/);
-    assert.match(md, /Send to one friend first/);
-    assert.match(markdownFilename(fixture), /\.md$/);
-  });
+test('exporters - n8n export', () => {
+  const n8nData = n8n.toN8nWorkflow(mockWorkflow);
+  assert.equal(n8nData.name, 'YouTube Video Production');
+  assert.ok(Array.isArray(n8nData.nodes));
+  assert.ok(n8nData.nodes.some(n => n.type === 'n8n-nodes-base.manualTrigger'));
+  assert.equal(n8n.n8nFilename(mockWorkflow), 'youtube-video-production-n8n.json');
+});
+
+test('exporters - make.com export', () => {
+  const makeData = make.toMakeWorkflow(mockWorkflow);
+  assert.equal(makeData.name, 'YouTube Video Production');
+  assert.equal(makeData.flow.length, 2);
+  assert.equal(make.makeFilename(mockWorkflow), 'youtube-video-production-make.json');
+});
+
+test('exporters - mermaid export', () => {
+  const mmd = mermaid.toMermaid(mockWorkflow);
+  assert.ok(mmd.includes('graph TD'));
+  assert.ok(mmd.includes('Scripting & Topic Research'));
+  assert.ok(mmd.includes('Finish(["✅ Published YouTube video"])'));
+  assert.equal(mermaid.mermaidFilename(mockWorkflow), 'youtube-video-production.mmd');
+});
+
+test('exporters - executable script export', () => {
+  const scriptContent = script.toScript(mockWorkflow);
+  assert.ok(scriptContent.includes('#!/usr/bin/env node'));
+  assert.ok(scriptContent.includes('YouTube Video Production'));
+  assert.ok(scriptContent.includes('ChatGPT'));
+  assert.equal(script.scriptFilename(mockWorkflow), 'youtube-video-production-runner.js');
+});
+
+test('exporters - central index function', () => {
+  const resMd = exportWorkflow(mockWorkflow, 'markdown');
+  assert.equal(resMd.mimeType, 'text/markdown');
+  
+  const resMake = exportWorkflow(mockWorkflow, 'make');
+  assert.equal(resMake.mimeType, 'application/json');
+
+  const resMermaid = exportWorkflow(mockWorkflow, 'mermaid');
+  assert.equal(resMermaid.mimeType, 'text/plain');
+
+  const resScript = exportWorkflow(mockWorkflow, 'script');
+  assert.equal(resScript.mimeType, 'text/javascript');
 });

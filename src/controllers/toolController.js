@@ -213,7 +213,7 @@ export const incrementViews = async (req, res, next) => {
 export const toggleLike = async (req, res, next) => {
   try {
     const { slug } = req.params;
-    const userId = req.user.id;
+    const userId = req.user._id || req.user.id;
     
     const tool = await Tool.findOne({ slug, isActive: true });
     if (!tool) {
@@ -258,7 +258,7 @@ export const toggleLike = async (req, res, next) => {
 export const toggleSave = async (req, res, next) => {
   try {
     const { slug } = req.params;
-    const userId = req.user.id;
+    const userId = req.user._id || req.user.id;
     
     const tool = await Tool.findOne({ slug, isActive: true });
     if (!tool) {

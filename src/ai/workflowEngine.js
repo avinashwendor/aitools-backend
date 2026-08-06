@@ -1354,6 +1354,11 @@ export async function handleMessage({
         answers: resolvedAnswers,
         alreadyKnow,
         stillNeed,
+        // Forwarded, not recomputed — this transition ('asking' →
+        // 'awaiting_approval') never re-runs the router, so the queries it
+        // produced on the intake turn are the only ones that exist.
+        searchQueries: clarifyState.searchQueries || [],
+        domains: clarifyState.domains || [],
       });
     }
     return {
@@ -1390,12 +1395,30 @@ export async function handleMessage({
 
   let routed;
   if (forcedGoal) {
+    /**
+     * The approval turn does the real planning but deliberately does NOT
+     * re-route: the router already ran on the intake turn, and paying for a
+     * second call to re-derive what it decided a moment ago would double the
+     * latency of the most-watched screen in the product for nothing.
+     *
+     * What it must not do is *invent* the retrieval input. `forcedGoal` is the
+     * enriched goal — the user's goal with "User preferences:" and their intake
+     * answers appended — and clipping that to a query length yields
+     * "Launch a podcast\n\nUser preferences:\nWhat is your budget for too…",
+     * which retrieves against the wording of our own questions. The router's
+     * queries and domains are carried on the clarification state for exactly
+     * this; the base goal is the fallback when a state predates them.
+     */
+    const baseGoal = clarifyState?.baseGoal || sanitized;
+    const carriedQueries = (clarifyState?.searchQueries || []).filter(Boolean);
+    const carriedDomains = (clarifyState?.domains || []).filter(Boolean);
+
     routed = {
       intent: 'workflow',
       goal: forcedGoal.slice(0, 500),
-      title: clarifyState?.baseGoal?.slice(0, 80) || '',
-      domains: [],
-      searchQueries: [forcedGoal.slice(0, 80)],
+      title: baseGoal.slice(0, 80),
+      domains: carriedDomains,
+      searchQueries: carriedQueries.length ? carriedQueries : [baseGoal.slice(0, 120)],
       // The intake answers win over the stored profile: they are what the user
       // said about *this* build, minutes ago.
       pricing: forcedOverrides.pricing || profile?.pricingPreference || 'any',
@@ -1486,6 +1509,10 @@ export async function handleMessage({
           answers: {},
           alreadyKnow,
           stillNeed: [],
+          // Carried so the approval turn retrieves against the router's own
+          // queries rather than re-deriving them from the enriched goal.
+          searchQueries: routed.searchQueries || [],
+          domains: routed.domains || [],
         }).catch(err =>
           log.warn('Failed to persist clarification state', { error: err.message })
         );
@@ -1523,6 +1550,8 @@ export async function handleMessage({
           intakeOverrides: {},
           alreadyKnow,
           stillNeed,
+          searchQueries: routed.searchQueries || [],
+          domains: routed.domains || [],
         }).catch(err =>
           log.warn('Failed to persist clarification state', { error: err.message })
         );

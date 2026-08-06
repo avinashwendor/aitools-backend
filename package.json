@@ -11,7 +11,7 @@
     "dev": "node --watch src/server.js",
     "seed": "node src/seed.js",
     "catalog:expand": "node scripts/expand-catalog.mjs",
-    "test": "LOG_LEVEL=error node --experimental-test-module-mocks --test \"tests/**/*.test.mjs\"",
+    "test": "LOG_LEVEL=error node --experimental-test-module-mocks --test-force-exit --test \"tests/**/*.test.mjs\"",
     "eval:retrieval": "node scripts/eval-retrieval.mjs",
     "eval:workflow": "node scripts/eval-workflow.mjs",
     "e2e:workflow": "node scripts/e2e-workflow.mjs",

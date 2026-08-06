@@ -93,6 +93,20 @@ const conversationSchema = new mongoose.Schema(
       /** LLM briefing: what we already know vs still need before planning. */
       alreadyKnow: { type: [String], default: [] },
       stillNeed: { type: [String], default: [] },
+      /**
+       * The router's retrieval plan, carried across the approval turn.
+       *
+       * The router runs on the *intake* turn and produces goal-shaped search
+       * queries and category domains. The approval turn that follows does the
+       * actual planning, and used to rebuild its retrieval input from the
+       * enriched goal — a string that is the goal with "User preferences:" and
+       * the intake answers appended. Truncated to a query length, that reads
+       * as "Launch a podcast\n\nUser preferences:\nWhat is your budget for…",
+       * which retrieves against the wording of our own questions instead of
+       * the user's goal, on the single most expensive call in the product.
+       */
+      searchQueries: { type: [String], default: [] },
+      domains: { type: [String], default: [] },
     },
 
     turnCount: { type: Number, default: 0 },
